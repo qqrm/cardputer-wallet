@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "firmware",
+    "host-cli",
+    "shared",
+]
+default-members = ["host-cli", "shared"]
+resolver = "2"
