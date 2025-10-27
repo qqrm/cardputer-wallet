@@ -1,0 +1,12 @@
+[package]
+name = "host-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serialport = { version = "4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_cbor = "0.11"
+shared = { path = "../shared" }
