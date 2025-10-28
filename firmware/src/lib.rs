@@ -283,6 +283,7 @@ fn handle_push(ack: &PushAck, ctx: &mut SyncContext) -> Result<DeviceResponse, P
         {
             ctx.pending_sequence = None;
             ctx.vault_offset = 0;
+            ctx.wipe_sensitive();
             Ok(DeviceResponse::Completed(SyncCompletion {
                 protocol_version: PROTOCOL_VERSION,
                 frames_sent: sequence,
