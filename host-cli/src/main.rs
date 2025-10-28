@@ -16,6 +16,9 @@ const SERIAL_BAUD_RATE: u32 = 115_200;
 const DEFAULT_TIMEOUT_SECS: u64 = 2;
 const HOST_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_CHUNK_SIZE: u32 = 4 * 1024;
+const CARDPUTER_USB_VID: u16 = 0x303A;
+const CARDPUTER_USB_PID: u16 = 0x4001;
+const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -23,6 +26,10 @@ struct Cli {
     /// Optional path to the serial device. Falls back to auto-detection when omitted.
     #[arg(short, long)]
     port: Option<String>,
+
+    /// Skip Cardputer VID/PID filtering and accept the first USB serial device.
+    #[arg(long)]
+    any_port: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -68,8 +75,7 @@ fn main() -> Result<()> {
 fn run(cli: Cli) -> Result<(), SharedError> {
     let port_path = match cli.port {
         Some(port) => port,
-        None => detect_first_serial_port()?
-            .ok_or_else(|| SharedError::Transport("no CDC device found".to_string()))?,
+        None => detect_first_serial_port(cli.any_port)?,
     };
 
     println!("Connecting to Cardputer on {port_path}…");
@@ -314,15 +320,86 @@ fn open_serial_port(path: &str) -> Result<Box<dyn SerialPort>, SharedError> {
     Ok(port)
 }
 
-fn detect_first_serial_port() -> Result<Option<String>, SharedError> {
+fn detect_first_serial_port(allow_any_port: bool) -> Result<String, SharedError> {
     let ports = serialport::available_ports().map_err(|err| {
         SharedError::Transport(format!("failed to enumerate serial ports: {err}"))
     })?;
-    let port = ports
-        .into_iter()
-        .find(|p| matches!(p.port_type, SerialPortType::UsbPort(_)))
-        .map(|p| p.port_name);
-    Ok(port)
+
+    select_serial_port(&ports, allow_any_port)
+        .map(|info| info.port_name.clone())
+        .ok_or_else(|| missing_cardputer_error(allow_any_port))
+}
+
+fn select_serial_port(
+    ports: &[serialport::SerialPortInfo],
+    allow_any_port: bool,
+) -> Option<&serialport::SerialPortInfo> {
+    if allow_any_port {
+        return ports
+            .iter()
+            .find(|info| matches!(info.port_type, SerialPortType::UsbPort(_)));
+    }
+
+    let matches: Vec<&serialport::SerialPortInfo> = ports
+        .iter()
+        .filter(|info| matches_cardputer_vid_pid(info))
+        .collect();
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    if matches.len() == 1 {
+        return matches.into_iter().next();
+    }
+
+    if let Some(preferred) = matches
+        .iter()
+        .copied()
+        .find(|info| matches_cardputer_identity(info))
+    {
+        return Some(preferred);
+    }
+
+    matches.into_iter().next()
+}
+
+fn matches_cardputer_vid_pid(info: &serialport::SerialPortInfo) -> bool {
+    matches!(&info.port_type, SerialPortType::UsbPort(usb) if usb.vid == CARDPUTER_USB_VID && usb.pid == CARDPUTER_USB_PID)
+}
+
+fn matches_cardputer_identity(info: &serialport::SerialPortInfo) -> bool {
+    match &info.port_type {
+        SerialPortType::UsbPort(usb) => {
+            field_matches_keyword(usb.product.as_deref())
+                || field_matches_keyword(usb.serial_number.as_deref())
+                || field_matches_keyword(usb.manufacturer.as_deref())
+        }
+        _ => false,
+    }
+}
+
+fn field_matches_keyword(field: Option<&str>) -> bool {
+    field.is_some_and(contains_keyword)
+}
+
+fn contains_keyword(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    CARDPUTER_IDENTITY_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+}
+
+fn missing_cardputer_error(allow_any_port: bool) -> SharedError {
+    let mut message = format!(
+        "Cardputer USB CDC device not found (expected VID 0x{CARDPUTER_USB_VID:04X}, PID 0x{CARDPUTER_USB_PID:04X})."
+    );
+
+    if !allow_any_port {
+        message.push_str(" Pass --any-port to connect to the first available USB serial device.");
+    }
+
+    SharedError::Transport(message)
 }
 
 fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
@@ -340,11 +417,124 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn usb_port(
+        name: &str,
+        vid: u16,
+        pid: u16,
+        serial: Option<&str>,
+        manufacturer: Option<&str>,
+        product: Option<&str>,
+    ) -> serialport::SerialPortInfo {
+        serialport::SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::UsbPort(serialport::UsbPortInfo {
+                vid,
+                pid,
+                serial_number: serial.map(|value| value.to_string()),
+                manufacturer: manufacturer.map(|value| value.to_string()),
+                product: product.map(|value| value.to_string()),
+                interface: None,
+            }),
+        }
+    }
+
+    fn non_usb_port(name: &str) -> serialport::SerialPortInfo {
+        serialport::SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::PciPort,
+        }
+    }
+
     fn encode_response(response: DeviceResponse) -> Vec<u8> {
         let payload = serde_cbor::to_vec(&response).expect("encode response");
         let mut cursor = Cursor::new(Vec::new());
         write_framed_message(&mut cursor, &payload).expect("write frame");
         cursor.into_inner()
+    }
+
+    #[test]
+    fn detect_cardputer_by_vid_pid() {
+        let ports = vec![
+            non_usb_port("/dev/ttyS0"),
+            usb_port(
+                "/dev/ttyUSB0",
+                CARDPUTER_USB_VID,
+                CARDPUTER_USB_PID,
+                None,
+                Some("M5Stack"),
+                None,
+            ),
+        ];
+
+        let detected = select_serial_port(&ports, false).expect("cardputer port");
+        assert_eq!(detected.port_name, "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn detect_cardputer_prefers_identity_keywords() {
+        let ports = vec![
+            usb_port(
+                "/dev/ttyUSB0",
+                CARDPUTER_USB_VID,
+                CARDPUTER_USB_PID,
+                None,
+                None,
+                Some("Generic CDC"),
+            ),
+            usb_port(
+                "/dev/ttyUSB1",
+                CARDPUTER_USB_VID,
+                CARDPUTER_USB_PID,
+                None,
+                Some("M5Stack"),
+                Some("Cardputer CDC"),
+            ),
+        ];
+
+        let detected = select_serial_port(&ports, false).expect("cardputer port");
+        assert_eq!(detected.port_name, "/dev/ttyUSB1");
+    }
+
+    #[test]
+    fn detect_cardputer_none_without_match() {
+        let ports = vec![
+            non_usb_port("/dev/ttyS0"),
+            usb_port(
+                "/dev/ttyUSB0",
+                0x10C4,
+                0xEA60,
+                None,
+                Some("Silicon Labs"),
+                Some("CP210x"),
+            ),
+        ];
+
+        assert!(select_serial_port(&ports, false).is_none());
+    }
+
+    #[test]
+    fn detect_cardputer_allows_any_port_override() {
+        let ports = vec![
+            usb_port(
+                "/dev/ttyUSB0",
+                0x10C4,
+                0xEA60,
+                None,
+                Some("Silicon Labs"),
+                Some("CP210x"),
+            ),
+            usb_port(
+                "/dev/ttyUSB1",
+                CARDPUTER_USB_VID,
+                CARDPUTER_USB_PID,
+                None,
+                Some("M5Stack"),
+                Some("Cardputer CDC"),
+            ),
+        ];
+
+        let detected = select_serial_port(&ports, true).expect("usb port");
+        assert_eq!(detected.port_name, "/dev/ttyUSB0");
     }
 
     #[test]
