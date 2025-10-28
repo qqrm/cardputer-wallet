@@ -1,6 +1,21 @@
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+
 use anyhow::Result;
-use clap::Parser;
-use serialport::SerialPortType;
+use clap::{Args, Parser, Subcommand};
+use serialport::{SerialPort, SerialPortType};
+
+use shared::error::SharedError;
+use shared::schema::{
+    AbortReason, AbortRequest, DeviceResponse, HostRequest, JournalFrame, PullVaultRequest,
+    PushAck, SyncCompletion, VaultChunk, PROTOCOL_VERSION,
+};
+
+const SERIAL_BAUD_RATE: u32 = 115_200;
+const DEFAULT_TIMEOUT_SECS: u64 = 2;
+const HOST_BUFFER_SIZE: u32 = 64 * 1024;
+const MAX_CHUNK_SIZE: u32 = 4 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -8,27 +23,453 @@ struct Cli {
     /// Optional path to the serial device. Falls back to auto-detection when omitted.
     #[arg(short, long)]
     port: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Fetch the latest vault data from the device.
+    Pull(RepoArgs),
+    /// Confirm that pushed journal frames were persisted locally.
+    Push(RepoArgs),
+    /// Query the device for its current sync status.
+    Status(RepoArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct RepoArgs {
+    /// Path to the repository that should receive or provide data.
+    #[arg(long, value_name = "PATH")]
+    repo: PathBuf,
+    /// Path to the credentials file used during the operation.
+    #[arg(long, value_name = "PATH")]
+    credentials: PathBuf,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let port = match cli.port {
-        Some(port) => port,
-        None => {
-            detect_first_serial_port()?.ok_or_else(|| anyhow::anyhow!("no CDC device found"))?
+    if let Err(err) = run(cli) {
+        match &err {
+            SharedError::Transport(_) => {
+                eprintln!("Transport failure: {err}");
+            }
+            SharedError::Serialization(_) => {
+                eprintln!("CBOR decoding error: {err}");
+            }
         }
-    };
+        return Err(anyhow::Error::from(err));
+    }
 
-    println!("Connecting to Cardputer on {port}…");
-    // TODO: add CBOR request/response handling using the shared schema.
     Ok(())
 }
 
-fn detect_first_serial_port() -> Result<Option<String>> {
-    let ports = serialport::available_ports()?;
+fn run(cli: Cli) -> Result<(), SharedError> {
+    let port_path = match cli.port {
+        Some(port) => port,
+        None => detect_first_serial_port()?
+            .ok_or_else(|| SharedError::Transport("no CDC device found".to_string()))?,
+    };
+
+    println!("Connecting to Cardputer on {port_path}…");
+    let mut port = open_serial_port(&port_path)?;
+
+    match cli.command {
+        Command::Pull(args) => execute_pull(&mut *port, &args),
+        Command::Push(args) => execute_push(&mut *port, &args),
+        Command::Status(args) => execute_status(&mut *port, &args),
+    }
+}
+
+fn execute_pull<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
+        "Preparing pull for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let request = HostRequest::PullVault(PullVaultRequest {
+        protocol_version: PROTOCOL_VERSION,
+        host_buffer_size: HOST_BUFFER_SIZE,
+        max_chunk_size: MAX_CHUNK_SIZE,
+        known_generation: None,
+    });
+
+    send_host_request(port, &request)?;
+    println!("Request sent. Waiting for device responses…");
+
+    loop {
+        let response = read_device_response(port)?;
+        if !handle_device_response(response)? {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
+        "Confirming push for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let request = HostRequest::AckPush(PushAck {
+        protocol_version: PROTOCOL_VERSION,
+        last_frame_sequence: 0,
+        journal_checksum: 0,
+    });
+
+    send_host_request(port, &request)?;
+    println!("Acknowledgement sent. Awaiting confirmation…");
+
+    loop {
+        let response = read_device_response(port)?;
+        if !handle_device_response(response)? {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_status<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
+        "Checking device status for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let probe = HostRequest::Abort(AbortRequest {
+        protocol_version: PROTOCOL_VERSION,
+        reason: AbortReason::UserCancelled,
+    });
+    send_host_request(port, &probe)?;
+    println!("Status probe sent. Awaiting device reply…");
+
+    let response = read_device_response(port)?;
+    handle_device_response(response)?;
+    Ok(())
+}
+
+fn handle_device_response(response: DeviceResponse) -> Result<bool, SharedError> {
+    match response {
+        DeviceResponse::JournalFrame(frame) => {
+            print_journal_frame(&frame);
+            Ok(true)
+        }
+        DeviceResponse::VaultChunk(chunk) => {
+            print_vault_chunk(&chunk);
+            Ok(true)
+        }
+        DeviceResponse::Completed(summary) => {
+            print_completion(&summary);
+            Ok(false)
+        }
+        DeviceResponse::Error(err) => Err(SharedError::Transport(format!(
+            "device reported {code:?}: {message}",
+            code = err.code,
+            message = err.message
+        ))),
+    }
+}
+
+fn print_journal_frame(frame: &JournalFrame) {
+    println!(
+        "Received journal frame #{sequence} with {remaining} operations pending.",
+        sequence = frame.sequence,
+        remaining = frame.remaining_operations,
+    );
+    if frame.operations.is_empty() {
+        println!("  No operations in this frame.");
+    } else {
+        println!("  Operations: {}", frame.operations.len());
+        for op in &frame.operations {
+            println!("    - {op:?}");
+        }
+    }
+}
+
+fn print_vault_chunk(chunk: &VaultChunk) {
+    println!(
+        "Received vault chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
+        sequence = chunk.sequence,
+        size = chunk.data.len(),
+        remaining = chunk.remaining_bytes,
+    );
+    if chunk.is_last {
+        println!("  This was the final chunk of the transfer.");
+    }
+}
+
+fn print_completion(summary: &SyncCompletion) {
+    println!(
+        "Device completed the sync phase using protocol v{version} after {frames} frames.",
+        version = summary.protocol_version,
+        frames = summary.frames_sent,
+    );
+    println!(
+        "  Stream checksum: 0x{checksum:08X}",
+        checksum = summary.stream_checksum
+    );
+}
+
+fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), SharedError>
+where
+    W: Write + ?Sized,
+{
+    let payload = serde_cbor::to_vec(request)?;
+    write_framed_message(writer, &payload)
+}
+
+fn read_device_response<R>(reader: &mut R) -> Result<DeviceResponse, SharedError>
+where
+    R: Read + ?Sized,
+{
+    let payload = read_framed_message(reader)?;
+    let response = serde_cbor::from_slice(&payload)?;
+    Ok(response)
+}
+
+fn write_framed_message<W>(writer: &mut W, payload: &[u8]) -> Result<(), SharedError>
+where
+    W: Write + ?Sized,
+{
+    let length = payload.len();
+    if length > u32::MAX as usize {
+        return Err(SharedError::Transport(format!(
+            "payload too large: {length} bytes"
+        )));
+    }
+
+    let length_bytes = (length as u32).to_le_bytes();
+    writer
+        .write_all(&length_bytes)
+        .map_err(map_io_error("write frame length"))?;
+    writer
+        .write_all(payload)
+        .map_err(map_io_error("write frame payload"))?;
+
+    let checksum = crc32fast::hash(payload);
+    writer
+        .write_all(&checksum.to_le_bytes())
+        .map_err(map_io_error("write frame checksum"))?;
+    writer.flush().map_err(map_io_error("flush frame"))?;
+    Ok(())
+}
+
+fn read_framed_message<R>(reader: &mut R) -> Result<Vec<u8>, SharedError>
+where
+    R: Read + ?Sized,
+{
+    let mut length_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut length_bytes)
+        .map_err(map_io_error("read frame length"))?;
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    let mut payload = vec![0u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(map_io_error("read frame payload"))?;
+
+    let mut checksum_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut checksum_bytes)
+        .map_err(map_io_error("read frame checksum"))?;
+    let expected = u32::from_le_bytes(checksum_bytes);
+    let actual = crc32fast::hash(&payload);
+    if expected != actual {
+        return Err(SharedError::Transport(format!(
+            "checksum mismatch (expected 0x{expected:08X}, calculated 0x{actual:08X})"
+        )));
+    }
+
+    Ok(payload)
+}
+
+fn open_serial_port(path: &str) -> Result<Box<dyn SerialPort>, SharedError> {
+    let mut port = serialport::new(path, SERIAL_BAUD_RATE)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .open()
+        .map_err(|err| {
+            SharedError::Transport(format!("failed to open serial port {path}: {err}"))
+        })?;
+
+    port.set_timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .map_err(|err| {
+            SharedError::Transport(format!("failed to configure timeout on {path}: {err}"))
+        })?;
+
+    Ok(port)
+}
+
+fn detect_first_serial_port() -> Result<Option<String>, SharedError> {
+    let ports = serialport::available_ports().map_err(|err| {
+        SharedError::Transport(format!("failed to enumerate serial ports: {err}"))
+    })?;
     let port = ports
         .into_iter()
         .find(|p| matches!(p.port_type, SerialPortType::UsbPort(_)))
         .map(|p| p.port_name);
     Ok(port)
+}
+
+fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
+    move |err| {
+        let mut message = format!("{context} failed: {err}");
+        if err.kind() == io::ErrorKind::TimedOut {
+            message.push_str(" (operation timed out)");
+        }
+        SharedError::Transport(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn encode_response(response: DeviceResponse) -> Vec<u8> {
+        let payload = serde_cbor::to_vec(&response).expect("encode response");
+        let mut cursor = Cursor::new(Vec::new());
+        write_framed_message(&mut cursor, &payload).expect("write frame");
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn framing_roundtrip() {
+        let request = HostRequest::PullVault(PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: HOST_BUFFER_SIZE,
+            max_chunk_size: MAX_CHUNK_SIZE,
+            known_generation: Some(7),
+        });
+
+        let payload = serde_cbor::to_vec(&request).expect("encode request");
+        let mut writer = Cursor::new(Vec::new());
+        write_framed_message(&mut writer, &payload).expect("write frame");
+
+        let data = writer.into_inner();
+        let mut reader = Cursor::new(data);
+        let decoded = read_framed_message(&mut reader).expect("read frame");
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn framing_detects_checksum_mismatch() {
+        let payload = vec![1u8, 2, 3, 4];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+
+        let mut reader = Cursor::new(frame);
+        let err = read_framed_message(&mut reader).expect_err("expected checksum error");
+        match err {
+            SharedError::Transport(message) => {
+                assert!(message.contains("checksum mismatch"));
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn pull_sends_request_and_stops_on_completion() {
+        let responses = [
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: 1024,
+                remaining_bytes: 512,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![0; 8],
+                checksum: 0x1234ABCD,
+                is_last: false,
+            })),
+            encode_response(DeviceResponse::Completed(SyncCompletion {
+                protocol_version: PROTOCOL_VERSION,
+                frames_sent: 2,
+                stream_checksum: 0xCAFEBABE,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let args = RepoArgs {
+            repo: PathBuf::from("/tmp/repo"),
+            credentials: PathBuf::from("/tmp/creds"),
+        };
+
+        execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let payload = read_framed_message(&mut reader).expect("decode written frame");
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+        assert!(matches!(decoded, HostRequest::PullVault(_)));
+    }
+
+    #[test]
+    fn status_sends_abort_probe() {
+        let responses = encode_response(DeviceResponse::Completed(SyncCompletion {
+            protocol_version: PROTOCOL_VERSION,
+            frames_sent: 0,
+            stream_checksum: 0,
+        }));
+
+        let mut port = MockPort::new(responses);
+        let args = RepoArgs {
+            repo: PathBuf::from("/tmp/repo"),
+            credentials: PathBuf::from("/tmp/creds"),
+        };
+
+        execute_status(&mut port, &args).expect("status succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let payload = read_framed_message(&mut reader).expect("decode written frame");
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+        assert!(matches!(decoded, HostRequest::Abort(_)));
+    }
+
+    struct MockPort {
+        read_cursor: Cursor<Vec<u8>>,
+        writes: Vec<u8>,
+    }
+
+    impl MockPort {
+        fn new(read_data: Vec<u8>) -> Self {
+            Self {
+                read_cursor: Cursor::new(read_data),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MockPort {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read_cursor.read(buf)
+        }
+    }
+
+    impl Write for MockPort {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }
