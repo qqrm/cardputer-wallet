@@ -9,4 +9,7 @@ clap = { version = "4", features = ["derive"] }
 serialport = { version = "4", default-features = false }
 serde_cbor = "0.11"
 shared = { path = "../shared" }
+
+[package.metadata.cargo-machete]
+ignored = ["serde", "serde_cbor", "shared"]
 crc32fast = "1"
