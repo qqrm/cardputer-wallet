@@ -11,20 +11,32 @@ This crate contains the embedded firmware for the Cardputer wallet prototype tar
 
 ## Building
 
-1. Install the Espressif Rust tooling and Xtensa target support:
+1. Install the official Espressif Rust toolchain for Xtensa devices by following the [xtensa setup guide](https://docs.espressif.com/projects/rust/book/getting-started/toolchain.html#xtensa-devices). The short version is:
 
    ```bash
-   rustup target add xtensa-esp32s3-none-elf
+   cargo install espup
+   espup install --targets esp32s3
+   source "$HOME/.cargo/env"
+   source "$HOME/export-esp.sh"
    cargo install espflash
    ```
 
-2. Build the firmware in release mode:
+2. (Optional) Regenerate the firmware scaffold with [`esp-generate`](https://github.com/esp-rs/esp-generate) when creating a new board profile:
+
+   ```bash
+   cargo install esp-generate
+   esp-generate generate cardputer-wallet
+   ```
+
+   The existing crate already follows the generated layout; run the command only when bootstrapping a fresh checkout.
+
+3. Build the firmware in release mode:
 
    ```bash
    cargo build --release -p firmware --target xtensa-esp32s3-none-elf
    ```
 
-3. Flash the resulting image using `espflash` (adjust the serial port as needed):
+4. Flash the resulting image using `espflash` (adjust the serial port as needed):
 
    ```bash
    espflash flash target/xtensa-esp32s3-none-elf/release/firmware
