@@ -6,10 +6,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-serialport = { version = "4", default-features = false }
+serialport = { version = "4", default-features = false, features = ["usbportinfo-interface"] }
 serde_cbor = "0.11"
 shared = { path = "../shared" }
+crc32fast = "1"
 
 [package.metadata.cargo-machete]
 ignored = ["serde", "serde_cbor", "shared"]
-crc32fast = "1"

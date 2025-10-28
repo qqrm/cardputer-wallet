@@ -26,3 +26,9 @@ cargo run -p host-cli -- pull --repo ./vault-replica --credentials ./cardputer.j
 ```
 
 The CLI opens the detected USB CDC port (or the path provided through `--port`), transmits the request using CBOR framing, and then prints progress as vault chunks, journal frames, and completion records are received.
+
+### Serial port detection
+
+By default the CLI scans all local USB CDC ports and selects the first device that reports the Cardputer vendor/product pair (`VID 0x303A`, `PID 0x4001`). If multiple ports expose that identity it prefers the one whose USB metadata references `Cardputer` or `M5Stack` in the product, manufacturer, or serial fields.
+
+Pass `--any-port` to disable the filter and open the first enumerated USB serial device. This is useful when testing against mock firmware or development boards that use a different USB descriptor. When no matching Cardputer is found the CLI reports the expected VID/PID and suggests using the override for debugging.
