@@ -5,13 +5,15 @@ edition = "2021"
 publish = false
 
 [dependencies]
+serde_cbor = { version = "0.11", default-features = false, features = ["alloc"] }
+shared = { path = "../shared" }
+zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_arch = "xtensa")'.dependencies]
 embassy-executor = { version = "0.2", default-features = false }
 esp-hal = { version = "1.0.0-rc.1", default-features = false, features = ["esp32s3", "unstable"] }
 esp-hal-embassy = { version = "0.9", default-features = false, features = ["esp32s3"] }
 esp-alloc = "0.4"
 embassy-time = { version = "0.4", default-features = false }
 nb = "1.1"
-serde_cbor = { version = "0.11", default-features = false, features = ["alloc"] }
-shared = { path = "../shared" }
 static_cell = "2.1"
-zeroize = { version = "1.7", default-features = false, features = ["alloc"] }

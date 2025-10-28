@@ -6,6 +6,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serialport::{SerialPort, SerialPortType};
 
+use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
     AbortReason, AbortRequest, DeviceResponse, HostRequest, JournalFrame, PullVaultRequest,
@@ -236,19 +237,25 @@ where
     W: Write + ?Sized,
 {
     let payload = serde_cbor::to_vec(request)?;
-    write_framed_message(writer, &payload)
+    let command = command_for_request(request);
+    write_framed_message(writer, command, &payload)
 }
 
 fn read_device_response<R>(reader: &mut R) -> Result<DeviceResponse, SharedError>
 where
     R: Read + ?Sized,
 {
-    let payload = read_framed_message(reader)?;
+    let (command, payload) = read_framed_message(reader)?;
     let response = serde_cbor::from_slice(&payload)?;
+    validate_response_command(command, &response)?;
     Ok(response)
 }
 
-fn write_framed_message<W>(writer: &mut W, payload: &[u8]) -> Result<(), SharedError>
+fn write_framed_message<W>(
+    writer: &mut W,
+    command: CdcCommand,
+    payload: &[u8],
+) -> Result<(), SharedError>
 where
     W: Write + ?Sized,
 {
@@ -259,49 +266,84 @@ where
         )));
     }
 
-    let length_bytes = (length as u32).to_le_bytes();
+    let checksum = compute_crc32(payload);
+    let header = FrameHeader::new(PROTOCOL_VERSION, command, length as u32, checksum);
     writer
-        .write_all(&length_bytes)
-        .map_err(map_io_error("write frame length"))?;
+        .write_all(&header.to_bytes())
+        .map_err(map_io_error("write frame header"))?;
     writer
         .write_all(payload)
         .map_err(map_io_error("write frame payload"))?;
 
-    let checksum = crc32fast::hash(payload);
-    writer
-        .write_all(&checksum.to_le_bytes())
-        .map_err(map_io_error("write frame checksum"))?;
     writer.flush().map_err(map_io_error("flush frame"))?;
     Ok(())
 }
 
-fn read_framed_message<R>(reader: &mut R) -> Result<Vec<u8>, SharedError>
+fn read_framed_message<R>(reader: &mut R) -> Result<(CdcCommand, Vec<u8>), SharedError>
 where
     R: Read + ?Sized,
 {
-    let mut length_bytes = [0u8; 4];
+    let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
     reader
-        .read_exact(&mut length_bytes)
-        .map_err(map_io_error("read frame length"))?;
-    let length = u32::from_le_bytes(length_bytes) as usize;
+        .read_exact(&mut header_bytes)
+        .map_err(map_io_error("read frame header"))?;
+    let header = FrameHeader::from_bytes(header_bytes)
+        .map_err(|err| SharedError::Transport(format!("failed to decode header: {err}")))?;
+
+    if header.version != PROTOCOL_VERSION {
+        return Err(SharedError::Transport(format!(
+            "unsupported protocol version: {}",
+            header.version
+        )));
+    }
+
+    let length = header.length as usize;
     let mut payload = vec![0u8; length];
     reader
         .read_exact(&mut payload)
         .map_err(map_io_error("read frame payload"))?;
 
-    let mut checksum_bytes = [0u8; 4];
-    reader
-        .read_exact(&mut checksum_bytes)
-        .map_err(map_io_error("read frame checksum"))?;
-    let expected = u32::from_le_bytes(checksum_bytes);
-    let actual = crc32fast::hash(&payload);
+    let expected = header.checksum;
+    let actual = compute_crc32(&payload);
     if expected != actual {
         return Err(SharedError::Transport(format!(
             "checksum mismatch (expected 0x{expected:08X}, calculated 0x{actual:08X})"
         )));
     }
 
-    Ok(payload)
+    Ok((header.command, payload))
+}
+
+fn command_for_request(request: &HostRequest) -> CdcCommand {
+    match request {
+        HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::AckPush(_) => CdcCommand::Ack,
+        HostRequest::Abort(_) => CdcCommand::Nack,
+    }
+}
+
+fn command_for_response(response: &DeviceResponse) -> CdcCommand {
+    match response {
+        DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
+        DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
+        DeviceResponse::Completed(_) => CdcCommand::Status,
+        DeviceResponse::Error(_) => CdcCommand::Nack,
+    }
+}
+
+fn validate_response_command(
+    command: CdcCommand,
+    response: &DeviceResponse,
+) -> Result<(), SharedError> {
+    let expected = command_for_response(response);
+    if command == expected {
+        Ok(())
+    } else {
+        Err(SharedError::Transport(format!(
+            "unexpected command {:?} for response {:?} (expected {:?})",
+            command, response, expected
+        )))
+    }
 }
 
 fn open_serial_port(path: &str) -> Result<Box<dyn SerialPort>, SharedError> {
@@ -415,6 +457,7 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::schema::{DeviceError, DeviceErrorCode};
     use std::io::Cursor;
 
     fn usb_port(
@@ -448,7 +491,8 @@ mod tests {
     fn encode_response(response: DeviceResponse) -> Vec<u8> {
         let payload = serde_cbor::to_vec(&response).expect("encode response");
         let mut cursor = Cursor::new(Vec::new());
-        write_framed_message(&mut cursor, &payload).expect("write frame");
+        let command = command_for_response(&response);
+        write_framed_message(&mut cursor, command, &payload).expect("write frame");
         cursor.into_inner()
     }
 
@@ -548,12 +592,14 @@ mod tests {
 
         let payload = serde_cbor::to_vec(&request).expect("encode request");
         let mut writer = Cursor::new(Vec::new());
-        write_framed_message(&mut writer, &payload).expect("write frame");
+        let command = command_for_request(&request);
+        write_framed_message(&mut writer, command, &payload).expect("write frame");
 
         let data = writer.into_inner();
         let mut reader = Cursor::new(data);
-        let decoded = read_framed_message(&mut reader).expect("read frame");
+        let (decoded_command, decoded) = read_framed_message(&mut reader).expect("read frame");
 
+        assert_eq!(decoded_command, command);
         assert_eq!(decoded, payload);
     }
 
@@ -561,15 +607,49 @@ mod tests {
     fn framing_detects_checksum_mismatch() {
         let payload = vec![1u8, 2, 3, 4];
         let mut frame = Vec::new();
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let header = FrameHeader::new(
+            PROTOCOL_VERSION,
+            CdcCommand::PullVault,
+            payload.len() as u32,
+            0xDEADBEEFu32,
+        );
+        frame.extend_from_slice(&header.to_bytes());
         frame.extend_from_slice(&payload);
-        frame.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
 
         let mut reader = Cursor::new(frame);
         let err = read_framed_message(&mut reader).expect_err("expected checksum error");
         match err {
             SharedError::Transport(message) => {
                 assert!(message.contains("checksum mismatch"));
+            }
+            _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn response_command_mismatch_is_reported() {
+        let response = DeviceResponse::Error(DeviceError {
+            protocol_version: PROTOCOL_VERSION,
+            code: DeviceErrorCode::InternalFailure,
+            message: "failure".into(),
+        });
+        let payload = serde_cbor::to_vec(&response).expect("encode response");
+        let mut frame = Vec::new();
+        let checksum = compute_crc32(&payload);
+        let wrong_command = FrameHeader::new(
+            PROTOCOL_VERSION,
+            CdcCommand::PullVault,
+            payload.len() as u32,
+            checksum,
+        );
+        frame.extend_from_slice(&wrong_command.to_bytes());
+        frame.extend_from_slice(&payload);
+
+        let mut reader = Cursor::new(frame);
+        let err = read_device_response(&mut reader).expect_err("expected command error");
+        match err {
+            SharedError::Transport(message) => {
+                assert!(message.contains("unexpected command"));
             }
             _ => panic!("unexpected error variant"),
         }
@@ -605,7 +685,8 @@ mod tests {
         execute_pull(&mut port, &args).expect("pull succeeds");
 
         let mut reader = Cursor::new(port.writes);
-        let payload = read_framed_message(&mut reader).expect("decode written frame");
+        let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
+        assert_eq!(command, CdcCommand::PullVault);
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
         assert!(matches!(decoded, HostRequest::PullVault(_)));
     }
@@ -627,7 +708,8 @@ mod tests {
         execute_status(&mut port, &args).expect("status succeeds");
 
         let mut reader = Cursor::new(port.writes);
-        let payload = read_framed_message(&mut reader).expect("decode written frame");
+        let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
+        assert_eq!(command, CdcCommand::Nack);
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
         assert!(matches!(decoded, HostRequest::Abort(_)));
     }

@@ -7,3 +7,4 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_cbor = "0.11"
 thiserror = "1"
+crc32fast = { version = "1", default-features = false }

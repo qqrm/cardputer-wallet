@@ -3,9 +3,12 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::cmp;
 
+#[cfg(target_arch = "xtensa")]
+use shared::cdc::FRAME_HEADER_SIZE;
+use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
 use shared::schema::{
     AbortRequest, DeviceError, DeviceErrorCode, DeviceResponse, HostRequest, JournalFrame,
     JournalOperation, PullVaultRequest, PushAck, SyncCompletion, VaultChunk, PROTOCOL_VERSION,
@@ -33,10 +36,15 @@ pub enum ProtocolError {
     Encode(String),
     /// Host requested a protocol version that we do not understand.
     UnsupportedProtocol(u16),
+    /// Header contained a command that does not match the encoded payload.
+    InvalidCommand,
+    /// CRC validation failed for an incoming frame.
+    ChecksumMismatch,
     /// Host acknowledged a journal frame with mismatching metadata.
     InvalidAcknowledgement,
 }
 
+#[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 impl ProtocolError {
     fn as_device_error(&self) -> DeviceError {
         let (code, message) = match self {
@@ -59,6 +67,14 @@ impl ProtocolError {
             ProtocolError::UnsupportedProtocol(version) => (
                 DeviceErrorCode::StaleGeneration,
                 format!("unsupported protocol version: {version}"),
+            ),
+            ProtocolError::InvalidCommand => (
+                DeviceErrorCode::ChecksumMismatch,
+                "command identifier did not match the encoded payload".into(),
+            ),
+            ProtocolError::ChecksumMismatch => (
+                DeviceErrorCode::ChecksumMismatch,
+                "frame checksum validation failed".into(),
             ),
             ProtocolError::InvalidAcknowledgement => (
                 DeviceErrorCode::ChecksumMismatch,
@@ -227,16 +243,52 @@ fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> 
     serde_cbor::to_vec(response).map_err(|err| ProtocolError::Encode(err.to_string()))
 }
 
+fn command_for_request(request: &HostRequest) -> CdcCommand {
+    match request {
+        HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::AckPush(_) => CdcCommand::Ack,
+        HostRequest::Abort(_) => CdcCommand::Nack,
+    }
+}
+
+fn command_for_response(response: &DeviceResponse) -> CdcCommand {
+    match response {
+        DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
+        DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
+        DeviceResponse::Completed(_) => CdcCommand::Status,
+        DeviceResponse::Error(_) => CdcCommand::Nack,
+    }
+}
+
+#[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
+fn validate_checksum(header: &FrameHeader, payload: &[u8]) -> Result<(), ProtocolError> {
+    let checksum = compute_crc32(payload);
+    if checksum == header.checksum {
+        Ok(())
+    } else {
+        Err(ProtocolError::ChecksumMismatch)
+    }
+}
+
 /// Decode a host frame, dispatch to the appropriate handler and encode the response.
-pub fn process_host_frame(frame: &[u8], ctx: &mut SyncContext) -> Result<Vec<u8>, ProtocolError> {
+pub fn process_host_frame(
+    command: CdcCommand,
+    frame: &[u8],
+    ctx: &mut SyncContext,
+) -> Result<(CdcCommand, Vec<u8>), ProtocolError> {
     let request = decode_request(frame)?;
+    if command_for_request(&request) != command {
+        return Err(ProtocolError::InvalidCommand);
+    }
+
     let response = match request {
         HostRequest::PullVault(pull) => handle_pull(&pull, ctx)?,
         HostRequest::AckPush(ack) => handle_push(&ack, ctx)?,
         HostRequest::Abort(abort) => handle_abort(&abort, ctx),
     };
 
-    encode_response(&response)
+    let response_command = command_for_response(&response);
+    Ok((response_command, encode_response(&response)?))
 }
 
 fn handle_pull(
@@ -360,12 +412,12 @@ mod tasks {
     pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, mut ctx: SyncContext) {
         loop {
             match read_frame(&mut serial).await {
-                Ok(frame) => match process_host_frame(&frame, &mut ctx) {
-                    Ok(response) => {
-                        let _ = write_frame(&mut serial, &response);
+                Ok((command, frame)) => match process_host_frame(command, &frame, &mut ctx) {
+                    Ok((response_command, response)) => {
+                        let _ = write_frame(&mut serial, response_command, &response);
                     }
                     Err(err) => {
-                        let error_frame =
+                        let payload =
                             match encode_response(&DeviceResponse::Error(err.as_device_error())) {
                                 Ok(encoded) => encoded,
                                 Err(encode_err) => {
@@ -374,11 +426,11 @@ mod tasks {
                                         .unwrap_or_default()
                                 }
                             };
-                        let _ = write_frame(&mut serial, &error_frame);
+                        let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                     }
                 },
                 Err(err) => {
-                    let error_frame =
+                    let payload =
                         match encode_response(&DeviceResponse::Error(err.as_device_error())) {
                             Ok(encoded) => encoded,
                             Err(encode_err) => {
@@ -387,7 +439,7 @@ mod tasks {
                                     .unwrap_or_default()
                             }
                         };
-                    let _ = write_frame(&mut serial, &error_frame);
+                    let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                 }
             }
         }
@@ -395,26 +447,31 @@ mod tasks {
 
     async fn read_frame(
         serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<Vec<u8>, ProtocolError> {
-        let length = read_length(serial).await?;
-        if length as usize > FRAME_MAX_SIZE {
-            return Err(ProtocolError::FrameTooLarge(length as usize));
+    ) -> Result<(CdcCommand, Vec<u8>), ProtocolError> {
+        let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
+        for byte in header_bytes.iter_mut() {
+            *byte = read_byte(serial).await?;
         }
 
-        let mut buffer = Vec::with_capacity(length as usize);
-        for _ in 0..length {
+        let header = FrameHeader::from_bytes(header_bytes)
+            .map_err(|err| ProtocolError::Decode(err.to_string()))?;
+
+        if header.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedProtocol(header.version));
+        }
+
+        if header.length as usize > FRAME_MAX_SIZE {
+            return Err(ProtocolError::FrameTooLarge(header.length as usize));
+        }
+
+        let mut buffer = Vec::with_capacity(header.length as usize);
+        for _ in 0..header.length {
             buffer.push(read_byte(serial).await?);
         }
 
-        Ok(buffer)
-    }
+        validate_checksum(&header, &buffer)?;
 
-    async fn read_length(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<u16, ProtocolError> {
-        let lsb = read_byte(serial).await? as u16;
-        let msb = read_byte(serial).await? as u16;
-        Ok(lsb | (msb << 8))
+        Ok((header.command, buffer))
     }
 
     async fn read_byte(serial: &mut UsbSerialJtag<'static, Blocking>) -> Result<u8, ProtocolError> {
@@ -429,14 +486,19 @@ mod tasks {
 
     fn write_frame(
         serial: &mut UsbSerialJtag<'static, Blocking>,
+        command: CdcCommand,
         payload: &[u8],
     ) -> Result<(), ProtocolError> {
-        if payload.len() > u16::MAX as usize {
+        if payload.len() > FRAME_MAX_SIZE {
             return Err(ProtocolError::FrameTooLarge(payload.len()));
         }
-        let length = payload.len() as u16;
+
+        let length = payload.len() as u32;
+        let checksum = compute_crc32(payload);
+        let header = FrameHeader::new(PROTOCOL_VERSION, command, length, checksum).to_bytes();
+
         serial
-            .write(&[length as u8, (length >> 8) as u8])
+            .write(&header)
             .map_err(|_| ProtocolError::Transport)?;
         if !payload.is_empty() {
             serial
@@ -466,7 +528,9 @@ mod tests {
         });
 
         let encoded = serde_cbor::to_vec(&request).expect("encode request");
-        let response_bytes = process_host_frame(&encoded, &mut ctx).expect("process pull");
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::PullVault, &encoded, &mut ctx).expect("process pull");
+        assert_eq!(command, CdcCommand::PushOps);
         let response: DeviceResponse =
             serde_cbor::from_slice(&response_bytes).expect("decode response");
 
@@ -494,7 +558,9 @@ mod tests {
             known_generation: None,
         });
         let encoded_pull = serde_cbor::to_vec(&pull_request).unwrap();
-        let response_bytes = process_host_frame(&encoded_pull, &mut ctx).unwrap();
+        let (response_command, response_bytes) =
+            process_host_frame(CdcCommand::PullVault, &encoded_pull, &mut ctx).unwrap();
+        assert_eq!(response_command, CdcCommand::PushOps);
         let frame: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
         let (sequence, checksum) = match frame {
             DeviceResponse::JournalFrame(frame) => (frame.sequence, frame.checksum),
@@ -507,7 +573,9 @@ mod tests {
             journal_checksum: checksum,
         });
         let encoded_ack = serde_cbor::to_vec(&ack).unwrap();
-        let ack_response = process_host_frame(&encoded_ack, &mut ctx).unwrap();
+        let (ack_command, ack_response) =
+            process_host_frame(CdcCommand::Ack, &encoded_ack, &mut ctx).unwrap();
+        assert_eq!(ack_command, CdcCommand::Status);
         let decoded: DeviceResponse = serde_cbor::from_slice(&ack_response).unwrap();
 
         match decoded {
@@ -529,7 +597,41 @@ mod tests {
             known_generation: None,
         });
         let encoded = serde_cbor::to_vec(&request).unwrap();
-        let error = process_host_frame(&encoded, &mut ctx).expect_err("expected rejection");
+        let error = process_host_frame(CdcCommand::PullVault, &encoded, &mut ctx)
+            .expect_err("expected rejection");
         assert!(matches!(error, ProtocolError::UnsupportedProtocol(_)));
+    }
+
+    #[test]
+    fn mismatched_command_is_rejected() {
+        let mut ctx = SyncContext::new();
+        let request = HostRequest::PullVault(PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 1,
+            max_chunk_size: 1,
+            known_generation: None,
+        });
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let error = process_host_frame(CdcCommand::Ack, &encoded, &mut ctx)
+            .expect_err("expected command mismatch");
+        assert_eq!(error, ProtocolError::InvalidCommand);
+    }
+
+    #[test]
+    fn checksum_validation_detects_corruption() {
+        let payload = b"payload".to_vec();
+        let mut header = FrameHeader::new(
+            PROTOCOL_VERSION,
+            CdcCommand::PullVault,
+            payload.len() as u32,
+            compute_crc32(&payload),
+        );
+
+        // Good checksum passes validation.
+        validate_checksum(&header, &payload).expect("valid checksum");
+
+        header.checksum ^= 0xFFFF_FFFF;
+        let error = validate_checksum(&header, &payload).expect_err("expected checksum error");
+        assert_eq!(error, ProtocolError::ChecksumMismatch);
     }
 }
