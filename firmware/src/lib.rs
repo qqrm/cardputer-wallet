@@ -200,30 +200,62 @@ impl SyncContext {
     }
 
     fn next_vault_chunk(&mut self, max_chunk: usize) -> VaultChunk {
-        let chunk_size = cmp::min(
-            cmp::min(max_chunk, FRAME_MAX_SIZE),
-            self.vault_image.len().saturating_sub(self.vault_offset),
-        );
-        let slice_end = self.vault_offset + chunk_size;
-        let payload = if chunk_size == 0 {
-            Vec::new()
-        } else {
-            self.vault_image[self.vault_offset..slice_end].to_vec()
-        };
+        let available = self.vault_image.len().saturating_sub(self.vault_offset);
+        let max_payload = cmp::min(max_chunk, FRAME_MAX_SIZE);
+        let mut chunk_size = cmp::min(max_payload, available);
+        let device_chunk_size = cmp::max(1, max_payload) as u32;
 
-        self.vault_offset = slice_end;
-        let remaining = self.vault_image.len().saturating_sub(self.vault_offset) as u64;
-        let checksum = accumulate_checksum(0, &payload);
+        loop {
+            let slice_end = self.vault_offset + chunk_size;
+            let payload = if chunk_size == 0 {
+                Vec::new()
+            } else {
+                self.vault_image[self.vault_offset..slice_end].to_vec()
+            };
 
-        VaultChunk {
-            protocol_version: PROTOCOL_VERSION,
-            sequence: self.next_sequence,
-            total_size: self.vault_image.len() as u64,
-            remaining_bytes: remaining,
-            device_chunk_size: cmp::max(1, cmp::min(FRAME_MAX_SIZE, max_chunk)) as u32,
-            data: payload,
-            checksum,
-            is_last: remaining == 0,
+            let remaining = self.vault_image.len().saturating_sub(slice_end) as u64;
+            let checksum = accumulate_checksum(0, &payload);
+
+            let chunk = VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: self.next_sequence,
+                total_size: self.vault_image.len() as u64,
+                remaining_bytes: remaining,
+                device_chunk_size,
+                data: payload,
+                checksum,
+                is_last: remaining == 0,
+            };
+
+            let encoded_len = match serde_cbor::to_vec(&DeviceResponse::VaultChunk(chunk.clone())) {
+                Ok(bytes) => bytes.len(),
+                Err(_) => return chunk,
+            };
+
+            if encoded_len <= FRAME_MAX_SIZE {
+                self.vault_offset = slice_end;
+                return chunk;
+            }
+
+            if chunk_size == 0 {
+                return chunk;
+            }
+
+            let overhead = encoded_len.saturating_sub(chunk.data.len());
+            if overhead >= FRAME_MAX_SIZE {
+                chunk_size = 0;
+                continue;
+            }
+
+            let target_size = FRAME_MAX_SIZE - overhead;
+            let max_allowed = cmp::min(max_payload, available);
+            let new_size = cmp::min(target_size, max_allowed);
+
+            if new_size >= chunk_size {
+                chunk_size = chunk_size.saturating_sub(1);
+            } else {
+                chunk_size = new_size;
+            }
         }
     }
 }
