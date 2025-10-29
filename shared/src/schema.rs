@@ -6,25 +6,130 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Host initiated requests travelling from the CLI to the device during a sync session.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum HostRequest {
+    /// Initiate a fresh session with the device and negotiate capabilities.
+    Hello(HelloRequest),
+    /// Query the device for its current synchronization status.
+    Status(StatusRequest),
+    /// Update the device real time clock to a host supplied timestamp.
+    SetTime(SetTimeRequest),
+    /// Ask the device to report its notion of wall clock time.
+    GetTime(GetTimeRequest),
+    /// Request the device to provide metadata describing the latest vault head.
+    PullHead(PullHeadRequest),
     /// Request the device to stream its latest vault back to the host.
     PullVault(PullVaultRequest),
     /// Confirm that a sequence of journal frames has been applied successfully by the host.
-    AckPush(PushAck),
-    /// Abort the current sync session with an explicit reason.
-    Abort(AbortRequest),
+    Ack(AckRequest),
 }
 
 /// Responses sent by the device back to the host during a sync session.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum DeviceResponse {
+    /// Confirmation that a session has been established with device metadata.
+    Hello(HelloResponse),
+    /// Summary of the device sync state.
+    Status(StatusResponse),
+    /// Current notion of wall clock time exposed by the device.
+    Time(TimeResponse),
+    /// Metadata describing the latest encrypted vault artifacts.
+    Head(PullHeadResponse),
     /// A batch of journal operations produced by the device for the host to apply.
     JournalFrame(JournalFrame),
     /// A chunk of the encrypted vault streamed from the device.
     VaultChunk(VaultChunk),
-    /// Final status after completing a sync phase.
-    Completed(SyncCompletion),
+    /// Confirmation that a host initiated command completed successfully.
+    Ack(AckResponse),
     /// Failure reported by the device while handling the previous host request.
-    Error(DeviceError),
+    Nack(NackResponse),
+}
+
+/// Payload for the HELLO request sent by the host.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct HelloRequest {
+    /// Version of the protocol expected by the host for this session.
+    pub protocol_version: u16,
+    /// Identifier for the host environment (helpful for logs).
+    pub client_name: String,
+    /// Version string describing the host CLI.
+    pub client_version: String,
+}
+
+/// Device metadata returned after a successful HELLO handshake.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct HelloResponse {
+    /// Protocol version agreed for the session.
+    pub protocol_version: u16,
+    /// Human readable identifier for the device.
+    pub device_name: String,
+    /// Firmware version currently running on the device.
+    pub firmware_version: String,
+    /// Opaque identifier used to correlate subsequent requests with this session.
+    pub session_id: u32,
+}
+
+/// Host request asking for the current device status.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct StatusRequest {
+    /// Protocol version expected by the host.
+    pub protocol_version: u16,
+}
+
+/// Snapshot of the device sync status.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct StatusResponse {
+    /// Protocol version used when generating the response.
+    pub protocol_version: u16,
+    /// Monotonic generation counter for the vault.
+    pub vault_generation: u64,
+    /// Number of journal operations waiting to be synced to the host.
+    pub pending_operations: u32,
+    /// Device notion of the current wall clock in milliseconds since the Unix epoch.
+    pub current_time_ms: u64,
+}
+
+/// Host request to update the device notion of wall clock time.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct SetTimeRequest {
+    /// Protocol version expected by the host.
+    pub protocol_version: u16,
+    /// Milliseconds since the Unix epoch provided by the host.
+    pub epoch_millis: u64,
+}
+
+/// Host request to read the device notion of wall clock time.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct GetTimeRequest {
+    /// Protocol version expected by the host.
+    pub protocol_version: u16,
+}
+
+/// Current wall clock time returned by the device.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct TimeResponse {
+    /// Protocol version used when encoding the response.
+    pub protocol_version: u16,
+    /// Milliseconds since the Unix epoch according to the device.
+    pub epoch_millis: u64,
+}
+
+/// Host request for high level vault metadata.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PullHeadRequest {
+    /// Protocol version expected by the host.
+    pub protocol_version: u16,
+}
+
+/// Metadata describing the latest vault artefacts.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PullHeadResponse {
+    /// Protocol version used when encoding the response.
+    pub protocol_version: u16,
+    /// Monotonic generation counter for the vault artefact.
+    pub vault_generation: u64,
+    /// Hash of the encrypted vault content.
+    pub vault_hash: [u8; 32],
+    /// Hash of the recipients manifest associated with the vault.
+    pub recipients_hash: [u8; 32],
 }
 
 /// Metadata accompanying the host request to pull the vault from the device.
@@ -42,33 +147,13 @@ pub struct PullVaultRequest {
 
 /// Host acknowledgement that a push flow journal was persisted successfully.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct PushAck {
+pub struct AckRequest {
     /// Version of the protocol used by the host for the acknowledgement.
     pub protocol_version: u16,
     /// Sequential identifier that matches the last processed journal frame.
     pub last_frame_sequence: u32,
     /// Rolling CRC32 of the journal payloads applied by the host.
     pub journal_checksum: u32,
-}
-
-/// Host initiated abort with a human readable context.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct AbortRequest {
-    /// Version of the protocol understood by the host when issuing the abort.
-    pub protocol_version: u16,
-    /// Reason for the abort so the device can render an error message.
-    pub reason: AbortReason,
-}
-
-/// Canonical abort reasons supported by the host implementation.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub enum AbortReason {
-    /// Host detected an unrecoverable transport or decoding error.
-    TransportFailure,
-    /// Vault verification failed on the host side.
-    VerificationFailed,
-    /// Operator cancelled the sync flow manually.
-    UserCancelled,
 }
 
 /// Journal data generated by the device and consumed by the host.
@@ -125,20 +210,18 @@ pub struct VaultChunk {
     pub is_last: bool,
 }
 
-/// Status emitted when the device finalises a sync phase.
+/// Response sent when a host command completes successfully.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct SyncCompletion {
-    /// Protocol version agreed for the session.
+pub struct AckResponse {
+    /// Protocol version used when encoding the acknowledgement.
     pub protocol_version: u16,
-    /// Total number of frames sent during the completed phase.
-    pub frames_sent: u32,
-    /// CRC32 of the entire payload stream seen by the device.
-    pub stream_checksum: u32,
+    /// Short description of the action that completed.
+    pub message: String,
 }
 
 /// Describes an error condition detected by the device.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
-pub struct DeviceError {
+pub struct NackResponse {
     /// Protocol version in use when the error was detected.
     pub protocol_version: u16,
     /// Stable error code for programmatic handling.
@@ -166,11 +249,10 @@ mod tests {
 
     #[test]
     fn host_request_roundtrip() {
-        let request = HostRequest::PullVault(PullVaultRequest {
+        let request = HostRequest::Hello(HelloRequest {
             protocol_version: PROTOCOL_VERSION,
-            host_buffer_size: 64 * 1024,
-            max_chunk_size: 4096,
-            known_generation: Some(42),
+            client_name: "cli".into(),
+            client_version: "0.1.0".into(),
         });
 
         let encoded = serde_cbor::to_vec(&request).expect("encode");
@@ -181,16 +263,11 @@ mod tests {
 
     #[test]
     fn device_response_roundtrip() {
-        let response = DeviceResponse::JournalFrame(JournalFrame {
+        let response = DeviceResponse::Status(StatusResponse {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 1,
-            remaining_operations: 0,
-            operations: vec![JournalOperation::UpdateField {
-                entry_id: "entry-1".to_string(),
-                field: "username".to_string(),
-                value_checksum: 0xDEADBEEF,
-            }],
-            checksum: 0xABCD1234,
+            vault_generation: 7,
+            pending_operations: 2,
+            current_time_ms: 1_700_000_000_000,
         });
 
         let encoded = serde_cbor::to_vec(&response).expect("encode");
@@ -200,35 +277,29 @@ mod tests {
     }
 
     #[test]
-    fn vault_chunk_roundtrip() {
-        let chunk = DeviceResponse::VaultChunk(VaultChunk {
+    fn handshake_and_pull_sequence_roundtrip() {
+        let hello = HostRequest::Hello(HelloRequest {
             protocol_version: PROTOCOL_VERSION,
-            sequence: 3,
-            total_size: 1024,
-            remaining_bytes: 256,
-            device_chunk_size: 512,
-            data: vec![1, 2, 3, 4, 5],
-            checksum: 0x12345678,
-            is_last: false,
+            client_name: "cli".into(),
+            client_version: "0.1.0".into(),
+        });
+        let status = HostRequest::Status(StatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let head = HostRequest::PullHead(PullHeadRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let pull = HostRequest::PullVault(PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 64 * 1024,
+            max_chunk_size: 4096,
+            known_generation: None,
         });
 
-        let encoded = serde_cbor::to_vec(&chunk).expect("encode");
-        let decoded: DeviceResponse = serde_cbor::from_slice(&encoded).expect("decode");
-
-        assert_eq!(decoded, chunk);
-    }
-
-    #[test]
-    fn device_error_roundtrip() {
-        let error = DeviceResponse::Error(DeviceError {
-            protocol_version: PROTOCOL_VERSION,
-            code: DeviceErrorCode::ChecksumMismatch,
-            message: "checksum mismatch".into(),
-        });
-
-        let encoded = serde_cbor::to_vec(&error).expect("encode");
-        let decoded: DeviceResponse = serde_cbor::from_slice(&encoded).expect("decode");
-
-        assert_eq!(decoded, error);
+        for request in [hello, status, head, pull] {
+            let encoded = serde_cbor::to_vec(&request).expect("encode");
+            let decoded: HostRequest = serde_cbor::from_slice(&encoded).expect("decode");
+            assert_eq!(decoded, request);
+        }
     }
 }

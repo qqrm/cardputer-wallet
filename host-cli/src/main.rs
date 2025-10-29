@@ -1,7 +1,8 @@
-use std::fs;
+use std::env;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -10,8 +11,9 @@ use serialport::{SerialPort, SerialPortType};
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
-    AbortReason, AbortRequest, DeviceResponse, HostRequest, JournalFrame, PullVaultRequest,
-    PushAck, SyncCompletion, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
+    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest,
+    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -40,12 +42,20 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Perform the HELLO handshake and print device metadata.
+    Hello,
+    /// Query the device for its current sync status.
+    Status,
+    /// Update the device clock.
+    SetTime(SetTimeArgs),
+    /// Read the device clock value.
+    GetTime,
+    /// Request the latest vault head metadata.
+    PullHead,
     /// Fetch the latest vault data from the device.
     Pull(RepoArgs),
     /// Confirm that pushed journal frames were persisted locally.
-    Push(RepoArgs),
-    /// Query the device for its current sync status.
-    Status(RepoArgs),
+    Ack(RepoArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -56,6 +66,16 @@ struct RepoArgs {
     /// Path to the credentials file used during the operation.
     #[arg(long, value_name = "PATH")]
     credentials: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SetTimeArgs {
+    /// Epoch milliseconds to send to the device.
+    #[arg(long, value_name = "MILLIS", conflicts_with = "system")]
+    epoch_ms: Option<u64>,
+    /// Use the host system time instead of an explicit value.
+    #[arg(long)]
+    system: bool,
 }
 
 fn main() -> Result<()> {
@@ -85,9 +105,13 @@ fn run(cli: Cli) -> Result<(), SharedError> {
     let mut port = open_serial_port(&port_path)?;
 
     match cli.command {
+        Command::Hello => execute_hello(&mut *port),
+        Command::Status => execute_status(&mut *port),
+        Command::SetTime(args) => execute_set_time(&mut *port, &args),
+        Command::GetTime => execute_get_time(&mut *port),
+        Command::PullHead => execute_pull_head(&mut *port),
         Command::Pull(args) => execute_pull(&mut *port, &args),
-        Command::Push(args) => execute_push(&mut *port, &args),
-        Command::Status(args) => execute_status(&mut *port, &args),
+        Command::Ack(args) => execute_ack(&mut *port, &args),
     }
 }
 
@@ -123,7 +147,7 @@ where
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
-fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+fn execute_ack<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
 where
     P: Read + Write + ?Sized,
 {
@@ -165,23 +189,89 @@ where
     Ok(())
 }
 
-fn execute_status<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+fn execute_hello<P>(port: &mut P) -> Result<(), SharedError>
 where
     P: Read + Write + ?Sized,
 {
-    println!(
-        "Checking device status for repository '{}' using credentials '{}'",
-        args.repo.display(),
-        args.credentials.display()
-    );
+    println!("Initiating HELLO handshake…");
 
-    let probe = HostRequest::Abort(AbortRequest {
+    let client_name = env::var("USER").unwrap_or_else(|_| "unknown".into());
+    let request = HostRequest::Hello(HelloRequest {
         protocol_version: PROTOCOL_VERSION,
-        reason: AbortReason::UserCancelled,
+        client_name,
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
     });
-    send_host_request(port, &probe)?;
-    println!("Status probe sent. Awaiting device reply…");
 
+    send_host_request(port, &request)?;
+    let response = read_device_response(port)?;
+    handle_device_response(response)?;
+    Ok(())
+}
+
+fn execute_status<P>(port: &mut P) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!("Requesting device status…");
+    let request = HostRequest::Status(StatusRequest {
+        protocol_version: PROTOCOL_VERSION,
+    });
+    send_host_request(port, &request)?;
+    let response = read_device_response(port)?;
+    handle_device_response(response)?;
+    Ok(())
+}
+
+fn execute_set_time<P>(port: &mut P, args: &SetTimeArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    let epoch_ms = if args.system {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| SharedError::Transport(format!("system clock error: {err}")))?
+            .as_millis() as u64
+    } else if let Some(value) = args.epoch_ms {
+        value
+    } else {
+        println!("No time provided, defaulting to zero.");
+        0
+    };
+
+    println!("Setting device time to {epoch_ms} ms…");
+    let request = HostRequest::SetTime(SetTimeRequest {
+        protocol_version: PROTOCOL_VERSION,
+        epoch_millis: epoch_ms,
+    });
+    send_host_request(port, &request)?;
+    let response = read_device_response(port)?;
+    handle_device_response(response)?;
+    Ok(())
+}
+
+fn execute_get_time<P>(port: &mut P) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!("Requesting device time…");
+    let request = HostRequest::GetTime(GetTimeRequest {
+        protocol_version: PROTOCOL_VERSION,
+    });
+    send_host_request(port, &request)?;
+    let response = read_device_response(port)?;
+    handle_device_response(response)?;
+    Ok(())
+}
+
+fn execute_pull_head<P>(port: &mut P) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!("Requesting vault head metadata…");
+    let request = HostRequest::PullHead(PullHeadRequest {
+        protocol_version: PROTOCOL_VERSION,
+    });
+    send_host_request(port, &request)?;
     let response = read_device_response(port)?;
     handle_device_response(response, None)?;
     Ok(())
@@ -192,6 +282,22 @@ fn handle_device_response(
     tracker: Option<&mut SyncStateTracker>,
 ) -> Result<bool, SharedError> {
     match response {
+        DeviceResponse::Hello(info) => {
+            print_hello(&info);
+            Ok(false)
+        }
+        DeviceResponse::Status(status) => {
+            print_status(&status);
+            Ok(false)
+        }
+        DeviceResponse::Time(time) => {
+            print_time(&time);
+            Ok(false)
+        }
+        DeviceResponse::Head(head) => {
+            print_head(&head);
+            Ok(false)
+        }
         DeviceResponse::JournalFrame(frame) => {
             print_journal_frame(&frame);
             if let Some(state) = tracker {
@@ -215,7 +321,7 @@ fn handle_device_response(
             }
             Ok(false)
         }
-        DeviceResponse::Error(err) => Err(SharedError::Transport(format!(
+        DeviceResponse::Nack(err) => Err(SharedError::Transport(format!(
             "device reported {code:?}: {message}",
             code = err.code,
             message = err.message
@@ -334,16 +440,47 @@ fn print_vault_chunk(chunk: &VaultChunk) {
     }
 }
 
-fn print_completion(summary: &SyncCompletion) {
+fn print_hello(info: &HelloResponse) {
     println!(
-        "Device completed the sync phase using protocol v{version} after {frames} frames.",
-        version = summary.protocol_version,
-        frames = summary.frames_sent,
+        "HELLO response from '{name}' running firmware v{firmware} (session {session}).",
+        name = info.device_name,
+        firmware = info.firmware_version,
+        session = info.session_id,
     );
+}
+
+fn print_status(status: &StatusResponse) {
     println!(
-        "  Stream checksum: 0x{checksum:08X}",
-        checksum = summary.stream_checksum
+        "Status: generation {generation}, pending ops {pending}, device time {time} ms.",
+        generation = status.vault_generation,
+        pending = status.pending_operations,
+        time = status.current_time_ms,
     );
+}
+
+fn print_time(time: &TimeResponse) {
+    println!("Device time: {} ms since Unix epoch", time.epoch_millis);
+}
+
+fn print_head(head: &PullHeadResponse) {
+    println!(
+        "Vault head generation {generation}.",
+        generation = head.vault_generation,
+    );
+    println!("  Vault hash   : {}", hex_encode(&head.vault_hash));
+    println!("  Recipients hash: {}", hex_encode(&head.recipients_hash));
+}
+
+fn print_ack(message: &AckResponse) {
+    println!("Acknowledgement: {}", message.message);
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = FmtWrite::write_fmt(&mut output, format_args!("{:02X}", byte));
+    }
+    output
 }
 
 fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), SharedError>
@@ -430,18 +567,26 @@ where
 
 fn command_for_request(request: &HostRequest) -> CdcCommand {
     match request {
+        HostRequest::Hello(_) => CdcCommand::Hello,
+        HostRequest::Status(_) => CdcCommand::Status,
+        HostRequest::SetTime(_) => CdcCommand::SetTime,
+        HostRequest::GetTime(_) => CdcCommand::GetTime,
+        HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
-        HostRequest::AckPush(_) => CdcCommand::Ack,
-        HostRequest::Abort(_) => CdcCommand::Nack,
+        HostRequest::Ack(_) => CdcCommand::Ack,
     }
 }
 
 fn command_for_response(response: &DeviceResponse) -> CdcCommand {
     match response {
+        DeviceResponse::Hello(_) => CdcCommand::Hello,
+        DeviceResponse::Status(_) => CdcCommand::Status,
+        DeviceResponse::Time(_) => CdcCommand::GetTime,
+        DeviceResponse::Head(_) => CdcCommand::PullHead,
         DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
         DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
-        DeviceResponse::Completed(_) => CdcCommand::Status,
-        DeviceResponse::Error(_) => CdcCommand::Nack,
+        DeviceResponse::Ack(_) => CdcCommand::Ack,
+        DeviceResponse::Nack(_) => CdcCommand::Nack,
     }
 }
 
@@ -571,7 +716,7 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::schema::{DeviceError, DeviceErrorCode};
+    use shared::schema::{DeviceErrorCode, NackResponse};
     use std::io::Cursor;
     use tempfile::tempdir;
 
@@ -743,7 +888,7 @@ mod tests {
 
     #[test]
     fn response_command_mismatch_is_reported() {
-        let response = DeviceResponse::Error(DeviceError {
+        let response = DeviceResponse::Nack(NackResponse {
             protocol_version: PROTOCOL_VERSION,
             code: DeviceErrorCode::InternalFailure,
             message: "failure".into(),
@@ -783,10 +928,15 @@ mod tests {
                 checksum: 0x1234ABCD,
                 is_last: false,
             })),
-            encode_response(DeviceResponse::Completed(SyncCompletion {
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
-                frames_sent: 2,
-                stream_checksum: 0xCAFEBABE,
+                sequence: 2,
+                total_size: 1024,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![0; 8],
+                checksum: 0xCAFEBABE,
+                is_last: true,
             })),
         ]
         .concat();
@@ -808,11 +958,12 @@ mod tests {
     }
 
     #[test]
-    fn status_sends_abort_probe() {
-        let responses = encode_response(DeviceResponse::Completed(SyncCompletion {
+    fn status_sends_status_command() {
+        let responses = encode_response(DeviceResponse::Status(StatusResponse {
             protocol_version: PROTOCOL_VERSION,
-            frames_sent: 0,
-            stream_checksum: 0,
+            vault_generation: 2,
+            pending_operations: 1,
+            current_time_ms: 42,
         }));
 
         let mut port = MockPort::new(responses);
@@ -822,13 +973,13 @@ mod tests {
             credentials: temp.path().join("creds"),
         };
 
-        execute_status(&mut port, &args).expect("status succeeds");
+        execute_status(&mut port).expect("status succeeds");
 
         let mut reader = Cursor::new(port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
-        assert_eq!(command, CdcCommand::Nack);
+        assert_eq!(command, CdcCommand::Status);
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
-        assert!(matches!(decoded, HostRequest::Abort(_)));
+        assert!(matches!(decoded, HostRequest::Status(_)));
     }
 
     #[test]
