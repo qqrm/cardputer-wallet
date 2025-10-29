@@ -10,5 +10,8 @@ serialport = { version = "4", default-features = false, features = ["usbportinfo
 serde_cbor = "0.11"
 shared = { path = "../shared" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [package.metadata.cargo-machete]
 ignored = ["serde", "serde_cbor", "shared"]

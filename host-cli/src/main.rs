@@ -1,5 +1,6 @@
+use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,6 +21,7 @@ const MAX_CHUNK_SIZE: u32 = 4 * 1024;
 const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
+const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -109,14 +111,16 @@ where
     send_host_request(port, &request)?;
     println!("Request sent. Waiting for device responses…");
 
+    let mut state_tracker = SyncStateTracker::default();
+
     loop {
         let response = read_device_response(port)?;
-        if !handle_device_response(response)? {
+        if !handle_device_response(response, Some(&mut state_tracker))? {
             break;
         }
     }
 
-    Ok(())
+    persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
 fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
@@ -129,10 +133,23 @@ where
         args.credentials.display()
     );
 
+    let (sequence, checksum) = match load_sync_state(&args.repo)? {
+        Some(pair) => pair,
+        None => {
+            eprintln!(
+                "Missing journal state in '{}'. Run pull before confirming a push.",
+                args.repo.display()
+            );
+            return Err(SharedError::Transport(
+                "journal state not found for push acknowledgement".into(),
+            ));
+        }
+    };
+
     let request = HostRequest::AckPush(PushAck {
         protocol_version: PROTOCOL_VERSION,
-        last_frame_sequence: 0,
-        journal_checksum: 0,
+        last_frame_sequence: sequence,
+        journal_checksum: checksum,
     });
 
     send_host_request(port, &request)?;
@@ -140,7 +157,7 @@ where
 
     loop {
         let response = read_device_response(port)?;
-        if !handle_device_response(response)? {
+        if !handle_device_response(response, None)? {
             break;
         }
     }
@@ -166,18 +183,27 @@ where
     println!("Status probe sent. Awaiting device reply…");
 
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
-fn handle_device_response(response: DeviceResponse) -> Result<bool, SharedError> {
+fn handle_device_response(
+    response: DeviceResponse,
+    tracker: Option<&mut SyncStateTracker>,
+) -> Result<bool, SharedError> {
     match response {
         DeviceResponse::JournalFrame(frame) => {
             print_journal_frame(&frame);
+            if let Some(state) = tracker {
+                state.record(frame.sequence, frame.checksum);
+            }
             Ok(true)
         }
         DeviceResponse::VaultChunk(chunk) => {
             print_vault_chunk(&chunk);
+            if let Some(state) = tracker {
+                state.record(chunk.sequence, chunk.checksum);
+            }
             Ok(true)
         }
         DeviceResponse::Completed(summary) => {
@@ -190,6 +216,89 @@ fn handle_device_response(response: DeviceResponse) -> Result<bool, SharedError>
             message = err.message
         ))),
     }
+}
+
+#[derive(Default)]
+struct SyncStateTracker {
+    last_pair: Option<(u32, u32)>,
+}
+
+impl SyncStateTracker {
+    fn record(&mut self, sequence: u32, checksum: u32) {
+        self.last_pair = Some((sequence, checksum));
+    }
+
+    fn last_pair(&self) -> Option<(u32, u32)> {
+        self.last_pair
+    }
+}
+
+fn persist_sync_state(repo_path: &Path, state: Option<(u32, u32)>) -> Result<(), SharedError> {
+    let path = sync_state_path(repo_path);
+    match state {
+        Some((sequence, checksum)) => {
+            let content = format!("{sequence}:{checksum}\n");
+            fs::write(&path, content).map_err(|err| {
+                SharedError::Transport(format!(
+                    "failed to write sync state to '{}': {err}",
+                    path.display()
+                ))
+            })?
+        }
+        None => match fs::remove_file(&path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(SharedError::Transport(format!(
+                    "failed to clear sync state at '{}': {err}",
+                    path.display()
+                )))
+            }
+        },
+    }
+
+    Ok(())
+}
+
+fn load_sync_state(repo_path: &Path) -> Result<Option<(u32, u32)>, SharedError> {
+    let path = sync_state_path(repo_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read sync state from '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+
+    let trimmed = content.trim();
+    let (sequence_str, checksum_str) = trimmed.split_once(':').ok_or_else(|| {
+        SharedError::Transport(format!(
+            "invalid sync state format in '{}': expected 'sequence:checksum'",
+            path.display()
+        ))
+    })?;
+
+    let sequence = sequence_str.trim().parse::<u32>().map_err(|err| {
+        SharedError::Transport(format!(
+            "invalid sequence in sync state '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let checksum = checksum_str.trim().parse::<u32>().map_err(|err| {
+        SharedError::Transport(format!(
+            "invalid checksum in sync state '{}': {err}",
+            path.display()
+        ))
+    })?;
+
+    Ok(Some((sequence, checksum)))
+}
+
+fn sync_state_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(SYNC_STATE_FILE)
 }
 
 fn print_journal_frame(frame: &JournalFrame) {
@@ -459,6 +568,7 @@ mod tests {
     use super::*;
     use shared::schema::{DeviceError, DeviceErrorCode};
     use std::io::Cursor;
+    use tempfile::tempdir;
 
     fn usb_port(
         name: &str,
@@ -677,9 +787,10 @@ mod tests {
         .concat();
 
         let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
         let args = RepoArgs {
-            repo: PathBuf::from("/tmp/repo"),
-            credentials: PathBuf::from("/tmp/creds"),
+            repo: temp.path().to_path_buf(),
+            credentials: temp.path().join("creds"),
         };
 
         execute_pull(&mut port, &args).expect("pull succeeds");
@@ -700,9 +811,10 @@ mod tests {
         }));
 
         let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
         let args = RepoArgs {
-            repo: PathBuf::from("/tmp/repo"),
-            credentials: PathBuf::from("/tmp/creds"),
+            repo: temp.path().to_path_buf(),
+            credentials: temp.path().join("creds"),
         };
 
         execute_status(&mut port, &args).expect("status succeeds");
@@ -712,6 +824,60 @@ mod tests {
         assert_eq!(command, CdcCommand::Nack);
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
         assert!(matches!(decoded, HostRequest::Abort(_)));
+    }
+
+    #[test]
+    fn push_ack_uses_saved_journal_state() {
+        let sequence = 7;
+        let checksum = 0xAABBCCDD;
+        let pull_responses = [
+            encode_response(DeviceResponse::JournalFrame(JournalFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                remaining_operations: 0,
+                operations: Vec::new(),
+                checksum,
+            })),
+            encode_response(DeviceResponse::Completed(SyncCompletion {
+                protocol_version: PROTOCOL_VERSION,
+                frames_sent: 1,
+                stream_checksum: checksum,
+            })),
+        ]
+        .concat();
+
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().to_path_buf(),
+            credentials: temp.path().join("creds"),
+        };
+
+        {
+            let mut port = MockPort::new(pull_responses);
+            execute_pull(&mut port, &args).expect("pull succeeds");
+        }
+
+        let push_responses = encode_response(DeviceResponse::Completed(SyncCompletion {
+            protocol_version: PROTOCOL_VERSION,
+            frames_sent: 0,
+            stream_checksum: 0,
+        }));
+
+        let mut push_port = MockPort::new(push_responses);
+        execute_push(&mut push_port, &args).expect("push succeeds");
+
+        let mut reader = Cursor::new(push_port.writes);
+        let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
+        assert_eq!(command, CdcCommand::Ack);
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+
+        match decoded {
+            HostRequest::AckPush(ack) => {
+                assert_eq!(ack.last_frame_sequence, sequence);
+                assert_eq!(ack.journal_checksum, checksum);
+            }
+            other => panic!("unexpected request written: {:?}", other),
+        }
     }
 
     struct MockPort {
