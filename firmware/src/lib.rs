@@ -371,6 +371,7 @@ fn handle_hello(
     }
     ctx.pending_sequence = None;
     ctx.next_sequence = 1;
+    ctx.vault_offset = 0;
 
     Ok(DeviceResponse::Hello(HelloResponse {
         protocol_version: PROTOCOL_VERSION,
