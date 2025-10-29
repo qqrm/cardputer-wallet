@@ -10,8 +10,10 @@ use core::cmp;
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
 use shared::schema::{
-    AbortRequest, DeviceError, DeviceErrorCode, DeviceResponse, HostRequest, JournalFrame,
-    JournalOperation, PullVaultRequest, PushAck, SyncCompletion, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
+    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, SetTimeRequest, StatusRequest, StatusResponse,
+    TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
 
@@ -46,7 +48,7 @@ pub enum ProtocolError {
 
 #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 impl ProtocolError {
-    fn as_device_error(&self) -> DeviceError {
+    fn as_nack(&self) -> NackResponse {
         let (code, message) = match self {
             ProtocolError::FrameTooLarge(len) => (
                 DeviceErrorCode::ResourceExhausted,
@@ -82,7 +84,7 @@ impl ProtocolError {
             ),
         };
 
-        DeviceError {
+        NackResponse {
             protocol_version: PROTOCOL_VERSION,
             code,
             message,
@@ -123,6 +125,11 @@ pub struct SyncContext {
     vault_offset: usize,
     recipients_manifest: Zeroizing<Vec<u8>>,
     crypto: CryptoMaterial,
+    session_id: u32,
+    device_name: String,
+    firmware_version: String,
+    vault_generation: u64,
+    current_time_ms: u64,
 }
 
 impl SyncContext {
@@ -139,6 +146,11 @@ impl SyncContext {
             vault_offset: 0,
             recipients_manifest: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
             crypto,
+            session_id: 0,
+            device_name: String::from("Cardputer Wallet"),
+            firmware_version: String::from(env!("CARGO_PKG_VERSION")),
+            vault_generation: 0,
+            current_time_ms: 0,
         }
     }
 
@@ -155,6 +167,9 @@ impl SyncContext {
             self.journal_ops.push(JournalOperation::Add {
                 entry_id: String::from("demo-entry"),
             });
+        }
+        if self.vault_generation == 0 {
+            self.vault_generation = 1;
         }
     }
 
@@ -267,6 +282,13 @@ fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
     seed
 }
 
+fn artifact_hash(data: &[u8]) -> [u8; 32] {
+    let checksum = compute_crc32(data);
+    let mut hash = [0u8; 32];
+    hash[..4].copy_from_slice(&checksum.to_le_bytes());
+    hash
+}
+
 fn decode_request(frame: &[u8]) -> Result<HostRequest, ProtocolError> {
     serde_cbor::from_slice(frame).map_err(|err| ProtocolError::Decode(err.to_string()))
 }
@@ -277,18 +299,26 @@ fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> 
 
 fn command_for_request(request: &HostRequest) -> CdcCommand {
     match request {
+        HostRequest::Hello(_) => CdcCommand::Hello,
+        HostRequest::Status(_) => CdcCommand::Status,
+        HostRequest::SetTime(_) => CdcCommand::SetTime,
+        HostRequest::GetTime(_) => CdcCommand::GetTime,
+        HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
-        HostRequest::AckPush(_) => CdcCommand::Ack,
-        HostRequest::Abort(_) => CdcCommand::Nack,
+        HostRequest::Ack(_) => CdcCommand::Ack,
     }
 }
 
 fn command_for_response(response: &DeviceResponse) -> CdcCommand {
     match response {
+        DeviceResponse::Hello(_) => CdcCommand::Hello,
+        DeviceResponse::Status(_) => CdcCommand::Status,
+        DeviceResponse::Time(_) => CdcCommand::GetTime,
+        DeviceResponse::Head(_) => CdcCommand::PullHead,
         DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
         DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
-        DeviceResponse::Completed(_) => CdcCommand::Status,
-        DeviceResponse::Error(_) => CdcCommand::Nack,
+        DeviceResponse::Ack(_) => CdcCommand::Ack,
+        DeviceResponse::Nack(_) => CdcCommand::Nack,
     }
 }
 
@@ -314,13 +344,105 @@ pub fn process_host_frame(
     }
 
     let response = match request {
+        HostRequest::Hello(hello) => handle_hello(&hello, ctx)?,
+        HostRequest::Status(status) => handle_status(&status, ctx)?,
+        HostRequest::SetTime(set_time) => handle_set_time(&set_time, ctx)?,
+        HostRequest::GetTime(get_time) => handle_get_time(&get_time, ctx)?,
+        HostRequest::PullHead(head) => handle_pull_head(&head, ctx)?,
         HostRequest::PullVault(pull) => handle_pull(&pull, ctx)?,
-        HostRequest::AckPush(ack) => handle_push(&ack, ctx)?,
-        HostRequest::Abort(abort) => handle_abort(&abort, ctx),
+        HostRequest::Ack(ack) => handle_ack(&ack, ctx)?,
     };
 
     let response_command = command_for_response(&response);
     Ok((response_command, encode_response(&response)?))
+}
+
+fn handle_hello(
+    request: &HelloRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    ctx.session_id = ctx.session_id.wrapping_add(1);
+    if ctx.session_id == 0 {
+        ctx.session_id = 1;
+    }
+    ctx.pending_sequence = None;
+    ctx.next_sequence = 1;
+
+    Ok(DeviceResponse::Hello(HelloResponse {
+        protocol_version: PROTOCOL_VERSION,
+        device_name: ctx.device_name.clone(),
+        firmware_version: ctx.firmware_version.clone(),
+        session_id: ctx.session_id,
+    }))
+}
+
+fn handle_status(
+    request: &StatusRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    Ok(DeviceResponse::Status(StatusResponse {
+        protocol_version: PROTOCOL_VERSION,
+        vault_generation: ctx.vault_generation,
+        pending_operations: ctx.journal_ops.len() as u32,
+        current_time_ms: ctx.current_time_ms,
+    }))
+}
+
+fn handle_set_time(
+    request: &SetTimeRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    ctx.current_time_ms = request.epoch_millis;
+
+    Ok(DeviceResponse::Ack(AckResponse {
+        protocol_version: PROTOCOL_VERSION,
+        message: format!("clock set to {} ms", request.epoch_millis),
+    }))
+}
+
+fn handle_get_time(
+    request: &GetTimeRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    Ok(DeviceResponse::Time(TimeResponse {
+        protocol_version: PROTOCOL_VERSION,
+        epoch_millis: ctx.current_time_ms,
+    }))
+}
+
+fn handle_pull_head(
+    request: &PullHeadRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    let vault_hash = artifact_hash(&ctx.vault_image);
+    let recipients_hash = artifact_hash(&ctx.recipients_manifest);
+
+    Ok(DeviceResponse::Head(PullHeadResponse {
+        protocol_version: PROTOCOL_VERSION,
+        vault_generation: ctx.vault_generation,
+        vault_hash,
+        recipients_hash,
+    }))
 }
 
 fn handle_pull(
@@ -356,7 +478,7 @@ fn handle_pull(
     }
 }
 
-fn handle_push(ack: &PushAck, ctx: &mut SyncContext) -> Result<DeviceResponse, ProtocolError> {
+fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse, ProtocolError> {
     if ack.protocol_version != PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedProtocol(ack.protocol_version));
     }
@@ -368,23 +490,16 @@ fn handle_push(ack: &PushAck, ctx: &mut SyncContext) -> Result<DeviceResponse, P
             ctx.pending_sequence = None;
             ctx.vault_offset = 0;
             ctx.wipe_sensitive();
-            Ok(DeviceResponse::Completed(SyncCompletion {
+            ctx.vault_generation = ctx.vault_generation.saturating_add(1);
+            Ok(DeviceResponse::Ack(AckResponse {
                 protocol_version: PROTOCOL_VERSION,
-                frames_sent: sequence,
-                stream_checksum: checksum,
+                message: format!(
+                    "acknowledged journal frame #{sequence} (checksum 0x{checksum:08X})"
+                ),
             }))
         }
         _ => Err(ProtocolError::InvalidAcknowledgement),
     }
-}
-
-fn handle_abort(_abort: &AbortRequest, ctx: &mut SyncContext) -> DeviceResponse {
-    ctx.wipe_sensitive();
-    DeviceResponse::Completed(SyncCompletion {
-        protocol_version: PROTOCOL_VERSION,
-        frames_sent: 0,
-        stream_checksum: 0,
-    })
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -449,28 +564,24 @@ mod tasks {
                         let _ = write_frame(&mut serial, response_command, &response);
                     }
                     Err(err) => {
-                        let payload =
-                            match encode_response(&DeviceResponse::Error(err.as_device_error())) {
-                                Ok(encoded) => encoded,
-                                Err(encode_err) => {
-                                    let fatal = encode_err.as_device_error();
-                                    serde_cbor::to_vec(&DeviceResponse::Error(fatal))
-                                        .unwrap_or_default()
-                                }
-                            };
+                        let payload = match encode_response(&DeviceResponse::Nack(err.as_nack())) {
+                            Ok(encoded) => encoded,
+                            Err(encode_err) => {
+                                let fatal = encode_err.as_nack();
+                                serde_cbor::to_vec(&DeviceResponse::Nack(fatal)).unwrap_or_default()
+                            }
+                        };
                         let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                     }
                 },
                 Err(err) => {
-                    let payload =
-                        match encode_response(&DeviceResponse::Error(err.as_device_error())) {
-                            Ok(encoded) => encoded,
-                            Err(encode_err) => {
-                                let fatal = encode_err.as_device_error();
-                                serde_cbor::to_vec(&DeviceResponse::Error(fatal))
-                                    .unwrap_or_default()
-                            }
-                        };
+                    let payload = match encode_response(&DeviceResponse::Nack(err.as_nack())) {
+                        Ok(encoded) => encoded,
+                        Err(encode_err) => {
+                            let fatal = encode_err.as_nack();
+                            serde_cbor::to_vec(&DeviceResponse::Nack(fatal)).unwrap_or_default()
+                        }
+                    };
                     let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                 }
             }
@@ -599,7 +710,7 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         };
 
-        let ack = HostRequest::AckPush(PushAck {
+        let ack = HostRequest::Ack(AckRequest {
             protocol_version: PROTOCOL_VERSION,
             last_frame_sequence: sequence,
             journal_checksum: checksum,
@@ -607,13 +718,13 @@ mod tests {
         let encoded_ack = serde_cbor::to_vec(&ack).unwrap();
         let (ack_command, ack_response) =
             process_host_frame(CdcCommand::Ack, &encoded_ack, &mut ctx).unwrap();
-        assert_eq!(ack_command, CdcCommand::Status);
+        assert_eq!(ack_command, CdcCommand::Ack);
         let decoded: DeviceResponse = serde_cbor::from_slice(&ack_response).unwrap();
 
         match decoded {
-            DeviceResponse::Completed(status) => {
-                assert_eq!(status.frames_sent, sequence);
-                assert_eq!(status.stream_checksum, checksum);
+            DeviceResponse::Ack(message) => {
+                assert_eq!(message.protocol_version, PROTOCOL_VERSION);
+                assert!(message.message.contains(&sequence.to_string()));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -665,5 +776,114 @@ mod tests {
         header.checksum ^= 0xFFFF_FFFF;
         let error = validate_checksum(&header, &payload).expect_err("expected checksum error");
         assert_eq!(error, ProtocolError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn hello_establishes_session() {
+        let mut ctx = SyncContext::new();
+        let request = HostRequest::Hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "cli".into(),
+            client_version: "0.1.0".into(),
+        });
+
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::Hello, &encoded, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::Hello);
+        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+
+        match response {
+            DeviceResponse::Hello(info) => {
+                assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+                assert_ne!(info.session_id, 0);
+                assert_eq!(info.device_name, "Cardputer Wallet");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_reflects_context_state() {
+        let mut ctx = SyncContext::new();
+        ctx.bootstrap_demo_state();
+        ctx.current_time_ms = 1_234_567;
+        ctx.vault_generation = 9;
+
+        let request = HostRequest::Status(StatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::Status, &encoded, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::Status);
+        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+
+        match response {
+            DeviceResponse::Status(status) => {
+                assert_eq!(status.vault_generation, 9);
+                assert_eq!(status.pending_operations, ctx.journal_ops.len() as u32);
+                assert_eq!(status.current_time_ms, 1_234_567);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_time_updates_clock_and_get_time_reports_it() {
+        let mut ctx = SyncContext::new();
+        let set_request = HostRequest::SetTime(SetTimeRequest {
+            protocol_version: PROTOCOL_VERSION,
+            epoch_millis: 9_876,
+        });
+        let encoded_set = serde_cbor::to_vec(&set_request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::SetTime, &encoded_set, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::Ack);
+        let ack: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        match ack {
+            DeviceResponse::Ack(message) => {
+                assert!(message.message.contains("9876"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let get_request = HostRequest::GetTime(GetTimeRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let encoded_get = serde_cbor::to_vec(&get_request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::GetTime, &encoded_get, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::GetTime);
+        let time_response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        match time_response {
+            DeviceResponse::Time(time) => {
+                assert_eq!(time.epoch_millis, 9_876);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pull_head_reports_hashes() {
+        let mut ctx = SyncContext::new();
+        ctx.bootstrap_demo_state();
+
+        let request = HostRequest::PullHead(PullHeadRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::PullHead, &encoded, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::PullHead);
+        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+
+        match response {
+            DeviceResponse::Head(head) => {
+                assert_eq!(head.vault_generation, ctx.vault_generation);
+                assert_ne!(head.vault_hash, [0u8; 32]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }
