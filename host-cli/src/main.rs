@@ -208,6 +208,11 @@ fn handle_device_response(
         }
         DeviceResponse::Completed(summary) => {
             print_completion(&summary);
+            if let Some(state) = tracker {
+                if summary.frames_sent > 0 {
+                    state.record(summary.frames_sent, summary.stream_checksum);
+                }
+            }
             Ok(false)
         }
         DeviceResponse::Error(err) => Err(SharedError::Transport(format!(
@@ -829,19 +834,20 @@ mod tests {
     #[test]
     fn push_ack_uses_saved_journal_state() {
         let sequence = 7;
-        let checksum = 0xAABBCCDD;
+        let frame_checksum = 0xAABBCCDD;
+        let stream_checksum = 0x11223344;
         let pull_responses = [
             encode_response(DeviceResponse::JournalFrame(JournalFrame {
                 protocol_version: PROTOCOL_VERSION,
                 sequence,
                 remaining_operations: 0,
                 operations: Vec::new(),
-                checksum,
+                checksum: frame_checksum,
             })),
             encode_response(DeviceResponse::Completed(SyncCompletion {
                 protocol_version: PROTOCOL_VERSION,
-                frames_sent: 1,
-                stream_checksum: checksum,
+                frames_sent: sequence,
+                stream_checksum,
             })),
         ]
         .concat();
@@ -874,7 +880,7 @@ mod tests {
         match decoded {
             HostRequest::AckPush(ack) => {
                 assert_eq!(ack.last_frame_sequence, sequence);
-                assert_eq!(ack.journal_checksum, checksum);
+                assert_eq!(ack.journal_checksum, stream_checksum);
             }
             other => panic!("unexpected request written: {:?}", other),
         }
