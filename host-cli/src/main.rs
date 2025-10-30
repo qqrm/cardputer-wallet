@@ -12,8 +12,8 @@ use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest,
-    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
