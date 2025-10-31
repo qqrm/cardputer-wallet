@@ -414,6 +414,7 @@ impl SyncContext {
         let mut cache = NoCache::new();
         let mut scratch = Zeroizing::new(vec![0u8; STORAGE_DATA_BUFFER_CAPACITY]);
 
+        self.vault_image = Zeroizing::new(Vec::new());
         if let Some(vault) = map::fetch_item::<u8, Vec<u8>, _>(
             flash,
             range.clone(),
@@ -424,11 +425,11 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            self.vault_image = Zeroizing::new(vault);
-        } else {
-            self.vault_image = Zeroizing::new(Vec::new());
+            self.vault_image =
+                Self::validate_flash_blob::<S::Error>(vault, VAULT_BUFFER_CAPACITY, "vault image")?;
         }
 
+        self.recipients_manifest = Zeroizing::new(Vec::new());
         if let Some(recipients) = map::fetch_item::<u8, Vec<u8>, _>(
             flash,
             range.clone(),
@@ -439,9 +440,20 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            self.recipients_manifest = Zeroizing::new(recipients);
-        } else {
-            self.recipients_manifest = Zeroizing::new(Vec::new());
+            match Self::validate_flash_blob::<S::Error>(
+                recipients,
+                RECIPIENTS_BUFFER_CAPACITY,
+                "recipients manifest",
+            ) {
+                Ok(blob) => {
+                    self.recipients_manifest = blob;
+                }
+                Err(err) => {
+                    self.vault_image = Zeroizing::new(Vec::new());
+                    self.vault_offset = 0;
+                    return Err(err);
+                }
+            }
         }
 
         if let Some(journal_bytes) = map::fetch_item::<u8, Vec<u8>, _>(
@@ -494,6 +506,22 @@ impl SyncContext {
         self.next_sequence = 1;
 
         Ok(())
+    }
+
+    fn validate_flash_blob<E>(
+        data: Vec<u8>,
+        capacity: usize,
+        label: &'static str,
+    ) -> Result<Zeroizing<Vec<u8>>, StorageError<E>> {
+        if data.len() > capacity {
+            return Err(StorageError::Decode(format!(
+                "{label} exceeds capacity ({} > {})",
+                data.len(),
+                capacity
+            )));
+        }
+
+        Ok(Zeroizing::new(data))
     }
 
     /// Persist key material into flash storage.
@@ -1375,6 +1403,42 @@ mod tests {
         let ciphertext = ctx.crypto.encrypt_record(&nonce, &payload).unwrap();
         let roundtrip = ctx.crypto.decrypt_record(&nonce, &ciphertext).unwrap();
         assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
+    fn load_from_flash_rejects_oversized_vault_image() {
+        let oversized_vault = vec![0xAA; VAULT_BUFFER_CAPACITY + 1];
+        let error = SyncContext::validate_flash_blob::<()>(
+            oversized_vault,
+            VAULT_BUFFER_CAPACITY,
+            "vault image",
+        )
+        .expect_err("oversized vault should be rejected");
+
+        match error {
+            StorageError::Decode(message) => {
+                assert!(message.contains("vault image exceeds capacity"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_flash_rejects_oversized_recipients_manifest() {
+        let oversized_recipients = vec![0xBB; RECIPIENTS_BUFFER_CAPACITY + 1];
+        let error = SyncContext::validate_flash_blob::<()>(
+            oversized_recipients,
+            RECIPIENTS_BUFFER_CAPACITY,
+            "recipients manifest",
+        )
+        .expect_err("oversized recipients should be rejected");
+
+        match error {
+            StorageError::Decode(message) => {
+                assert!(message.contains("recipients manifest exceeds capacity"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
