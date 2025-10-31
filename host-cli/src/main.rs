@@ -1,7 +1,8 @@
 use std::env;
 use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -54,8 +55,8 @@ enum Command {
     PullHead,
     /// Fetch the latest vault data from the device.
     Pull(RepoArgs),
-    /// Confirm that pushed journal frames were persisted locally.
-    Ack(RepoArgs),
+    /// Confirm completion of a device initiated push flow.
+    Push(RepoArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -111,7 +112,7 @@ fn run(cli: Cli) -> Result<(), SharedError> {
         Command::GetTime => execute_get_time(&mut *port),
         Command::PullHead => execute_pull_head(&mut *port),
         Command::Pull(args) => execute_pull(&mut *port, &args),
-        Command::Ack(args) => execute_ack(&mut *port, &args),
+        Command::Push(args) => execute_push(&mut *port, &args),
     }
 }
 
@@ -147,12 +148,12 @@ where
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
-fn execute_ack<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
 where
     P: Read + Write + ?Sized,
 {
     println!(
-        "Confirming push for repository '{}' using credentials '{}'",
+        "Finalising push for repository '{}' using credentials '{}'",
         args.repo.display(),
         args.credentials.display()
     );
@@ -170,7 +171,7 @@ where
         }
     };
 
-    let request = HostRequest::AckPush(PushAck {
+    let request = HostRequest::Ack(AckRequest {
         protocol_version: PROTOCOL_VERSION,
         last_frame_sequence: sequence,
         journal_checksum: checksum,
@@ -204,7 +205,7 @@ where
 
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -218,7 +219,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -245,7 +246,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -259,7 +260,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -303,22 +304,17 @@ fn handle_device_response(
             if let Some(state) = tracker {
                 state.record(frame.sequence, frame.checksum);
             }
-            Ok(true)
+            Ok(frame.remaining_operations > 0)
         }
         DeviceResponse::VaultChunk(chunk) => {
             print_vault_chunk(&chunk);
             if let Some(state) = tracker {
                 state.record(chunk.sequence, chunk.checksum);
             }
-            Ok(true)
+            Ok(!chunk.is_last)
         }
-        DeviceResponse::Completed(summary) => {
-            print_completion(&summary);
-            if let Some(state) = tracker {
-                if summary.frames_sent > 0 {
-                    state.record(summary.frames_sent, summary.stream_checksum);
-                }
-            }
+        DeviceResponse::Ack(message) => {
+            print_ack(&message);
             Ok(false)
         }
         DeviceResponse::Nack(err) => Err(SharedError::Transport(format!(
@@ -573,6 +569,7 @@ fn command_for_request(request: &HostRequest) -> CdcCommand {
         HostRequest::GetTime(_) => CdcCommand::GetTime,
         HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::PushOps(_) => CdcCommand::PushOps,
         HostRequest::Ack(_) => CdcCommand::Ack,
     }
 }
@@ -967,11 +964,6 @@ mod tests {
         }));
 
         let mut port = MockPort::new(responses);
-        let temp = tempdir().expect("tempdir");
-        let args = RepoArgs {
-            repo: temp.path().to_path_buf(),
-            credentials: temp.path().join("creds"),
-        };
 
         execute_status(&mut port).expect("status succeeds");
 
@@ -983,25 +975,16 @@ mod tests {
     }
 
     #[test]
-    fn push_ack_uses_saved_journal_state() {
+    fn push_sends_ack_request_with_saved_state() {
         let sequence = 7;
         let frame_checksum = 0xAABBCCDD;
-        let stream_checksum = 0x11223344;
-        let pull_responses = [
-            encode_response(DeviceResponse::JournalFrame(JournalFrame {
-                protocol_version: PROTOCOL_VERSION,
-                sequence,
-                remaining_operations: 0,
-                operations: Vec::new(),
-                checksum: frame_checksum,
-            })),
-            encode_response(DeviceResponse::Completed(SyncCompletion {
-                protocol_version: PROTOCOL_VERSION,
-                frames_sent: sequence,
-                stream_checksum,
-            })),
-        ]
-        .concat();
+        let pull_responses = encode_response(DeviceResponse::JournalFrame(JournalFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            remaining_operations: 0,
+            operations: Vec::new(),
+            checksum: frame_checksum,
+        }));
 
         let temp = tempdir().expect("tempdir");
         let args = RepoArgs {
@@ -1014,10 +997,9 @@ mod tests {
             execute_pull(&mut port, &args).expect("pull succeeds");
         }
 
-        let push_responses = encode_response(DeviceResponse::Completed(SyncCompletion {
+        let push_responses = encode_response(DeviceResponse::Ack(AckResponse {
             protocol_version: PROTOCOL_VERSION,
-            frames_sent: 0,
-            stream_checksum: 0,
+            message: String::from("acknowledged"),
         }));
 
         let mut push_port = MockPort::new(push_responses);
@@ -1029,9 +1011,9 @@ mod tests {
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
 
         match decoded {
-            HostRequest::AckPush(ack) => {
+            HostRequest::Ack(ack) => {
                 assert_eq!(ack.last_frame_sequence, sequence);
-                assert_eq!(ack.journal_checksum, stream_checksum);
+                assert_eq!(ack.journal_checksum, frame_checksum);
             }
             other => panic!("unexpected request written: {:?}", other),
         }
