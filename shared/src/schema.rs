@@ -18,6 +18,8 @@ pub enum HostRequest {
     PullHead(PullHeadRequest),
     /// Request the device to stream its latest vault back to the host.
     PullVault(PullVaultRequest),
+    /// Provide a batch of journal operations that should be applied on the device.
+    PushOps(PushOpsRequest),
     /// Confirm that a sequence of journal frames has been applied successfully by the host.
     Ack(AckRequest),
 }
@@ -37,6 +39,8 @@ pub enum DeviceResponse {
     JournalFrame(JournalFrame),
     /// A chunk of the encrypted vault streamed from the device.
     VaultChunk(VaultChunk),
+    /// Summary produced by either side when a synchronization session completes.
+    SyncComplete(SessionCompletion),
     /// Confirmation that a host initiated command completed successfully.
     Ack(AckResponse),
     /// Failure reported by the device while handling the previous host request.
@@ -145,6 +149,23 @@ pub struct PullVaultRequest {
     pub known_generation: Option<u64>,
 }
 
+/// Host request supplying journal operations that should be applied by the device.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct PushOpsRequest {
+    /// Version of the protocol carried by the push frame.
+    pub protocol_version: u16,
+    /// Sequential identifier for the frame being transmitted.
+    pub sequence: u32,
+    /// Number of operations still queued after this frame.
+    pub remaining_operations: u32,
+    /// Journal operations that the device must apply locally.
+    pub operations: Vec<JournalOperation>,
+    /// CRC32 computed over the encoded operations payload.
+    pub checksum: u32,
+    /// Whether this frame finalises the push sequence.
+    pub is_last: bool,
+}
+
 /// Host acknowledgement that a push flow journal was persisted successfully.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct AckRequest {
@@ -217,6 +238,30 @@ pub struct AckResponse {
     pub protocol_version: u16,
     /// Short description of the action that completed.
     pub message: String,
+}
+
+/// Indicates that a synchronization session finished successfully.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub struct SessionCompletion {
+    /// Protocol version used when encoding the completion summary.
+    pub protocol_version: u16,
+    /// Direction of the session that just ended.
+    pub direction: SyncDirection,
+    /// Number of frames transferred during the session.
+    pub frames_transferred: u32,
+    /// Number of journal operations processed during the session.
+    pub operations_transferred: u32,
+    /// Rolling checksum that describes the processed journal stream.
+    pub journal_checksum: u32,
+}
+
+/// Distinguishes between pull and push synchronization flows.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+pub enum SyncDirection {
+    /// Device streamed operations to the host.
+    Pull,
+    /// Host streamed operations to the device.
+    Push,
 }
 
 /// Describes an error condition detected by the device.
@@ -301,5 +346,40 @@ mod tests {
             let decoded: HostRequest = serde_cbor::from_slice(&encoded).expect("decode");
             assert_eq!(decoded, request);
         }
+    }
+
+    #[test]
+    fn push_ops_roundtrip() {
+        let request = HostRequest::PushOps(PushOpsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 3,
+            remaining_operations: 0,
+            operations: vec![JournalOperation::Add {
+                entry_id: "demo".into(),
+            }],
+            checksum: 0xDEADBEEF,
+            is_last: true,
+        });
+
+        let encoded = serde_cbor::to_vec(&request).expect("encode");
+        let decoded: HostRequest = serde_cbor::from_slice(&encoded).expect("decode");
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn session_completion_roundtrip() {
+        let response = DeviceResponse::SyncComplete(SessionCompletion {
+            protocol_version: PROTOCOL_VERSION,
+            direction: SyncDirection::Pull,
+            frames_transferred: 4,
+            operations_transferred: 16,
+            journal_checksum: 0xA5A5_A5A5,
+        });
+
+        let encoded = serde_cbor::to_vec(&response).expect("encode");
+        let decoded: DeviceResponse = serde_cbor::from_slice(&encoded).expect("decode");
+
+        assert_eq!(decoded, response);
     }
 }

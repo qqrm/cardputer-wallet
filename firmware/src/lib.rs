@@ -12,8 +12,8 @@ use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
     HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, SetTimeRequest, StatusRequest, StatusResponse,
-    TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    PullHeadResponse, PullVaultRequest, PushOpsRequest, SessionCompletion, SetTimeRequest,
+    StatusRequest, StatusResponse, SyncDirection, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
 
@@ -305,6 +305,7 @@ fn command_for_request(request: &HostRequest) -> CdcCommand {
         HostRequest::GetTime(_) => CdcCommand::GetTime,
         HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::PushOps(_) => CdcCommand::PushOps,
         HostRequest::Ack(_) => CdcCommand::Ack,
     }
 }
@@ -317,6 +318,7 @@ fn command_for_response(response: &DeviceResponse) -> CdcCommand {
         DeviceResponse::Head(_) => CdcCommand::PullHead,
         DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
         DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
+        DeviceResponse::SyncComplete(_) => CdcCommand::Ack,
         DeviceResponse::Ack(_) => CdcCommand::Ack,
         DeviceResponse::Nack(_) => CdcCommand::Nack,
     }
@@ -350,6 +352,7 @@ pub fn process_host_frame(
         HostRequest::GetTime(get_time) => handle_get_time(&get_time, ctx)?,
         HostRequest::PullHead(head) => handle_pull_head(&head, ctx)?,
         HostRequest::PullVault(pull) => handle_pull(&pull, ctx)?,
+        HostRequest::PushOps(push) => handle_push_ops(&push, ctx)?,
         HostRequest::Ack(ack) => handle_ack(&ack, ctx)?,
     };
 
@@ -477,6 +480,33 @@ fn handle_pull(
 
         Ok(DeviceResponse::VaultChunk(chunk))
     }
+}
+
+fn handle_push_ops(
+    request: &PushOpsRequest,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
+    }
+
+    let expected = ctx.compute_journal_checksum(&request.operations);
+    if expected != request.checksum {
+        return Err(ProtocolError::ChecksumMismatch);
+    }
+
+    ctx.pending_sequence = Some((request.sequence, request.checksum));
+    ctx.next_sequence = request.sequence.wrapping_add(1);
+
+    let summary = SessionCompletion {
+        protocol_version: PROTOCOL_VERSION,
+        direction: SyncDirection::Push,
+        frames_transferred: request.sequence,
+        operations_transferred: request.operations.len() as u32,
+        journal_checksum: request.checksum,
+    };
+
+    Ok(DeviceResponse::SyncComplete(summary))
 }
 
 fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse, ProtocolError> {
@@ -729,6 +759,61 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_ops_success_returns_completion() {
+        let mut ctx = SyncContext::new();
+        let operations = vec![JournalOperation::Add {
+            entry_id: String::from("new-entry"),
+        }];
+        let checksum = ctx.compute_journal_checksum(&operations);
+
+        let request = HostRequest::PushOps(PushOpsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 2,
+            remaining_operations: 0,
+            operations: operations.clone(),
+            checksum,
+            is_last: true,
+        });
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let (command, response) =
+            process_host_frame(CdcCommand::PushOps, &encoded, &mut ctx).expect("process push");
+        assert_eq!(command, CdcCommand::Ack);
+        let decoded: DeviceResponse = serde_cbor::from_slice(&response).unwrap();
+
+        match decoded {
+            DeviceResponse::SyncComplete(summary) => {
+                assert_eq!(summary.direction, SyncDirection::Push);
+                assert_eq!(summary.frames_transferred, request.sequence);
+                assert_eq!(summary.operations_transferred, operations.len() as u32);
+                assert_eq!(summary.journal_checksum, checksum);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_ops_rejects_mismatched_checksum() {
+        let mut ctx = SyncContext::new();
+        let operations = vec![JournalOperation::Delete {
+            entry_id: String::from("bad-entry"),
+        }];
+        let checksum = ctx.compute_journal_checksum(&operations) ^ 0xFFFF;
+
+        let request = HostRequest::PushOps(PushOpsRequest {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 1,
+            remaining_operations: 0,
+            operations,
+            checksum,
+            is_last: true,
+        });
+        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let error =
+            process_host_frame(CdcCommand::PushOps, &encoded, &mut ctx).expect_err("checksum");
+        assert_eq!(error, ProtocolError::ChecksumMismatch);
     }
 
     #[test]

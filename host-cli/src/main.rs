@@ -1,7 +1,8 @@
 use std::env;
 use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -12,8 +13,9 @@ use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest,
-    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    HostRequest, JournalFrame, JournalOperation, PullHeadRequest, PullHeadResponse,
+    PullVaultRequest, PushOpsRequest, SessionCompletion, SetTimeRequest, StatusRequest,
+    StatusResponse, SyncDirection, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -24,6 +26,7 @@ const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
+const PUSH_OPS_FILE: &str = ".cardputer-push-ops";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -54,6 +57,8 @@ enum Command {
     PullHead,
     /// Fetch the latest vault data from the device.
     Pull(RepoArgs),
+    /// Apply pending host operations on the device.
+    Push(RepoArgs),
     /// Confirm that pushed journal frames were persisted locally.
     Ack(RepoArgs),
 }
@@ -111,6 +116,7 @@ fn run(cli: Cli) -> Result<(), SharedError> {
         Command::GetTime => execute_get_time(&mut *port),
         Command::PullHead => execute_pull_head(&mut *port),
         Command::Pull(args) => execute_pull(&mut *port, &args),
+        Command::Push(args) => execute_push(&mut *port, &args),
         Command::Ack(args) => execute_ack(&mut *port, &args),
     }
 }
@@ -147,6 +153,47 @@ where
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
+fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
+        "Preparing push for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let operations = load_push_operations(&args.repo)?;
+    if operations.is_empty() {
+        println!("No pending operations to push. Sending empty frame to confirm state.");
+    } else {
+        println!("Queuing {} operations for transmission…", operations.len());
+    }
+
+    let checksum = compute_operations_checksum(&operations)?;
+    let request = HostRequest::PushOps(PushOpsRequest {
+        protocol_version: PROTOCOL_VERSION,
+        sequence: 1,
+        remaining_operations: 0,
+        operations,
+        checksum,
+        is_last: true,
+    });
+
+    send_host_request(port, &request)?;
+    println!("Push frame sent. Awaiting device confirmation…");
+
+    loop {
+        let response = read_device_response(port)?;
+        if !handle_device_response(response, None)? {
+            break;
+        }
+    }
+
+    clear_push_operations(&args.repo)?;
+    Ok(())
+}
+
 fn execute_ack<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
 where
     P: Read + Write + ?Sized,
@@ -170,7 +217,7 @@ where
         }
     };
 
-    let request = HostRequest::AckPush(PushAck {
+    let request = HostRequest::Ack(AckRequest {
         protocol_version: PROTOCOL_VERSION,
         last_frame_sequence: sequence,
         journal_checksum: checksum,
@@ -204,7 +251,7 @@ where
 
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -218,7 +265,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -245,7 +292,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -259,7 +306,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response)?;
+    handle_device_response(response, None)?;
     Ok(())
 }
 
@@ -312,13 +359,17 @@ fn handle_device_response(
             }
             Ok(true)
         }
-        DeviceResponse::Completed(summary) => {
-            print_completion(&summary);
+        DeviceResponse::SyncComplete(summary) => {
+            print_sync_complete(&summary);
             if let Some(state) = tracker {
-                if summary.frames_sent > 0 {
-                    state.record(summary.frames_sent, summary.stream_checksum);
+                if summary.direction == SyncDirection::Pull && summary.frames_transferred > 0 {
+                    state.record(summary.frames_transferred, summary.journal_checksum);
                 }
             }
+            Ok(false)
+        }
+        DeviceResponse::Ack(message) => {
+            print_ack(&message);
             Ok(false)
         }
         DeviceResponse::Nack(err) => Err(SharedError::Transport(format!(
@@ -412,6 +463,71 @@ fn sync_state_path(repo_path: &Path) -> PathBuf {
     repo_path.join(SYNC_STATE_FILE)
 }
 
+fn load_push_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, SharedError> {
+    let path = push_ops_path(repo_path);
+    let data = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read push operations from '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+
+    serde_cbor::from_slice(&data).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to decode push operations from '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+fn clear_push_operations(repo_path: &Path) -> Result<(), SharedError> {
+    let path = push_ops_path(repo_path);
+    match fs::remove_file(&path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SharedError::Transport(format!(
+            "failed to remove push operations file '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn push_ops_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(PUSH_OPS_FILE)
+}
+
+fn compute_operations_checksum(operations: &[JournalOperation]) -> Result<u32, SharedError> {
+    Ok(operations
+        .iter()
+        .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
+            JournalOperation::Add { entry_id } => accumulate_checksum(acc, entry_id.as_bytes()),
+            JournalOperation::UpdateField {
+                entry_id,
+                field,
+                value_checksum,
+            } => {
+                accumulate_checksum(
+                    accumulate_checksum(acc, entry_id.as_bytes()),
+                    field.as_bytes(),
+                ) ^ value_checksum
+            }
+            JournalOperation::Delete { entry_id } => {
+                accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
+            }
+        }))
+}
+
+fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
+    for byte in payload {
+        seed = seed.wrapping_mul(16777619) ^ (*byte as u32);
+    }
+    seed
+}
+
 fn print_journal_frame(frame: &JournalFrame) {
     println!(
         "Received journal frame #{sequence} with {remaining} operations pending.",
@@ -438,6 +554,23 @@ fn print_vault_chunk(chunk: &VaultChunk) {
     if chunk.is_last {
         println!("  This was the final chunk of the transfer.");
     }
+}
+
+fn print_sync_complete(summary: &SessionCompletion) {
+    let direction = match summary.direction {
+        SyncDirection::Pull => "pull",
+        SyncDirection::Push => "push",
+    };
+
+    println!(
+        "Sync {direction} session completed after {frames} frame(s) and {ops} operation(s).",
+        frames = summary.frames_transferred,
+        ops = summary.operations_transferred,
+    );
+    println!(
+        "  Journal checksum: 0x{checksum:08X}",
+        checksum = summary.journal_checksum
+    );
 }
 
 fn print_hello(info: &HelloResponse) {
@@ -573,6 +706,7 @@ fn command_for_request(request: &HostRequest) -> CdcCommand {
         HostRequest::GetTime(_) => CdcCommand::GetTime,
         HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::PushOps(_) => CdcCommand::PushOps,
         HostRequest::Ack(_) => CdcCommand::Ack,
     }
 }
@@ -585,6 +719,7 @@ fn command_for_response(response: &DeviceResponse) -> CdcCommand {
         DeviceResponse::Head(_) => CdcCommand::PullHead,
         DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
         DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
+        DeviceResponse::SyncComplete(_) => CdcCommand::Ack,
         DeviceResponse::Ack(_) => CdcCommand::Ack,
         DeviceResponse::Nack(_) => CdcCommand::Nack,
     }
@@ -938,6 +1073,13 @@ mod tests {
                 checksum: 0xCAFEBABE,
                 is_last: true,
             })),
+            encode_response(DeviceResponse::SyncComplete(SessionCompletion {
+                protocol_version: PROTOCOL_VERSION,
+                direction: SyncDirection::Pull,
+                frames_transferred: 2,
+                operations_transferred: 0,
+                journal_checksum: 0xCAFEBABE,
+            })),
         ]
         .concat();
 
@@ -967,12 +1109,6 @@ mod tests {
         }));
 
         let mut port = MockPort::new(responses);
-        let temp = tempdir().expect("tempdir");
-        let args = RepoArgs {
-            repo: temp.path().to_path_buf(),
-            credentials: temp.path().join("creds"),
-        };
-
         execute_status(&mut port).expect("status succeeds");
 
         let mut reader = Cursor::new(port.writes);
@@ -983,10 +1119,10 @@ mod tests {
     }
 
     #[test]
-    fn push_ack_uses_saved_journal_state() {
+    fn ack_uses_saved_journal_state() {
         let sequence = 7;
         let frame_checksum = 0xAABBCCDD;
-        let stream_checksum = 0x11223344;
+        let summary_checksum = 0x11223344;
         let pull_responses = [
             encode_response(DeviceResponse::JournalFrame(JournalFrame {
                 protocol_version: PROTOCOL_VERSION,
@@ -995,10 +1131,12 @@ mod tests {
                 operations: Vec::new(),
                 checksum: frame_checksum,
             })),
-            encode_response(DeviceResponse::Completed(SyncCompletion {
+            encode_response(DeviceResponse::SyncComplete(SessionCompletion {
                 protocol_version: PROTOCOL_VERSION,
-                frames_sent: sequence,
-                stream_checksum,
+                direction: SyncDirection::Pull,
+                frames_transferred: sequence,
+                operations_transferred: 0,
+                journal_checksum: summary_checksum,
             })),
         ]
         .concat();
@@ -1014,27 +1152,74 @@ mod tests {
             execute_pull(&mut port, &args).expect("pull succeeds");
         }
 
-        let push_responses = encode_response(DeviceResponse::Completed(SyncCompletion {
+        let ack_response = encode_response(DeviceResponse::Ack(AckResponse {
             protocol_version: PROTOCOL_VERSION,
-            frames_sent: 0,
-            stream_checksum: 0,
+            message: "ack".into(),
         }));
 
-        let mut push_port = MockPort::new(push_responses);
-        execute_push(&mut push_port, &args).expect("push succeeds");
+        let mut ack_port = MockPort::new(ack_response);
+        execute_ack(&mut ack_port, &args).expect("ack succeeds");
 
-        let mut reader = Cursor::new(push_port.writes);
+        let mut reader = Cursor::new(ack_port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
         assert_eq!(command, CdcCommand::Ack);
         let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
 
         match decoded {
-            HostRequest::AckPush(ack) => {
+            HostRequest::Ack(ack) => {
                 assert_eq!(ack.last_frame_sequence, sequence);
-                assert_eq!(ack.journal_checksum, stream_checksum);
+                assert_eq!(ack.journal_checksum, summary_checksum);
             }
             other => panic!("unexpected request written: {:?}", other),
         }
+    }
+
+    #[test]
+    fn push_sends_operations_frame_and_clears_file() {
+        let temp = tempdir().expect("tempdir");
+        let repo_path = temp.path();
+        let args = RepoArgs {
+            repo: repo_path.to_path_buf(),
+            credentials: repo_path.join("creds"),
+        };
+
+        let operations = vec![JournalOperation::Add {
+            entry_id: "entry-1".into(),
+        }];
+        let encoded_ops = serde_cbor::to_vec(&operations).expect("encode operations");
+        fs::write(push_ops_path(&args.repo), encoded_ops).expect("write ops file");
+
+        let response = encode_response(DeviceResponse::SyncComplete(SessionCompletion {
+            protocol_version: PROTOCOL_VERSION,
+            direction: SyncDirection::Push,
+            frames_transferred: 1,
+            operations_transferred: operations.len() as u32,
+            journal_checksum: 0xCAFEBABE,
+        }));
+
+        let mut port = MockPort::new(response);
+        execute_push(&mut port, &args).expect("push succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
+        assert_eq!(command, CdcCommand::PushOps);
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+
+        match decoded {
+            HostRequest::PushOps(frame) => {
+                assert_eq!(frame.sequence, 1);
+                assert!(frame.is_last);
+                assert_eq!(frame.operations, operations);
+                assert_eq!(frame.remaining_operations, 0);
+                assert_ne!(frame.checksum, 0);
+            }
+            other => panic!("unexpected request written: {:?}", other),
+        }
+
+        assert!(
+            !push_ops_path(&args.repo).exists(),
+            "operations file removed"
+        );
     }
 
     struct MockPort {
