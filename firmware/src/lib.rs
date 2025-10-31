@@ -233,7 +233,7 @@ pub struct CryptoMaterial {
     vault_key: Option<Zeroizing<[u8; 32]>>,
     pin_salt: [u8; 16],
     kek_nonce: [u8; 12],
-    wrapped_vault_key: Vec<u8>,
+    wrapped_vault_key: Zeroizing<Vec<u8>>,
     scrypt_params: ScryptParams,
 }
 
@@ -244,7 +244,7 @@ impl Default for CryptoMaterial {
             vault_key: None,
             pin_salt: [0u8; 16],
             kek_nonce: [0u8; 12],
-            wrapped_vault_key: Vec::new(),
+            wrapped_vault_key: Zeroizing::new(Vec::new()),
             scrypt_params: ScryptParams::recommended(),
         }
     }
@@ -271,7 +271,7 @@ impl CryptoMaterial {
     pub(crate) fn configure_from_record(&mut self, record: &KeyRecord) -> Result<(), KeyError> {
         self.pin_salt = record.salt;
         self.kek_nonce = record.nonce;
-        self.wrapped_vault_key = record.wrapped_key.clone();
+        self.wrapped_vault_key = Zeroizing::new(record.wrapped_key.clone());
         self.scrypt_params = record.scrypt.to_params()?;
         self.kek = None;
         self.vault_key = None;
@@ -285,7 +285,7 @@ impl CryptoMaterial {
             Some(KeyRecord {
                 salt: self.pin_salt,
                 nonce: self.kek_nonce,
-                wrapped_key: self.wrapped_vault_key.clone(),
+                wrapped_key: (*self.wrapped_vault_key).clone(),
                 scrypt: self.scrypt_params.into(),
             })
         }
@@ -309,7 +309,7 @@ impl CryptoMaterial {
         let cipher = self.cipher_from_kek()?;
         let nonce = Nonce::from(self.kek_nonce);
         let ciphertext = cipher.encrypt(&nonce, fresh_vault_key.as_ref())?;
-        self.wrapped_vault_key = ciphertext;
+        self.wrapped_vault_key = Zeroizing::new(ciphertext);
         self.vault_key = Some(fresh_vault_key);
         Ok(())
     }
@@ -322,7 +322,7 @@ impl CryptoMaterial {
         self.derive_kek(pin)?;
         let cipher = self.cipher_from_kek()?;
         let nonce = Nonce::from(self.kek_nonce);
-        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, self.wrapped_vault_key.as_ref())?);
+        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, self.wrapped_vault_key.as_slice())?);
 
         if plaintext.len() != 32 {
             return Err(KeyError::VaultKeyLength);
@@ -1524,5 +1524,20 @@ mod tests {
         assert!(ctx.crypto.vault_key.is_none());
         assert!(ctx.vault_image.is_empty());
         assert!(ctx.recipients_manifest.is_empty());
+    }
+
+    #[test]
+    fn unlock_with_wrong_pin_is_rejected() {
+        let mut ctx = SyncContext::new();
+        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
+        ctx.crypto.wrap_new_keys(b"123456", &mut rng).unwrap();
+        ctx.crypto.wipe();
+
+        let error = ctx
+            .crypto
+            .unlock_vault_key(b"654321")
+            .expect_err("wrong PIN should not decrypt");
+        assert_eq!(error, KeyError::CryptoFailure);
+        assert!(ctx.crypto.vault_key.is_none());
     }
 }
