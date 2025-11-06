@@ -137,11 +137,13 @@ where
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = SyncStateTracker::default();
+    let mut should_continue = true;
 
-    loop {
+    while should_continue {
         let response = read_device_response(port)?;
-        if !handle_device_response(response, Some(&mut state_tracker))? {
-            break;
+        should_continue = handle_device_response(response, Some(&mut state_tracker))?;
+        if should_continue {
+            send_host_request(port, &request)?;
         }
     }
 
@@ -913,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_sends_request_and_stops_on_completion() {
+    fn pull_reissues_request_until_completion() {
         let responses = [
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -948,10 +950,25 @@ mod tests {
         execute_pull(&mut port, &args).expect("pull succeeds");
 
         let mut reader = Cursor::new(port.writes);
-        let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
-        assert_eq!(command, CdcCommand::PullVault);
-        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
-        assert!(matches!(decoded, HostRequest::PullVault(_)));
+        let (command_one, payload_one) =
+            read_framed_message(&mut reader).expect("decode first written frame");
+        assert_eq!(command_one, CdcCommand::PullVault);
+        let decoded_one: HostRequest =
+            serde_cbor::from_slice(&payload_one).expect("decode first request");
+        assert!(matches!(decoded_one, HostRequest::PullVault(_)));
+
+        let (command_two, payload_two) =
+            read_framed_message(&mut reader).expect("decode second written frame");
+        assert_eq!(command_two, CdcCommand::PullVault);
+        let decoded_two: HostRequest =
+            serde_cbor::from_slice(&payload_two).expect("decode second request");
+        assert!(matches!(decoded_two, HostRequest::PullVault(_)));
+
+        assert_eq!(
+            reader.position(),
+            reader.get_ref().len() as u64,
+            "expected exactly two pull requests"
+        );
     }
 
     #[test]
