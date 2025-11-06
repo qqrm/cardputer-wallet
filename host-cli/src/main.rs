@@ -546,7 +546,15 @@ where
         )));
     }
 
-    let length = header.length as usize;
+    let length = header.length;
+    if length > HOST_BUFFER_SIZE {
+        return Err(SharedError::Transport(format!(
+            "frame payload length {} exceeds host buffer limit {}",
+            length, HOST_BUFFER_SIZE
+        )));
+    }
+
+    let length = length as usize;
     let mut payload = vec![0u8; length];
     reader
         .read_exact(&mut payload)
@@ -882,6 +890,27 @@ mod tests {
                 assert!(message.contains("checksum mismatch"));
             }
             _ => panic!("unexpected error variant"),
+        }
+    }
+
+    #[test]
+    fn framing_rejects_payload_exceeding_limit() {
+        let mut frame = Vec::new();
+        let header = FrameHeader::new(
+            PROTOCOL_VERSION,
+            CdcCommand::PullVault,
+            HOST_BUFFER_SIZE + 1,
+            0,
+        );
+        frame.extend_from_slice(&header.to_bytes());
+
+        let mut reader = Cursor::new(frame);
+        let err = read_framed_message(&mut reader).expect_err("expected length error");
+        match err {
+            SharedError::Transport(message) => {
+                assert!(message.contains("frame payload length"));
+            }
+            other => panic!("unexpected error variant: {:?}", other),
         }
     }
 
