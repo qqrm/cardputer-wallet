@@ -206,6 +206,15 @@ pub enum JournalOperation {
     Delete { entry_id: String },
 }
 
+/// Identifier describing which encrypted artifact is being transferred.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+pub enum VaultArtifact {
+    /// Primary vault image containing encrypted entries.
+    Vault,
+    /// Manifest that enumerates recipients allowed to unlock the vault.
+    Recipients,
+}
+
 /// Chunk of the encrypted vault payload streamed to the host.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct VaultChunk {
@@ -225,6 +234,8 @@ pub struct VaultChunk {
     pub checksum: u32,
     /// Whether this chunk finalises the artifact transfer.
     pub is_last: bool,
+    /// Artifact associated with this chunk.
+    pub artifact: VaultArtifact,
 }
 
 /// Response sent when a host command completes successfully.
