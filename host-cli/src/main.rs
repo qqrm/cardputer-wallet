@@ -143,16 +143,19 @@ where
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = SyncStateTracker::default();
+    let mut artifacts = PullArtifacts::default();
     let mut should_continue = true;
 
     while should_continue {
         let response = read_device_response(port)?;
-        should_continue = handle_device_response(response, Some(&mut state_tracker))?;
+        should_continue =
+            handle_device_response(response, Some(&mut state_tracker), Some(&mut artifacts))?;
         if should_continue {
             send_host_request(port, &request)?;
         }
     }
 
+    artifacts.persist(&args.repo)?;
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
@@ -250,7 +253,7 @@ where
 
     loop {
         let response = read_device_response(port)?;
-        if !handle_device_response(response, None)? {
+        if !handle_device_response(response, None, None)? {
             break;
         }
     }
@@ -413,7 +416,7 @@ where
 
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -427,7 +430,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -454,7 +457,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -468,7 +471,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -482,35 +485,51 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
 fn handle_device_response(
     response: DeviceResponse,
     tracker: Option<&mut SyncStateTracker>,
+    artifacts: Option<&mut PullArtifacts>,
 ) -> Result<bool, SharedError> {
     match response {
         DeviceResponse::Hello(info) => {
             print_hello(&info);
+            if let Some(storage) = artifacts {
+                storage.record_log("hello response");
+            }
             Ok(false)
         }
         DeviceResponse::Status(status) => {
             print_status(&status);
+            if let Some(storage) = artifacts {
+                storage.record_log("status response");
+            }
             Ok(false)
         }
         DeviceResponse::Time(time) => {
             print_time(&time);
+            if let Some(storage) = artifacts {
+                storage.record_log("time response");
+            }
             Ok(false)
         }
         DeviceResponse::Head(head) => {
             print_head(&head);
+            if let Some(storage) = artifacts {
+                storage.record_log("head response");
+            }
             Ok(false)
         }
         DeviceResponse::JournalFrame(frame) => {
             print_journal_frame(&frame);
             if let Some(state) = tracker {
                 state.record(frame.sequence, frame.checksum);
+            }
+            if let Some(storage) = artifacts {
+                storage.record_journal_frame(&frame);
             }
             Ok(frame.remaining_operations > 0)
         }
@@ -519,10 +538,16 @@ fn handle_device_response(
             if let Some(state) = tracker {
                 state.record(chunk.sequence, chunk.checksum);
             }
+            if let Some(storage) = artifacts {
+                storage.record_vault_chunk(&chunk);
+            }
             Ok(!chunk.is_last)
         }
         DeviceResponse::Ack(message) => {
             print_ack(&message);
+            if let Some(storage) = artifacts {
+                storage.record_log("ack response");
+            }
             Ok(false)
         }
         DeviceResponse::Nack(err) => Err(SharedError::Transport(format!(
@@ -531,6 +556,99 @@ fn handle_device_response(
             message = err.message
         ))),
     }
+}
+
+#[derive(Default)]
+struct PullArtifacts {
+    vault: ArtifactBuffer,
+    recipients_manifest: Option<Vec<u8>>,
+    log_context: Vec<String>,
+}
+
+impl PullArtifacts {
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) {
+        self.vault.bytes.extend_from_slice(&chunk.data);
+        self.vault.metadata.push(VaultChunkMetadata {
+            protocol_version: chunk.protocol_version,
+            sequence: chunk.sequence,
+            total_size: chunk.total_size,
+            remaining_bytes: chunk.remaining_bytes,
+            device_chunk_size: chunk.device_chunk_size,
+            checksum: chunk.checksum,
+            is_last: chunk.is_last,
+        });
+    }
+
+    fn record_journal_frame(&mut self, frame: &JournalFrame) {
+        let summary = format!(
+            "journal frame #{sequence} with {operations} operations and {remaining} pending",
+            sequence = frame.sequence,
+            operations = frame.operations.len(),
+            remaining = frame.remaining_operations,
+        );
+        self.log_context.push(summary);
+    }
+
+    fn record_log(&mut self, context: impl Into<String>) {
+        self.log_context.push(context.into());
+    }
+
+    #[allow(dead_code)]
+    fn record_recipients_manifest(&mut self, data: &[u8]) {
+        self.recipients_manifest = Some(data.to_vec());
+    }
+
+    fn persist(&self, repo: &Path) -> Result<(), SharedError> {
+        if self.vault.bytes.is_empty() && self.recipients_manifest.is_none() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(repo)
+            .map_err(|err| io_error("create repository directory", repo, err))?;
+
+        if !self.vault.bytes.is_empty() {
+            let vault_path = repo.join("vault.enc");
+            if let Some(parent) = vault_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("prepare vault directory", parent, err))?;
+            }
+            fs::write(&vault_path, &self.vault.bytes)
+                .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
+        }
+
+        if let Some(recipients) = &self.recipients_manifest {
+            let recipients_path = repo.join("recips.json");
+            if let Some(parent) = recipients_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("prepare recipients directory", parent, err))?;
+            }
+            fs::write(&recipients_path, recipients)
+                .map_err(|err| io_error("write recipients artifact", &recipients_path, err))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ArtifactBuffer {
+    bytes: Vec<u8>,
+    metadata: Vec<VaultChunkMetadata>,
+}
+
+#[allow(dead_code)]
+struct VaultChunkMetadata {
+    protocol_version: u16,
+    sequence: u32,
+    total_size: u64,
+    remaining_bytes: u64,
+    device_chunk_size: u32,
+    checksum: u32,
+    is_last: bool,
+}
+
+fn io_error(context: &str, path: &Path, err: io::Error) -> SharedError {
+    SharedError::Transport(format!("{context} at '{}': {err}", path.display()))
 }
 
 #[derive(Default)]
@@ -1205,6 +1323,49 @@ mod tests {
             reader.get_ref().len() as u64,
             "expected exactly two pull requests"
         );
+    }
+
+    #[test]
+    fn pull_persists_vault_chunks_to_file() {
+        let responses = [
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: 5,
+                remaining_bytes: 2,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![1, 2, 3],
+                checksum: 0xDEAD_BEEF,
+                is_last: false,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: 5,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![4, 5],
+                checksum: 0xC0FF_EE00,
+                is_last: true,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("nested/repo"),
+            credentials: temp.path().join("creds"),
+        };
+
+        execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let vault_path = args.repo.join("vault.enc");
+        let content = fs::read(&vault_path).expect("vault file");
+        assert_eq!(content, vec![1, 2, 3, 4, 5]);
+
+        let recipients_path = args.repo.join("recips.json");
+        assert!(!recipients_path.exists(), "unexpected recipients manifest");
     }
 
     #[test]
