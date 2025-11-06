@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-serde_cbor = { version = "0.11", default-features = false, features = ["alloc"] }
-shared = { path = "../shared" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+shared = { path = "../shared", default-features = false }
 zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 embedded-storage-async = { version = "0.4", default-features = false }

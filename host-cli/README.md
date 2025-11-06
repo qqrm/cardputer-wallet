@@ -3,11 +3,11 @@
 The host-side command line utility coordinates communication with the Cardputer over the USB CDC interface. It is responsible for:
 
 - discovering the virtual serial port exposed by the firmware;
-- encoding requests with the shared CBOR schema and transmitting them to the device;
-- decoding CBOR responses and presenting status information to the user;
+- encoding requests with the shared postcard schema and transmitting them to the device;
+- decoding postcard responses and presenting status information to the user;
 - providing troubleshooting commands for flashing, diagnostics, and state introspection.
 
-This crate depends on `serialport` for the CDC transport and `serde_cbor` for the binary message format shared with the firmware.
+This crate depends on `serialport` for the CDC transport and uses postcard codecs shared with the firmware.
 
 ## Usage
 
@@ -26,7 +26,7 @@ A typical pull flow looks like this:
 cargo run -p host-cli -- pull --repo ./vault-replica --credentials ./cardputer.json
 ```
 
-The CLI opens the detected USB CDC port (or the path provided through `--port`), transmits the request using CBOR framing, and then prints progress as vault chunks, journal frames, and completion records are received.
+The CLI opens the detected USB CDC port (or the path provided through `--port`), transmits the request using postcard framing, and then prints progress as vault chunks, journal frames, and completion records are received.
 
 ### Serial port detection
 

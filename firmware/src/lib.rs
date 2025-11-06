@@ -11,6 +11,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use embedded_storage_async::nor_flash::NorFlash;
+use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use rand_core::{CryptoRng, RngCore};
 use scrypt::{
     errors::{InvalidOutputLen, InvalidParams},
@@ -23,10 +24,12 @@ use serde::{Deserialize, Serialize};
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
 use shared::schema::{
-    AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
-    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
-    StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    decode_device_response, decode_host_request, decode_journal_operations, encode_device_response,
+    encode_host_request, encode_journal_operations, AckRequest, AckResponse, DeviceErrorCode,
+    DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse, HostRequest, JournalFrame,
+    JournalOperation, NackResponse, PullHeadRequest, PullHeadResponse, PullVaultRequest,
+    PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse, TimeResponse,
+    VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
 
@@ -479,7 +482,7 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            let operations: Vec<JournalOperation> = serde_cbor::from_slice(&journal_bytes)
+            let operations = decode_journal_operations(&journal_bytes)
                 .map_err(|err| StorageError::Decode(err.to_string()))?;
             self.journal_ops = operations;
         } else {
@@ -509,7 +512,7 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            let record: KeyRecord = serde_cbor::from_slice(&key_bytes)
+            let record: KeyRecord = postcard_from_bytes(&key_bytes)
                 .map_err(|err| StorageError::Decode(err.to_string()))?;
             self.crypto.configure_from_record(&record)?;
         }
@@ -549,8 +552,8 @@ impl SyncContext {
         if let Some(record) = self.crypto.record() {
             let mut cache = NoCache::new();
             let mut scratch = Zeroizing::new(vec![0u8; STORAGE_DATA_BUFFER_CAPACITY]);
-            let encoded =
-                serde_cbor::to_vec(&record).map_err(|err| StorageError::Decode(err.to_string()))?;
+            let encoded = postcard_to_allocvec(&record)
+                .map_err(|err| StorageError::Decode(err.to_string()))?;
 
             map::store_item(
                 flash,
@@ -669,10 +672,11 @@ impl SyncContext {
                 artifact,
             };
 
-            let encoded_len = match serde_cbor::to_vec(&DeviceResponse::VaultChunk(chunk.clone())) {
-                Ok(bytes) => bytes.len(),
-                Err(_) => return chunk,
-            };
+            let encoded_len =
+                match encode_device_response(&DeviceResponse::VaultChunk(chunk.clone())) {
+                    Ok(bytes) => bytes.len(),
+                    Err(_) => return chunk,
+                };
 
             if encoded_len <= FRAME_MAX_SIZE {
                 *offset = slice_end;
@@ -740,11 +744,11 @@ fn artifact_hash(data: &[u8]) -> [u8; 32] {
 }
 
 fn decode_request(frame: &[u8]) -> Result<HostRequest, ProtocolError> {
-    serde_cbor::from_slice(frame).map_err(|err| ProtocolError::Decode(err.to_string()))
+    decode_host_request(frame).map_err(|err| ProtocolError::Decode(err.to_string()))
 }
 
 fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> {
-    serde_cbor::to_vec(response).map_err(|err| ProtocolError::Encode(err.to_string()))
+    encode_device_response(response).map_err(|err| ProtocolError::Encode(err.to_string()))
 }
 
 fn command_for_request(request: &HostRequest) -> CdcCommand {
@@ -1048,7 +1052,8 @@ mod tasks {
                             Ok(encoded) => encoded,
                             Err(encode_err) => {
                                 let fatal = encode_err.as_nack();
-                                serde_cbor::to_vec(&DeviceResponse::Nack(fatal)).unwrap_or_default()
+                                encode_device_response(&DeviceResponse::Nack(fatal))
+                                    .unwrap_or_default()
                             }
                         };
                         let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
@@ -1059,7 +1064,7 @@ mod tasks {
                         Ok(encoded) => encoded,
                         Err(encode_err) => {
                             let fatal = encode_err.as_nack();
-                            serde_cbor::to_vec(&DeviceResponse::Nack(fatal)).unwrap_or_default()
+                            encode_device_response(&DeviceResponse::Nack(fatal)).unwrap_or_default()
                         }
                     };
                     let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
@@ -1159,12 +1164,11 @@ mod tests {
             known_generation: None,
         });
 
-        let encoded = serde_cbor::to_vec(&request).expect("encode request");
+        let encoded = encode_host_request(&request).expect("encode request");
         let (command, response_bytes) =
             process_host_frame(CdcCommand::PullVault, &encoded, &mut ctx).expect("process pull");
         assert_eq!(command, CdcCommand::PushOps);
-        let response: DeviceResponse =
-            serde_cbor::from_slice(&response_bytes).expect("decode response");
+        let response = decode_device_response(&response_bytes).expect("decode response");
 
         match response {
             DeviceResponse::JournalFrame(frame) => {
@@ -1230,11 +1234,11 @@ mod tests {
             max_chunk_size: 1024,
             known_generation: None,
         });
-        let encoded_pull = serde_cbor::to_vec(&pull_request).unwrap();
+        let encoded_pull = encode_host_request(&pull_request).unwrap();
         let (response_command, response_bytes) =
             process_host_frame(CdcCommand::PullVault, &encoded_pull, &mut ctx).unwrap();
         assert_eq!(response_command, CdcCommand::PushOps);
-        let frame: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let frame = decode_device_response(&response_bytes).unwrap();
         let (sequence, checksum) = match frame {
             DeviceResponse::JournalFrame(frame) => (frame.sequence, frame.checksum),
             other => panic!("unexpected response: {other:?}"),
@@ -1245,11 +1249,11 @@ mod tests {
             last_frame_sequence: sequence,
             journal_checksum: checksum,
         });
-        let encoded_ack = serde_cbor::to_vec(&ack).unwrap();
+        let encoded_ack = encode_host_request(&ack).unwrap();
         let (ack_command, ack_response) =
             process_host_frame(CdcCommand::Ack, &encoded_ack, &mut ctx).unwrap();
         assert_eq!(ack_command, CdcCommand::Ack);
-        let decoded: DeviceResponse = serde_cbor::from_slice(&ack_response).unwrap();
+        let decoded = decode_device_response(&ack_response).unwrap();
 
         match decoded {
             DeviceResponse::Ack(message) => {
@@ -1304,12 +1308,11 @@ mod tests {
             is_last: true,
         });
 
-        let encoded = serde_cbor::to_vec(&request).expect("encode push frame");
+        let encoded = encode_host_request(&request).expect("encode push frame");
         let (command, response_bytes) =
             process_host_frame(CdcCommand::PushOps, &encoded, &mut ctx).expect("process push");
         assert_eq!(command, CdcCommand::Ack);
-        let response: DeviceResponse =
-            serde_cbor::from_slice(&response_bytes).expect("decode ack response");
+        let response = decode_device_response(&response_bytes).expect("decode ack response");
 
         match response {
             DeviceResponse::Ack(message) => {
@@ -1329,7 +1332,7 @@ mod tests {
             max_chunk_size: 1,
             known_generation: None,
         });
-        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let encoded = encode_host_request(&request).unwrap();
         let error = process_host_frame(CdcCommand::PullVault, &encoded, &mut ctx)
             .expect_err("expected rejection");
         assert!(matches!(error, ProtocolError::UnsupportedProtocol(_)));
@@ -1344,7 +1347,7 @@ mod tests {
             max_chunk_size: 1,
             known_generation: None,
         });
-        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let encoded = encode_host_request(&request).unwrap();
         let error = process_host_frame(CdcCommand::Ack, &encoded, &mut ctx)
             .expect_err("expected command mismatch");
         assert_eq!(error, ProtocolError::InvalidCommand);
@@ -1377,11 +1380,11 @@ mod tests {
             client_version: "0.1.0".into(),
         });
 
-        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let encoded = encode_host_request(&request).unwrap();
         let (command, response_bytes) =
             process_host_frame(CdcCommand::Hello, &encoded, &mut ctx).unwrap();
         assert_eq!(command, CdcCommand::Hello);
-        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let response = decode_device_response(&response_bytes).unwrap();
 
         match response {
             DeviceResponse::Hello(info) => {
@@ -1407,11 +1410,11 @@ mod tests {
         let request = HostRequest::Status(StatusRequest {
             protocol_version: PROTOCOL_VERSION,
         });
-        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let encoded = encode_host_request(&request).unwrap();
         let (command, response_bytes) =
             process_host_frame(CdcCommand::Status, &encoded, &mut ctx).unwrap();
         assert_eq!(command, CdcCommand::Status);
-        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let response = decode_device_response(&response_bytes).unwrap();
 
         match response {
             DeviceResponse::Status(status) => {
@@ -1430,11 +1433,11 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             epoch_millis: 9_876,
         });
-        let encoded_set = serde_cbor::to_vec(&set_request).unwrap();
+        let encoded_set = encode_host_request(&set_request).unwrap();
         let (command, response_bytes) =
             process_host_frame(CdcCommand::SetTime, &encoded_set, &mut ctx).unwrap();
         assert_eq!(command, CdcCommand::Ack);
-        let ack: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let ack = decode_device_response(&response_bytes).unwrap();
         match ack {
             DeviceResponse::Ack(message) => {
                 assert!(message.message.contains("9876"));
@@ -1445,11 +1448,11 @@ mod tests {
         let get_request = HostRequest::GetTime(GetTimeRequest {
             protocol_version: PROTOCOL_VERSION,
         });
-        let encoded_get = serde_cbor::to_vec(&get_request).unwrap();
+        let encoded_get = encode_host_request(&get_request).unwrap();
         let (command, response_bytes) =
             process_host_frame(CdcCommand::GetTime, &encoded_get, &mut ctx).unwrap();
         assert_eq!(command, CdcCommand::GetTime);
-        let time_response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let time_response = decode_device_response(&response_bytes).unwrap();
         match time_response {
             DeviceResponse::Time(time) => {
                 assert_eq!(time.epoch_millis, 9_876);
@@ -1497,11 +1500,11 @@ mod tests {
         let request = HostRequest::PullHead(PullHeadRequest {
             protocol_version: PROTOCOL_VERSION,
         });
-        let encoded = serde_cbor::to_vec(&request).unwrap();
+        let encoded = encode_host_request(&request).unwrap();
         let (command, response_bytes) =
             process_host_frame(CdcCommand::PullHead, &encoded, &mut ctx).unwrap();
         assert_eq!(command, CdcCommand::PullHead);
-        let response: DeviceResponse = serde_cbor::from_slice(&response_bytes).unwrap();
+        let response = decode_device_response(&response_bytes).unwrap();
 
         match response {
             DeviceResponse::Head(head) => {
@@ -1525,7 +1528,7 @@ mod tests {
         let mut crypto = CryptoMaterial::default();
         crypto.wrap_new_keys(pin, &mut rng).unwrap();
         let key_record = crypto.record().expect("key record");
-        let encoded_record = serde_cbor::to_vec(&key_record).unwrap();
+        let encoded_record = postcard_to_allocvec(&key_record).unwrap();
 
         block_on(async {
             map::store_item(
@@ -1550,7 +1553,7 @@ mod tests {
             .await
             .unwrap();
 
-            let journal_bytes = serde_cbor::to_vec(&vec![JournalOperation::Add {
+            let journal_bytes = encode_journal_operations(&vec![JournalOperation::Add {
                 entry_id: String::from("flash-entry"),
             }])
             .unwrap();
