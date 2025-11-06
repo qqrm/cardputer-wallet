@@ -15,6 +15,9 @@ use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
     HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
     StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    HostRequest, JournalFrame, JournalOperation, PullHeadRequest, PullHeadResponse,
+    PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse,
+    TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -25,6 +28,8 @@ const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
+const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
+const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -55,8 +60,10 @@ enum Command {
     PullHead,
     /// Fetch the latest vault data from the device.
     Pull(RepoArgs),
-    /// Confirm completion of a device initiated push flow.
+    /// Push local journal operations to the device.
     Push(RepoArgs),
+    /// Confirm completion of a device initiated push flow.
+    Confirm(RepoArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -113,6 +120,7 @@ fn run(cli: Cli) -> Result<(), SharedError> {
         Command::PullHead => execute_pull_head(&mut *port),
         Command::Pull(args) => execute_pull(&mut *port, &args),
         Command::Push(args) => execute_push(&mut *port, &args),
+        Command::Confirm(args) => execute_confirm(&mut *port, &args),
     }
 }
 
@@ -137,20 +145,83 @@ where
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = SyncStateTracker::default();
+    let mut artifacts = PullArtifacts::default();
     let mut should_continue = true;
 
     while should_continue {
         let response = read_device_response(port)?;
-        should_continue = handle_device_response(response, Some(&mut state_tracker))?;
+        should_continue =
+            handle_device_response(response, Some(&mut state_tracker), Some(&mut artifacts))?;
         if should_continue {
             send_host_request(port, &request)?;
         }
     }
 
+    artifacts.persist(&args.repo)?;
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
 
 fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
+        "Preparing push for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let plan = PushPlan::load(&args.repo)?;
+    if plan.frames.is_empty() {
+        println!("No pending operations to push.");
+        return Ok(());
+    }
+
+    println!(
+        "Dispatching {} operation{} across {} frame{}…",
+        plan.total_operations,
+        if plan.total_operations == 1 { "" } else { "s" },
+        plan.frames.len(),
+        if plan.frames.len() == 1 { "" } else { "s" }
+    );
+
+    for frame in plan.frames.into_iter() {
+        let sequence = frame.sequence;
+        let operation_count = frame.operations.len();
+        println!(
+            "Sending frame #{sequence} with {operation_count} operation{plural} ({last}).",
+            plural = if operation_count == 1 { "" } else { "s" },
+            last = if frame.is_last {
+                "final frame"
+            } else {
+                "more frames pending"
+            }
+        );
+
+        let request = HostRequest::PushOps(frame);
+        send_host_request(port, &request)?;
+
+        let response = read_device_response(port)?;
+        match response {
+            DeviceResponse::Ack(message) => {
+                print_ack(&message);
+            }
+            other => {
+                let description = format!("{other:?}");
+                handle_device_response(other, None)?;
+                return Err(SharedError::Transport(format!(
+                    "unexpected device response while pushing operations: {description}"
+                )));
+            }
+        }
+    }
+
+    clear_local_operations(&args.repo)?;
+    println!("Push operations completed. Cleared local journal state.");
+    Ok(())
+}
+
+fn execute_confirm<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
 where
     P: Read + Write + ?Sized,
 {
@@ -184,12 +255,152 @@ where
 
     loop {
         let response = read_device_response(port)?;
-        if !handle_device_response(response, None)? {
+        if !handle_device_response(response, None, None)? {
             break;
         }
     }
 
     Ok(())
+}
+
+struct PushPlan {
+    frames: Vec<PushOperationsFrame>,
+    total_operations: usize,
+}
+
+impl PushPlan {
+    fn load(repo_path: &Path) -> Result<Self, SharedError> {
+        let operations = load_local_operations(repo_path)?;
+        if operations.is_empty() {
+            return Ok(Self {
+                frames: Vec::new(),
+                total_operations: 0,
+            });
+        }
+
+        let frames = build_push_frames(operations)?;
+        let total_operations = frames.iter().map(|frame| frame.operations.len()).sum();
+
+        Ok(Self {
+            frames,
+            total_operations,
+        })
+    }
+}
+
+fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, SharedError> {
+    let path = operations_log_path(repo_path);
+    let data = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read local operations from '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operations: Vec<JournalOperation> = serde_cbor::from_slice(&data)?;
+    Ok(operations)
+}
+
+fn build_push_frames(
+    operations: Vec<JournalOperation>,
+) -> Result<Vec<PushOperationsFrame>, SharedError> {
+    let mut frames: Vec<Vec<JournalOperation>> = Vec::new();
+    let mut current: Vec<JournalOperation> = Vec::new();
+
+    for operation in operations {
+        current.push(operation);
+        let encoded_len = serde_cbor::to_vec(&current)?.len();
+        if encoded_len > PUSH_FRAME_MAX_PAYLOAD {
+            let last = current
+                .pop()
+                .expect("pushed operation missing when building push frames");
+
+            if current.is_empty() {
+                return Err(SharedError::Transport(format!(
+                    "operation payload exceeds maximum frame size of {} bytes",
+                    PUSH_FRAME_MAX_PAYLOAD
+                )));
+            }
+
+            frames.push(std::mem::take(&mut current));
+            current.push(last);
+            let single_len = serde_cbor::to_vec(&current)?.len();
+            if single_len > PUSH_FRAME_MAX_PAYLOAD {
+                return Err(SharedError::Transport(format!(
+                    "operation payload exceeds maximum frame size of {} bytes",
+                    PUSH_FRAME_MAX_PAYLOAD
+                )));
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        frames.push(current);
+    }
+
+    let total = frames.len();
+    Ok(frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, operations)| PushOperationsFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: index as u32 + 1,
+            checksum: compute_local_journal_checksum(&operations),
+            is_last: index + 1 == total,
+            operations,
+        })
+        .collect())
+}
+
+fn clear_local_operations(repo_path: &Path) -> Result<(), SharedError> {
+    let path = operations_log_path(repo_path);
+    match fs::remove_file(&path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SharedError::Transport(format!(
+            "failed to clear local operations at '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn operations_log_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(LOCAL_OPERATIONS_FILE)
+}
+
+fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
+    operations
+        .iter()
+        .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
+            JournalOperation::Add { entry_id } => accumulate_checksum(acc, entry_id.as_bytes()),
+            JournalOperation::UpdateField {
+                entry_id,
+                field,
+                value_checksum,
+            } => {
+                let updated = accumulate_checksum(acc, entry_id.as_bytes());
+                let updated = accumulate_checksum(updated, field.as_bytes());
+                updated ^ value_checksum
+            }
+            JournalOperation::Delete { entry_id } => {
+                accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
+            }
+        })
+}
+
+fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
+    for byte in payload {
+        seed = seed.wrapping_mul(16777619) ^ u32::from(*byte);
+    }
+    seed
 }
 
 fn execute_hello<P>(port: &mut P) -> Result<(), SharedError>
@@ -207,7 +418,7 @@ where
 
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -221,7 +432,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -248,7 +459,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -262,7 +473,7 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
@@ -276,35 +487,51 @@ where
     });
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
-    handle_device_response(response, None)?;
+    handle_device_response(response, None, None)?;
     Ok(())
 }
 
 fn handle_device_response(
     response: DeviceResponse,
     tracker: Option<&mut SyncStateTracker>,
+    artifacts: Option<&mut PullArtifacts>,
 ) -> Result<bool, SharedError> {
     match response {
         DeviceResponse::Hello(info) => {
             print_hello(&info);
+            if let Some(storage) = artifacts {
+                storage.record_log("hello response");
+            }
             Ok(false)
         }
         DeviceResponse::Status(status) => {
             print_status(&status);
+            if let Some(storage) = artifacts {
+                storage.record_log("status response");
+            }
             Ok(false)
         }
         DeviceResponse::Time(time) => {
             print_time(&time);
+            if let Some(storage) = artifacts {
+                storage.record_log("time response");
+            }
             Ok(false)
         }
         DeviceResponse::Head(head) => {
             print_head(&head);
+            if let Some(storage) = artifacts {
+                storage.record_log("head response");
+            }
             Ok(false)
         }
         DeviceResponse::JournalFrame(frame) => {
             print_journal_frame(&frame);
             if let Some(state) = tracker {
                 state.record(frame.sequence, frame.checksum);
+            }
+            if let Some(storage) = artifacts {
+                storage.record_journal_frame(&frame);
             }
             Ok(frame.remaining_operations > 0)
         }
@@ -313,10 +540,16 @@ fn handle_device_response(
             if let Some(state) = tracker {
                 state.record(chunk.sequence, chunk.checksum);
             }
+            if let Some(storage) = artifacts {
+                storage.record_vault_chunk(&chunk);
+            }
             Ok(!chunk.is_last)
         }
         DeviceResponse::Ack(message) => {
             print_ack(&message);
+            if let Some(storage) = artifacts {
+                storage.record_log("ack response");
+            }
             Ok(false)
         }
         DeviceResponse::Nack(err) => Err(SharedError::Transport(format!(
@@ -325,6 +558,99 @@ fn handle_device_response(
             message = err.message
         ))),
     }
+}
+
+#[derive(Default)]
+struct PullArtifacts {
+    vault: ArtifactBuffer,
+    recipients_manifest: Option<Vec<u8>>,
+    log_context: Vec<String>,
+}
+
+impl PullArtifacts {
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) {
+        self.vault.bytes.extend_from_slice(&chunk.data);
+        self.vault.metadata.push(VaultChunkMetadata {
+            protocol_version: chunk.protocol_version,
+            sequence: chunk.sequence,
+            total_size: chunk.total_size,
+            remaining_bytes: chunk.remaining_bytes,
+            device_chunk_size: chunk.device_chunk_size,
+            checksum: chunk.checksum,
+            is_last: chunk.is_last,
+        });
+    }
+
+    fn record_journal_frame(&mut self, frame: &JournalFrame) {
+        let summary = format!(
+            "journal frame #{sequence} with {operations} operations and {remaining} pending",
+            sequence = frame.sequence,
+            operations = frame.operations.len(),
+            remaining = frame.remaining_operations,
+        );
+        self.log_context.push(summary);
+    }
+
+    fn record_log(&mut self, context: impl Into<String>) {
+        self.log_context.push(context.into());
+    }
+
+    #[allow(dead_code)]
+    fn record_recipients_manifest(&mut self, data: &[u8]) {
+        self.recipients_manifest = Some(data.to_vec());
+    }
+
+    fn persist(&self, repo: &Path) -> Result<(), SharedError> {
+        if self.vault.bytes.is_empty() && self.recipients_manifest.is_none() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(repo)
+            .map_err(|err| io_error("create repository directory", repo, err))?;
+
+        if !self.vault.bytes.is_empty() {
+            let vault_path = repo.join("vault.enc");
+            if let Some(parent) = vault_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("prepare vault directory", parent, err))?;
+            }
+            fs::write(&vault_path, &self.vault.bytes)
+                .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
+        }
+
+        if let Some(recipients) = &self.recipients_manifest {
+            let recipients_path = repo.join("recips.json");
+            if let Some(parent) = recipients_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("prepare recipients directory", parent, err))?;
+            }
+            fs::write(&recipients_path, recipients)
+                .map_err(|err| io_error("write recipients artifact", &recipients_path, err))?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ArtifactBuffer {
+    bytes: Vec<u8>,
+    metadata: Vec<VaultChunkMetadata>,
+}
+
+#[allow(dead_code)]
+struct VaultChunkMetadata {
+    protocol_version: u16,
+    sequence: u32,
+    total_size: u64,
+    remaining_bytes: u64,
+    device_chunk_size: u32,
+    checksum: u32,
+    is_last: bool,
+}
+
+fn io_error(context: &str, path: &Path, err: io::Error) -> SharedError {
+    SharedError::Transport(format!("{context} at '{}': {err}", path.display()))
 }
 
 #[derive(Default)]
@@ -728,6 +1054,7 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 mod tests {
     use super::*;
     use shared::schema::{DeviceErrorCode, NackResponse};
+    use std::fs;
     use std::io::Cursor;
     use tempfile::tempdir;
 
@@ -1007,6 +1334,49 @@ mod tests {
     }
 
     #[test]
+    fn pull_persists_vault_chunks_to_file() {
+        let responses = [
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: 5,
+                remaining_bytes: 2,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![1, 2, 3],
+                checksum: 0xDEAD_BEEF,
+                is_last: false,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: 5,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![4, 5],
+                checksum: 0xC0FF_EE00,
+                is_last: true,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("nested/repo"),
+            credentials: temp.path().join("creds"),
+        };
+
+        execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let vault_path = args.repo.join("vault.enc");
+        let content = fs::read(&vault_path).expect("vault file");
+        assert_eq!(content, vec![1, 2, 3, 4, 5]);
+
+        let recipients_path = args.repo.join("recips.json");
+        assert!(!recipients_path.exists(), "unexpected recipients manifest");
+    }
+
+    #[test]
     fn status_sends_status_command() {
         let responses = encode_response(DeviceResponse::Status(StatusResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -1027,7 +1397,66 @@ mod tests {
     }
 
     #[test]
-    fn push_sends_ack_request_with_saved_state() {
+    fn push_serializes_local_operations() {
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().to_path_buf(),
+            credentials: temp.path().join("creds"),
+        };
+
+        let operations = vec![
+            JournalOperation::Add {
+                entry_id: String::from("entry-1"),
+            },
+            JournalOperation::UpdateField {
+                entry_id: String::from("entry-1"),
+                field: String::from("username"),
+                value_checksum: 0x1234_5678,
+            },
+        ];
+        let encoded_ops = serde_cbor::to_vec(&operations).expect("encode operations");
+        fs::write(operations_log_path(&args.repo), &encoded_ops).expect("write operations");
+
+        let ack_response = encode_response(DeviceResponse::Ack(AckResponse {
+            protocol_version: PROTOCOL_VERSION,
+            message: String::from("acknowledged"),
+        }));
+
+        let mut port = MockPort::new(ack_response);
+        execute_push(&mut port, &args).expect("push succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let (command, payload) = read_framed_message(&mut reader).expect("decode push frame");
+        assert_eq!(command, CdcCommand::PushOps);
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode push request");
+
+        match decoded {
+            HostRequest::PushOps(frame) => {
+                assert_eq!(frame.sequence, 1);
+                assert!(frame.is_last);
+                assert_eq!(frame.operations, operations);
+                assert_eq!(
+                    frame.checksum,
+                    compute_local_journal_checksum(&frame.operations)
+                );
+            }
+            other => panic!("unexpected request written: {:?}", other),
+        }
+
+        assert_eq!(
+            reader.position(),
+            reader.get_ref().len() as u64,
+            "expected exactly one push frame"
+        );
+
+        assert!(
+            !operations_log_path(&args.repo).exists(),
+            "operations file should be cleared after push"
+        );
+    }
+
+    #[test]
+    fn confirm_sends_ack_request_with_saved_state() {
         let sequence = 7;
         let frame_checksum = 0xAABBCCDD;
         let pull_responses = encode_response(DeviceResponse::JournalFrame(JournalFrame {
@@ -1055,7 +1484,7 @@ mod tests {
         }));
 
         let mut push_port = MockPort::new(push_responses);
-        execute_push(&mut push_port, &args).expect("push succeeds");
+        execute_confirm(&mut push_port, &args).expect("confirm succeeds");
 
         let mut reader = Cursor::new(push_port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");

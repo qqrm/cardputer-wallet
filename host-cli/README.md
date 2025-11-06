@@ -11,10 +11,11 @@ This crate depends on `serialport` for the CDC transport and `serde_cbor` for th
 
 ## Usage
 
-Three high-level subcommands are currently supported:
+Four high-level subcommands are currently supported:
 
 - `pull` – request the latest vault snapshot from the device;
-- `push` – acknowledge that journal frames were persisted on the host;
+- `push` – transmit locally prepared journal operations to the device;
+- `confirm` – acknowledge that journal frames were persisted on the host;
 - `status` – send a lightweight probe and report the next device response.
 
 Each command accepts the repository path and credentials path so the host knows where to place received data or which secrets to use for future pushes.
