@@ -12,9 +12,9 @@ use serialport::{SerialPort, SerialPortType};
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
-    AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, ArtifactKind, DeviceResponse, GetTimeRequest, HelloRequest,
+    HelloResponse, HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest,
+    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -313,7 +313,7 @@ fn handle_device_response(
             if let Some(state) = tracker {
                 state.record(chunk.sequence, chunk.checksum);
             }
-            Ok(!chunk.is_last)
+            Ok(!(chunk.is_last && chunk.artifact == ArtifactKind::Recipients))
         }
         DeviceResponse::Ack(message) => {
             print_ack(&message);
@@ -428,7 +428,8 @@ fn print_journal_frame(frame: &JournalFrame) {
 
 fn print_vault_chunk(chunk: &VaultChunk) {
     println!(
-        "Received vault chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
+        "Received {artifact:?} chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
+        artifact = chunk.artifact,
         sequence = chunk.sequence,
         size = chunk.data.len(),
         remaining = chunk.remaining_bytes,
@@ -920,6 +921,7 @@ mod tests {
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 1,
+                artifact: ArtifactKind::Vault,
                 total_size: 1024,
                 remaining_bytes: 512,
                 device_chunk_size: MAX_CHUNK_SIZE,
@@ -930,7 +932,8 @@ mod tests {
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 2,
-                total_size: 1024,
+                artifact: ArtifactKind::Recipients,
+                total_size: 128,
                 remaining_bytes: 0,
                 device_chunk_size: MAX_CHUNK_SIZE,
                 data: vec![0; 8],

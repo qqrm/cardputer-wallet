@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
 use shared::schema::{
-    AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
-    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
-    StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, ArtifactKind, DeviceErrorCode, DeviceResponse, GetTimeRequest,
+    HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 use zeroize::Zeroizing;
 
@@ -368,7 +368,9 @@ pub struct SyncContext {
     next_sequence: u32,
     vault_image: Zeroizing<Vec<u8>>,
     vault_offset: usize,
+    recipients_offset: usize,
     recipients_manifest: Zeroizing<Vec<u8>>,
+    transfer_stage: TransferStage,
     crypto: CryptoMaterial,
     session_id: u32,
     device_name: String,
@@ -392,7 +394,9 @@ impl SyncContext {
             next_sequence: 1,
             vault_image: Zeroizing::new(Vec::with_capacity(VAULT_BUFFER_CAPACITY)),
             vault_offset: 0,
+            recipients_offset: 0,
             recipients_manifest: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
+            transfer_stage: TransferStage::Vault,
             crypto: CryptoMaterial::default(),
             session_id: 0,
             device_name: String::from("Cardputer Wallet"),
@@ -502,8 +506,10 @@ impl SyncContext {
         }
 
         self.vault_offset = 0;
+        self.recipients_offset = 0;
         self.pending_sequence = None;
         self.next_sequence = 1;
+        self.transfer_stage = TransferStage::Vault;
 
         Ok(())
     }
@@ -571,6 +577,8 @@ impl SyncContext {
 
         self.crypto.wipe();
         self.vault_offset = 0;
+        self.recipients_offset = 0;
+        self.transfer_stage = TransferStage::Vault;
         self.pending_sequence = None;
     }
 
@@ -595,27 +603,64 @@ impl SyncContext {
             })
     }
 
-    fn next_vault_chunk(&mut self, max_chunk: usize) -> VaultChunk {
-        let available = self.vault_image.len().saturating_sub(self.vault_offset);
+    fn next_transfer_chunk(&mut self, max_chunk: usize) -> VaultChunk {
+        match self.transfer_stage {
+            TransferStage::Vault => {
+                let (mut chunk, finished) =
+                    self.next_chunk_for_artifact(ArtifactKind::Vault, max_chunk);
+                chunk.is_last = false;
+                if finished {
+                    self.transfer_stage = TransferStage::Recipients;
+                }
+                chunk
+            }
+            TransferStage::Recipients => {
+                let (mut chunk, finished) =
+                    self.next_chunk_for_artifact(ArtifactKind::Recipients, max_chunk);
+                if finished {
+                    chunk.is_last = true;
+                    self.transfer_stage = TransferStage::Completed;
+                } else {
+                    chunk.is_last = false;
+                }
+                chunk
+            }
+            TransferStage::Completed => self.completed_chunk(),
+        }
+    }
+
+    fn next_chunk_for_artifact(
+        &mut self,
+        artifact: ArtifactKind,
+        max_chunk: usize,
+    ) -> (VaultChunk, bool) {
+        let (buffer, offset) = match artifact {
+            ArtifactKind::Vault => (&self.vault_image, &mut self.vault_offset),
+            ArtifactKind::Recipients => (&self.recipients_manifest, &mut self.recipients_offset),
+        };
+
+        let data = buffer.as_slice();
+        let available = data.len().saturating_sub(*offset);
         let max_payload = cmp::min(max_chunk, FRAME_MAX_SIZE);
         let mut chunk_size = cmp::min(max_payload, available);
         let device_chunk_size = cmp::max(1, max_payload) as u32;
 
         loop {
-            let slice_end = self.vault_offset + chunk_size;
+            let slice_end = *offset + chunk_size;
             let payload = if chunk_size == 0 {
                 Vec::new()
             } else {
-                self.vault_image[self.vault_offset..slice_end].to_vec()
+                data[*offset..slice_end].to_vec()
             };
 
-            let remaining = self.vault_image.len().saturating_sub(slice_end) as u64;
+            let remaining = data.len().saturating_sub(slice_end) as u64;
             let checksum = accumulate_checksum(0, &payload);
 
             let chunk = VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: self.next_sequence,
-                total_size: self.vault_image.len() as u64,
+                artifact,
+                total_size: data.len() as u64,
                 remaining_bytes: remaining,
                 device_chunk_size,
                 data: payload,
@@ -625,16 +670,20 @@ impl SyncContext {
 
             let encoded_len = match serde_cbor::to_vec(&DeviceResponse::VaultChunk(chunk.clone())) {
                 Ok(bytes) => bytes.len(),
-                Err(_) => return chunk,
+                Err(_) => {
+                    *offset = slice_end;
+                    return (chunk, remaining == 0);
+                }
             };
 
             if encoded_len <= FRAME_MAX_SIZE {
-                self.vault_offset = slice_end;
-                return chunk;
+                *offset = slice_end;
+                return (chunk, remaining == 0);
             }
 
             if chunk_size == 0 {
-                return chunk;
+                *offset = slice_end;
+                return (chunk, remaining == 0);
             }
 
             let overhead = encoded_len.saturating_sub(chunk.data.len());
@@ -654,6 +703,27 @@ impl SyncContext {
             }
         }
     }
+
+    fn completed_chunk(&self) -> VaultChunk {
+        VaultChunk {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: self.next_sequence,
+            artifact: ArtifactKind::Recipients,
+            total_size: 0,
+            remaining_bytes: 0,
+            device_chunk_size: 1,
+            data: Vec::new(),
+            checksum: accumulate_checksum(0, &[]),
+            is_last: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferStage {
+    Vault,
+    Recipients,
+    Completed,
 }
 
 fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
@@ -755,6 +825,8 @@ fn handle_hello(
     ctx.pending_sequence = None;
     ctx.next_sequence = 1;
     ctx.vault_offset = 0;
+    ctx.recipients_offset = 0;
+    ctx.transfer_stage = TransferStage::Vault;
 
     Ok(DeviceResponse::Hello(HelloResponse {
         protocol_version: PROTOCOL_VERSION,
@@ -852,7 +924,7 @@ fn handle_pull(
             checksum,
         }))
     } else {
-        let chunk = ctx.next_vault_chunk(request.max_chunk_size as usize);
+        let chunk = ctx.next_transfer_chunk(request.max_chunk_size as usize);
         let checksum = chunk.checksum;
         let sequence = chunk.sequence;
         ctx.pending_sequence = Some((sequence, checksum));
@@ -903,6 +975,8 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
         {
             ctx.pending_sequence = None;
             ctx.vault_offset = 0;
+            ctx.recipients_offset = 0;
+            ctx.transfer_stage = TransferStage::Vault;
             ctx.wipe_sensitive();
             ctx.vault_generation = ctx.vault_generation.saturating_add(1);
             Ok(DeviceResponse::Ack(AckResponse {
@@ -1460,6 +1534,9 @@ mod tests {
         assert_eq!(ctx.recipients_manifest.as_slice(), b"recipients");
         assert_eq!(ctx.vault_generation, 7);
         assert_eq!(ctx.journal_ops.len(), 1);
+        assert_eq!(ctx.transfer_stage, TransferStage::Vault);
+        assert_eq!(ctx.vault_offset, 0);
+        assert_eq!(ctx.recipients_offset, 0);
 
         ctx.crypto.unlock_vault_key(pin).unwrap();
         let nonce = [0xAA; 12];
@@ -1467,6 +1544,44 @@ mod tests {
         let ciphertext = ctx.crypto.encrypt_record(&nonce, &payload).unwrap();
         let roundtrip = ctx.crypto.decrypt_record(&nonce, &ciphertext).unwrap();
         assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
+    fn handle_pull_streams_vault_then_recipients() {
+        let mut ctx = SyncContext::new();
+        ctx.vault_image.extend_from_slice(b"vault-data");
+        ctx.recipients_manifest
+            .extend_from_slice(b"{\"recipients\":[]}");
+
+        let request = PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 4096,
+            max_chunk_size: 4096,
+            known_generation: None,
+        };
+
+        let first = handle_pull(&request, &mut ctx).expect("first chunk");
+        let first_chunk = match first {
+            DeviceResponse::VaultChunk(chunk) => chunk,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(first_chunk.sequence, 1);
+        assert_eq!(first_chunk.artifact, ArtifactKind::Vault);
+        assert_eq!(first_chunk.data, b"vault-data");
+        assert_eq!(first_chunk.remaining_bytes, 0);
+        assert!(!first_chunk.is_last);
+
+        let second = handle_pull(&request, &mut ctx).expect("second chunk");
+        let second_chunk = match second {
+            DeviceResponse::VaultChunk(chunk) => chunk,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(second_chunk.sequence, 2);
+        assert_eq!(second_chunk.artifact, ArtifactKind::Recipients);
+        assert_eq!(second_chunk.data, b"{\"recipients\":[]}");
+        assert_eq!(second_chunk.remaining_bytes, 0);
+        assert!(second_chunk.is_last);
+        assert_eq!(ctx.transfer_stage, TransferStage::Completed);
     }
 
     #[test]
@@ -1524,6 +1639,7 @@ mod tests {
         assert!(ctx.crypto.vault_key.is_none());
         assert!(ctx.vault_image.is_empty());
         assert!(ctx.recipients_manifest.is_empty());
+        assert_eq!(ctx.transfer_stage, TransferStage::Vault);
     }
 
     #[test]
