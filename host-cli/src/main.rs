@@ -14,7 +14,7 @@ use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
     HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -427,8 +427,12 @@ fn print_journal_frame(frame: &JournalFrame) {
 }
 
 fn print_vault_chunk(chunk: &VaultChunk) {
+    let artifact = match chunk.artifact {
+        VaultArtifact::Vault => "vault image",
+        VaultArtifact::Recipients => "recipients manifest",
+    };
     println!(
-        "Received vault chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
+        "Received {artifact} chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
         sequence = chunk.sequence,
         size = chunk.data.len(),
         remaining = chunk.remaining_bytes,
@@ -955,6 +959,7 @@ mod tests {
                 data: vec![0; 8],
                 checksum: 0x1234ABCD,
                 is_last: false,
+                artifact: VaultArtifact::Vault,
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -965,6 +970,7 @@ mod tests {
                 data: vec![0; 8],
                 checksum: 0xCAFEBABE,
                 is_last: true,
+                artifact: VaultArtifact::Vault,
             })),
         ]
         .concat();
