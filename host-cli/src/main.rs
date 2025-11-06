@@ -13,8 +13,9 @@ use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    HostRequest, JournalFrame, JournalOperation, PullHeadRequest, PullHeadResponse,
+    PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse,
+    TimeResponse, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -25,6 +26,8 @@ const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
+const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
+const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -55,8 +58,10 @@ enum Command {
     PullHead,
     /// Fetch the latest vault data from the device.
     Pull(RepoArgs),
-    /// Confirm completion of a device initiated push flow.
+    /// Push local journal operations to the device.
     Push(RepoArgs),
+    /// Confirm completion of a device initiated push flow.
+    Confirm(RepoArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -113,6 +118,7 @@ fn run(cli: Cli) -> Result<(), SharedError> {
         Command::PullHead => execute_pull_head(&mut *port),
         Command::Pull(args) => execute_pull(&mut *port, &args),
         Command::Push(args) => execute_push(&mut *port, &args),
+        Command::Confirm(args) => execute_confirm(&mut *port, &args),
     }
 }
 
@@ -155,6 +161,66 @@ where
     P: Read + Write + ?Sized,
 {
     println!(
+        "Preparing push for repository '{}' using credentials '{}'",
+        args.repo.display(),
+        args.credentials.display()
+    );
+
+    let plan = PushPlan::load(&args.repo)?;
+    if plan.frames.is_empty() {
+        println!("No pending operations to push.");
+        return Ok(());
+    }
+
+    println!(
+        "Dispatching {} operation{} across {} frame{}…",
+        plan.total_operations,
+        if plan.total_operations == 1 { "" } else { "s" },
+        plan.frames.len(),
+        if plan.frames.len() == 1 { "" } else { "s" }
+    );
+
+    for frame in plan.frames.into_iter() {
+        let sequence = frame.sequence;
+        let operation_count = frame.operations.len();
+        println!(
+            "Sending frame #{sequence} with {operation_count} operation{plural} ({last}).",
+            plural = if operation_count == 1 { "" } else { "s" },
+            last = if frame.is_last {
+                "final frame"
+            } else {
+                "more frames pending"
+            }
+        );
+
+        let request = HostRequest::PushOps(frame);
+        send_host_request(port, &request)?;
+
+        let response = read_device_response(port)?;
+        match response {
+            DeviceResponse::Ack(message) => {
+                print_ack(&message);
+            }
+            other => {
+                let description = format!("{other:?}");
+                handle_device_response(other, None)?;
+                return Err(SharedError::Transport(format!(
+                    "unexpected device response while pushing operations: {description}"
+                )));
+            }
+        }
+    }
+
+    clear_local_operations(&args.repo)?;
+    println!("Push operations completed. Cleared local journal state.");
+    Ok(())
+}
+
+fn execute_confirm<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    println!(
         "Finalising push for repository '{}' using credentials '{}'",
         args.repo.display(),
         args.credentials.display()
@@ -190,6 +256,146 @@ where
     }
 
     Ok(())
+}
+
+struct PushPlan {
+    frames: Vec<PushOperationsFrame>,
+    total_operations: usize,
+}
+
+impl PushPlan {
+    fn load(repo_path: &Path) -> Result<Self, SharedError> {
+        let operations = load_local_operations(repo_path)?;
+        if operations.is_empty() {
+            return Ok(Self {
+                frames: Vec::new(),
+                total_operations: 0,
+            });
+        }
+
+        let frames = build_push_frames(operations)?;
+        let total_operations = frames.iter().map(|frame| frame.operations.len()).sum();
+
+        Ok(Self {
+            frames,
+            total_operations,
+        })
+    }
+}
+
+fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, SharedError> {
+    let path = operations_log_path(repo_path);
+    let data = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read local operations from '{}': {err}",
+                path.display()
+            )))
+        }
+    };
+
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operations: Vec<JournalOperation> = serde_cbor::from_slice(&data)?;
+    Ok(operations)
+}
+
+fn build_push_frames(
+    operations: Vec<JournalOperation>,
+) -> Result<Vec<PushOperationsFrame>, SharedError> {
+    let mut frames: Vec<Vec<JournalOperation>> = Vec::new();
+    let mut current: Vec<JournalOperation> = Vec::new();
+
+    for operation in operations {
+        current.push(operation);
+        let encoded_len = serde_cbor::to_vec(&current)?.len();
+        if encoded_len > PUSH_FRAME_MAX_PAYLOAD {
+            let last = current
+                .pop()
+                .expect("pushed operation missing when building push frames");
+
+            if current.is_empty() {
+                return Err(SharedError::Transport(format!(
+                    "operation payload exceeds maximum frame size of {} bytes",
+                    PUSH_FRAME_MAX_PAYLOAD
+                )));
+            }
+
+            frames.push(std::mem::take(&mut current));
+            current.push(last);
+            let single_len = serde_cbor::to_vec(&current)?.len();
+            if single_len > PUSH_FRAME_MAX_PAYLOAD {
+                return Err(SharedError::Transport(format!(
+                    "operation payload exceeds maximum frame size of {} bytes",
+                    PUSH_FRAME_MAX_PAYLOAD
+                )));
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        frames.push(current);
+    }
+
+    let total = frames.len();
+    Ok(frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, operations)| PushOperationsFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: index as u32 + 1,
+            checksum: compute_local_journal_checksum(&operations),
+            is_last: index + 1 == total,
+            operations,
+        })
+        .collect())
+}
+
+fn clear_local_operations(repo_path: &Path) -> Result<(), SharedError> {
+    let path = operations_log_path(repo_path);
+    match fs::remove_file(&path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SharedError::Transport(format!(
+            "failed to clear local operations at '{}': {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn operations_log_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(LOCAL_OPERATIONS_FILE)
+}
+
+fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
+    operations
+        .iter()
+        .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
+            JournalOperation::Add { entry_id } => accumulate_checksum(acc, entry_id.as_bytes()),
+            JournalOperation::UpdateField {
+                entry_id,
+                field,
+                value_checksum,
+            } => {
+                let updated = accumulate_checksum(acc, entry_id.as_bytes());
+                let updated = accumulate_checksum(updated, field.as_bytes());
+                updated ^ value_checksum
+            }
+            JournalOperation::Delete { entry_id } => {
+                accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
+            }
+        })
+}
+
+fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
+    for byte in payload {
+        seed = seed.wrapping_mul(16777619) ^ u32::from(*byte);
+    }
+    seed
 }
 
 fn execute_hello<P>(port: &mut P) -> Result<(), SharedError>
@@ -724,6 +930,7 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 mod tests {
     use super::*;
     use shared::schema::{DeviceErrorCode, NackResponse};
+    use std::fs;
     use std::io::Cursor;
     use tempfile::tempdir;
 
@@ -1021,7 +1228,66 @@ mod tests {
     }
 
     #[test]
-    fn push_sends_ack_request_with_saved_state() {
+    fn push_serializes_local_operations() {
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().to_path_buf(),
+            credentials: temp.path().join("creds"),
+        };
+
+        let operations = vec![
+            JournalOperation::Add {
+                entry_id: String::from("entry-1"),
+            },
+            JournalOperation::UpdateField {
+                entry_id: String::from("entry-1"),
+                field: String::from("username"),
+                value_checksum: 0x1234_5678,
+            },
+        ];
+        let encoded_ops = serde_cbor::to_vec(&operations).expect("encode operations");
+        fs::write(operations_log_path(&args.repo), &encoded_ops).expect("write operations");
+
+        let ack_response = encode_response(DeviceResponse::Ack(AckResponse {
+            protocol_version: PROTOCOL_VERSION,
+            message: String::from("acknowledged"),
+        }));
+
+        let mut port = MockPort::new(ack_response);
+        execute_push(&mut port, &args).expect("push succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let (command, payload) = read_framed_message(&mut reader).expect("decode push frame");
+        assert_eq!(command, CdcCommand::PushOps);
+        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode push request");
+
+        match decoded {
+            HostRequest::PushOps(frame) => {
+                assert_eq!(frame.sequence, 1);
+                assert!(frame.is_last);
+                assert_eq!(frame.operations, operations);
+                assert_eq!(
+                    frame.checksum,
+                    compute_local_journal_checksum(&frame.operations)
+                );
+            }
+            other => panic!("unexpected request written: {:?}", other),
+        }
+
+        assert_eq!(
+            reader.position(),
+            reader.get_ref().len() as u64,
+            "expected exactly one push frame"
+        );
+
+        assert!(
+            !operations_log_path(&args.repo).exists(),
+            "operations file should be cleared after push"
+        );
+    }
+
+    #[test]
+    fn confirm_sends_ack_request_with_saved_state() {
         let sequence = 7;
         let frame_checksum = 0xAABBCCDD;
         let pull_responses = encode_response(DeviceResponse::JournalFrame(JournalFrame {
@@ -1049,7 +1315,7 @@ mod tests {
         }));
 
         let mut push_port = MockPort::new(push_responses);
-        execute_push(&mut push_port, &args).expect("push succeeds");
+        execute_confirm(&mut push_port, &args).expect("confirm succeeds");
 
         let mut reader = Cursor::new(push_port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
