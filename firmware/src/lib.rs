@@ -902,9 +902,7 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
             if ack.last_frame_sequence == sequence && ack.journal_checksum == checksum =>
         {
             ctx.pending_sequence = None;
-            ctx.vault_offset = 0;
             ctx.wipe_sensitive();
-            ctx.vault_generation = ctx.vault_generation.saturating_add(1);
             Ok(DeviceResponse::Ack(AckResponse {
                 protocol_version: PROTOCOL_VERSION,
                 message: format!(
@@ -1150,6 +1148,34 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn acknowledgement_keeps_vault_generation() {
+        let mut ctx = SyncContext::new();
+        ctx.vault_generation = 7;
+        let expected_generation = ctx.vault_generation;
+        let pending = (12, 0xABCD_1234);
+        ctx.pending_sequence = Some(pending);
+
+        let ack = AckRequest {
+            protocol_version: PROTOCOL_VERSION,
+            last_frame_sequence: pending.0,
+            journal_checksum: pending.1,
+        };
+
+        let response = handle_ack(&ack, &mut ctx).expect("ack should succeed");
+
+        match response {
+            DeviceResponse::Ack(message) => {
+                assert_eq!(message.protocol_version, PROTOCOL_VERSION);
+                assert!(message.message.contains(&pending.0.to_string()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        assert!(ctx.pending_sequence.is_none());
+        assert_eq!(ctx.vault_generation, expected_generation);
     }
 
     #[test]
