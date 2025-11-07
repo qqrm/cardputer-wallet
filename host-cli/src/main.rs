@@ -13,11 +13,9 @@ use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
     HostRequest, JournalFrame, JournalOperation, PullHeadRequest, PullHeadResponse,
     PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse,
-    TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -208,7 +206,7 @@ where
             }
             other => {
                 let description = format!("{other:?}");
-                handle_device_response(other, None)?;
+                handle_device_response(other, None, None)?;
                 return Err(SharedError::Transport(format!(
                     "unexpected device response while pushing operations: {description}"
                 )));
@@ -1345,6 +1343,7 @@ mod tests {
                 data: vec![1, 2, 3],
                 checksum: 0xDEAD_BEEF,
                 is_last: false,
+                artifact: VaultArtifact::Vault,
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1355,6 +1354,7 @@ mod tests {
                 data: vec![4, 5],
                 checksum: 0xC0FF_EE00,
                 is_last: true,
+                artifact: VaultArtifact::Vault,
             })),
         ]
         .concat();
