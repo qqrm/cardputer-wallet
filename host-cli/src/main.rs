@@ -12,12 +12,11 @@ use serialport::{SerialPort, SerialPortType};
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
-    AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, PullHeadRequest, PullHeadResponse, PullVaultRequest, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
-    HostRequest, JournalFrame, JournalOperation, PullHeadRequest, PullHeadResponse,
-    PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse,
-    TimeResponse, VaultChunk, PROTOCOL_VERSION,
+    decode_device_response, decode_journal_operations, encode_host_request,
+    encode_journal_operations, AckRequest, AckResponse, DeviceResponse, GetTimeRequest,
+    HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
+    StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -93,8 +92,8 @@ fn main() -> Result<()> {
             SharedError::Transport(_) => {
                 eprintln!("Transport failure: {err}");
             }
-            SharedError::Serialization(_) => {
-                eprintln!("CBOR decoding error: {err}");
+            SharedError::Codec(_) => {
+                eprintln!("Codec error: {err}");
             }
         }
         return Err(anyhow::Error::from(err));
@@ -208,7 +207,7 @@ where
             }
             other => {
                 let description = format!("{other:?}");
-                handle_device_response(other, None)?;
+                handle_device_response(other, None, None)?;
                 return Err(SharedError::Transport(format!(
                     "unexpected device response while pushing operations: {description}"
                 )));
@@ -305,7 +304,7 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
         return Ok(Vec::new());
     }
 
-    let operations: Vec<JournalOperation> = serde_cbor::from_slice(&data)?;
+    let operations = decode_journal_operations(&data)?;
     Ok(operations)
 }
 
@@ -317,7 +316,7 @@ fn build_push_frames(
 
     for operation in operations {
         current.push(operation);
-        let encoded_len = serde_cbor::to_vec(&current)?.len();
+        let encoded_len = encode_journal_operations(&current)?.len();
         if encoded_len > PUSH_FRAME_MAX_PAYLOAD {
             let last = current
                 .pop()
@@ -332,7 +331,7 @@ fn build_push_frames(
 
             frames.push(std::mem::take(&mut current));
             current.push(last);
-            let single_len = serde_cbor::to_vec(&current)?.len();
+            let single_len = encode_journal_operations(&current)?.len();
             if single_len > PUSH_FRAME_MAX_PAYLOAD {
                 return Err(SharedError::Transport(format!(
                     "operation payload exceeds maximum frame size of {} bytes",
@@ -815,7 +814,7 @@ fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), Sha
 where
     W: Write + ?Sized,
 {
-    let payload = serde_cbor::to_vec(request)?;
+    let payload = encode_host_request(request)?;
     let command = command_for_request(request);
     write_framed_message(writer, command, &payload)
 }
@@ -825,7 +824,7 @@ where
     R: Read + ?Sized,
 {
     let (command, payload) = read_framed_message(reader)?;
-    let response = serde_cbor::from_slice(&payload)?;
+    let response = decode_device_response(&payload)?;
     validate_response_command(command, &response)?;
     Ok(response)
 }
@@ -1053,7 +1052,9 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::schema::{DeviceErrorCode, NackResponse};
+    use shared::schema::{
+        decode_host_request, encode_device_response, DeviceErrorCode, NackResponse,
+    };
     use std::fs;
     use std::io::Cursor;
     use tempfile::tempdir;
@@ -1087,7 +1088,7 @@ mod tests {
     }
 
     fn encode_response(response: DeviceResponse) -> Vec<u8> {
-        let payload = serde_cbor::to_vec(&response).expect("encode response");
+        let payload = encode_device_response(&response).expect("encode response");
         let mut cursor = Cursor::new(Vec::new());
         let command = command_for_response(&response);
         write_framed_message(&mut cursor, command, &payload).expect("write frame");
@@ -1188,7 +1189,7 @@ mod tests {
             known_generation: Some(7),
         });
 
-        let payload = serde_cbor::to_vec(&request).expect("encode request");
+        let payload = encode_host_request(&request).expect("encode request");
         let mut writer = Cursor::new(Vec::new());
         let command = command_for_request(&request);
         write_framed_message(&mut writer, command, &payload).expect("write frame");
@@ -1252,7 +1253,7 @@ mod tests {
             code: DeviceErrorCode::InternalFailure,
             message: "failure".into(),
         });
-        let payload = serde_cbor::to_vec(&response).expect("encode response");
+        let payload = encode_device_response(&response).expect("encode response");
         let mut frame = Vec::new();
         let checksum = compute_crc32(&payload);
         let wrong_command = FrameHeader::new(
@@ -1316,14 +1317,14 @@ mod tests {
             read_framed_message(&mut reader).expect("decode first written frame");
         assert_eq!(command_one, CdcCommand::PullVault);
         let decoded_one: HostRequest =
-            serde_cbor::from_slice(&payload_one).expect("decode first request");
+            decode_host_request(&payload_one).expect("decode first request");
         assert!(matches!(decoded_one, HostRequest::PullVault(_)));
 
         let (command_two, payload_two) =
             read_framed_message(&mut reader).expect("decode second written frame");
         assert_eq!(command_two, CdcCommand::PullVault);
         let decoded_two: HostRequest =
-            serde_cbor::from_slice(&payload_two).expect("decode second request");
+            decode_host_request(&payload_two).expect("decode second request");
         assert!(matches!(decoded_two, HostRequest::PullVault(_)));
 
         assert_eq!(
@@ -1345,6 +1346,7 @@ mod tests {
                 data: vec![1, 2, 3],
                 checksum: 0xDEAD_BEEF,
                 is_last: false,
+                artifact: VaultArtifact::Vault,
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1355,6 +1357,7 @@ mod tests {
                 data: vec![4, 5],
                 checksum: 0xC0FF_EE00,
                 is_last: true,
+                artifact: VaultArtifact::Vault,
             })),
         ]
         .concat();
@@ -1392,7 +1395,7 @@ mod tests {
         let mut reader = Cursor::new(port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
         assert_eq!(command, CdcCommand::Status);
-        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+        let decoded = decode_host_request(&payload).expect("decode request");
         assert!(matches!(decoded, HostRequest::Status(_)));
     }
 
@@ -1414,7 +1417,7 @@ mod tests {
                 value_checksum: 0x1234_5678,
             },
         ];
-        let encoded_ops = serde_cbor::to_vec(&operations).expect("encode operations");
+        let encoded_ops = encode_journal_operations(&operations).expect("encode operations");
         fs::write(operations_log_path(&args.repo), &encoded_ops).expect("write operations");
 
         let ack_response = encode_response(DeviceResponse::Ack(AckResponse {
@@ -1428,7 +1431,7 @@ mod tests {
         let mut reader = Cursor::new(port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode push frame");
         assert_eq!(command, CdcCommand::PushOps);
-        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode push request");
+        let decoded = decode_host_request(&payload).expect("decode push request");
 
         match decoded {
             HostRequest::PushOps(frame) => {
@@ -1489,7 +1492,7 @@ mod tests {
         let mut reader = Cursor::new(push_port.writes);
         let (command, payload) = read_framed_message(&mut reader).expect("decode written frame");
         assert_eq!(command, CdcCommand::Ack);
-        let decoded: HostRequest = serde_cbor::from_slice(&payload).expect("decode request");
+        let decoded = decode_host_request(&payload).expect("decode request");
 
         match decoded {
             HostRequest::Ack(ack) => {

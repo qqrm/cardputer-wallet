@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-serde_cbor = { version = "0.11", default-features = false, features = ["alloc"] }
-shared = { path = "../shared" }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+shared = { path = "../shared", default-features = false }
 zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
 sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 embedded-storage-async = { version = "0.4", default-features = false }
@@ -14,6 +14,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 scrypt = { version = "0.12.0-rc.2", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_cbor = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
