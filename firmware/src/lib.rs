@@ -19,6 +19,7 @@ use scrypt::{
 };
 use sequential_storage::{cache::NoCache, map, Error as FlashStorageError};
 use serde::{Deserialize, Serialize};
+use serde_cbor::de::from_slice as cbor_from_slice;
 
 #[cfg(target_arch = "xtensa")]
 use shared::cdc::FRAME_HEADER_SIZE;
@@ -482,9 +483,20 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            let operations = decode_journal_operations(&journal_bytes)
-                .map_err(|err| StorageError::Decode(err.to_string()))?;
-            self.journal_ops = operations;
+            match decode_journal_operations(&journal_bytes) {
+                Ok(operations) => {
+                    self.journal_ops = operations;
+                }
+                Err(postcard_err) => {
+                    let operations = cbor_from_slice::<Vec<JournalOperation>>(&journal_bytes)
+                        .map_err(|cbor_err| {
+                            StorageError::Decode(format!(
+                                "postcard journal decode failed: {postcard_err}; legacy CBOR decode failed: {cbor_err}"
+                            ))
+                        })?;
+                    self.journal_ops = operations;
+                }
+            }
         } else {
             self.journal_ops.clear();
         }
@@ -512,8 +524,14 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            let record: KeyRecord = postcard_from_bytes(&key_bytes)
-                .map_err(|err| StorageError::Decode(err.to_string()))?;
+            let record: KeyRecord = match postcard_from_bytes(&key_bytes) {
+                Ok(record) => record,
+                Err(postcard_err) => cbor_from_slice(&key_bytes).map_err(|cbor_err| {
+                    StorageError::Decode(format!(
+                        "postcard key record decode failed: {postcard_err}; legacy CBOR decode failed: {cbor_err}"
+                    ))
+                })?,
+            };
             self.crypto.configure_from_record(&record)?;
         }
 
