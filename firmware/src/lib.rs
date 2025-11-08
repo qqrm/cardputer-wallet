@@ -752,6 +752,13 @@ impl SyncContext {
                 };
 
             if encoded_len <= frame_budget {
+                if chunk_size == 0 && available > 0 {
+                    return Err(ProtocolError::HostBufferTooSmall {
+                        required: encoded_len,
+                        provided: host_buffer_size,
+                    });
+                }
+
                 *offset = slice_end;
                 self.last_artifact = artifact;
 
