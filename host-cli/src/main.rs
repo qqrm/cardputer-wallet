@@ -11,13 +11,14 @@ use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_all
 use serde_cbor::from_slice as cbor_from_slice;
 use serialport::{SerialPort, SerialPortType};
 
-use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
+use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::error::SharedError;
 use shared::schema::{
-    decode_journal_operations, encode_journal_operations, AckRequest, AckResponse, DeviceResponse,
-    GetTimeRequest, HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
+    HostRequest, JournalFrame, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
+    StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_journal_operations,
+    encode_journal_operations,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -294,13 +295,13 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
     let data = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return migrate_legacy_operations(repo_path, &path)
+            return migrate_legacy_operations(repo_path, &path);
         }
         Err(err) => {
             return Err(SharedError::Transport(format!(
                 "failed to read local operations from '{}': {err}",
                 path.display()
-            )))
+            )));
         }
     };
 
@@ -328,7 +329,7 @@ fn migrate_legacy_operations(
             return Err(SharedError::Transport(format!(
                 "failed to read legacy local operations from '{}': {err}",
                 legacy_path.display()
-            )))
+            )));
         }
     };
 
@@ -359,7 +360,7 @@ fn migrate_legacy_operations(
             return Err(SharedError::Transport(format!(
                 "failed to remove legacy operations file '{}': {err}",
                 legacy_path.display()
-            )))
+            )));
         }
     }
 
@@ -748,7 +749,7 @@ fn persist_sync_state(repo_path: &Path, state: Option<(u32, u32)>) -> Result<(),
                 return Err(SharedError::Transport(format!(
                     "failed to clear sync state at '{}': {err}",
                     path.display()
-                )))
+                )));
             }
         },
     }
@@ -765,7 +766,7 @@ fn load_sync_state(repo_path: &Path) -> Result<Option<(u32, u32)>, SharedError> 
             return Err(SharedError::Transport(format!(
                 "failed to read sync state from '{}': {err}",
                 path.display()
-            )))
+            )));
         }
     };
 
@@ -1115,8 +1116,8 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 mod tests {
     use super::*;
     use shared::schema::{
-        decode_host_request, encode_device_response, encode_host_request, DeviceErrorCode,
-        NackResponse,
+        DeviceErrorCode, NackResponse, decode_host_request, encode_device_response,
+        encode_host_request,
     };
     use std::fs;
     use std::io::Cursor;
