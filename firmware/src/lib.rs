@@ -232,6 +232,91 @@ impl<'d> BootFlash<'d> {
 
         BlockingReadNorFlash::capacity(&self.storage)
     }
+
+    fn sequential_storage_range(&mut self) -> Option<Range<u32>> {
+        use core::str;
+        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
+
+        const PARTITION_MAGIC: u16 = 0x50AA;
+        const PARTITION_TABLE_OFFSET: u32 = 0x8000;
+        const PARTITION_TABLE_SIZE: usize = 0x1000;
+        const PARTITION_ENTRY_SIZE: usize = 32;
+        const DATA_PARTITION_TYPE: u8 = 0x01;
+        const FILESYSTEM_SUBTYPES: [u8; 3] = [0x81, 0x82, 0x83];
+        const SYNC_LABELS: [&str; 5] = [
+            "cardputer-sync",
+            "cardputer_sync",
+            "wallet-sync",
+            "wallet_sync",
+            "sync",
+        ];
+
+        let mut table = [0u8; PARTITION_TABLE_SIZE];
+        if BlockingReadNorFlash::read(&mut self.storage, PARTITION_TABLE_OFFSET, &mut table)
+            .is_err()
+        {
+            return None;
+        }
+
+        let mut preferred: Option<Range<u32>> = None;
+        let mut filesystem: Option<Range<u32>> = None;
+
+        for entry in table.chunks_exact(PARTITION_ENTRY_SIZE) {
+            let magic = u16::from_le_bytes([entry[0], entry[1]]);
+            if magic == 0xFFFF {
+                break;
+            }
+            if magic != PARTITION_MAGIC {
+                continue;
+            }
+
+            let partition_type = entry[2];
+            if partition_type != DATA_PARTITION_TYPE {
+                continue;
+            }
+
+            let subtype = entry[3];
+            let offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+            if size == 0 {
+                continue;
+            }
+
+            let end = match offset.checked_add(size) {
+                Some(limit) => limit,
+                None => continue,
+            };
+
+            let label_bytes = &entry[12..28];
+            let label_end = label_bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(label_bytes.len());
+            let label = match str::from_utf8(&label_bytes[..label_end]) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let range = offset..end;
+
+            if SYNC_LABELS
+                .iter()
+                .any(|expected| label.eq_ignore_ascii_case(expected))
+            {
+                return Some(range);
+            }
+
+            if subtype >= 0x40 && preferred.is_none() {
+                preferred = Some(range.clone());
+            }
+
+            if FILESYSTEM_SUBTYPES.contains(&subtype) && filesystem.is_none() {
+                filesystem = Some(range);
+            }
+        }
+
+        preferred.or(filesystem)
+    }
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -1187,8 +1272,12 @@ mod runtime {
         esp_hal_embassy::init(timer0);
 
         let mut flash = BootFlash::new(FlashStorage::new(peripherals.FLASH));
-        let flash_range = 0..flash.flash_capacity() as u32;
-        let boot_context = block_on(initialize_context_from_flash(&mut flash, flash_range));
+        let boot_context = match flash.sequential_storage_range() {
+            Some(range) => block_on(initialize_context_from_flash(&mut flash, range)),
+            None => Err(StorageError::Decode(
+                "sync flash partition not found".to_string(),
+            )),
+        };
 
         let usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
 
@@ -1226,15 +1315,26 @@ mod tasks {
     type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     #[task]
-    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, mut ctx: BootContext) {
-        if let Err(error) = &ctx {
+    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, ctx: BootContext) {
+        let (mut context, mut boot_error) = match ctx {
+            Ok(ctx) => (ctx, None),
+            Err(error) => (SyncContext::new(), Some(error)),
+        };
+
+        if let Some(error) = &boot_error {
             log_boot_failure(error);
         }
 
         loop {
             match read_frame(&mut serial).await {
-                Ok((command, frame)) => match &mut ctx {
-                    Ok(context) => match process_host_frame(command, &frame, context) {
+                Ok((command, frame)) => {
+                    if let Some(error) = boot_error.take() {
+                        let payload = boot_failure_payload(&error);
+                        let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                        continue;
+                    }
+
+                    match process_host_frame(command, &frame, &mut context) {
                         Ok((response_command, response)) => {
                             let _ = write_frame(&mut serial, response_command, &response);
                         }
@@ -1250,12 +1350,8 @@ mod tasks {
                                 };
                             let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                         }
-                    },
-                    Err(error) => {
-                        let payload = boot_failure_payload(error);
-                        let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                     }
-                },
+                }
                 Err(err) => {
                     let payload = match encode_response(&DeviceResponse::Nack(err.as_nack())) {
                         Ok(encoded) => encoded,
