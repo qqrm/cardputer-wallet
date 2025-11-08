@@ -6,3 +6,4 @@ pub mod cdc;
 #[cfg(feature = "std")]
 pub mod error;
 pub mod schema;
+pub mod vault;
