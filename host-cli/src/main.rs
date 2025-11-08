@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
+use serde_cbor::from_slice as cbor_from_slice;
 use serialport::{SerialPort, SerialPortType};
 
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
@@ -28,6 +29,7 @@ const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
 const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.postcard";
+const LEGACY_LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
 const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
 
 #[derive(Parser, Debug)]
@@ -291,7 +293,9 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
     let path = operations_log_path(repo_path);
     let data = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return migrate_legacy_operations(repo_path, &path)
+        }
         Err(err) => {
             return Err(SharedError::Transport(format!(
                 "failed to read local operations from '{}': {err}",
@@ -300,11 +304,65 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
         }
     };
 
+    decode_postcard_operations(data)
+}
+
+fn decode_postcard_operations(data: Vec<u8>) -> Result<Vec<JournalOperation>, SharedError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
     let operations = decode_journal_operations(&data)?;
+    Ok(operations)
+}
+
+fn migrate_legacy_operations(
+    repo_path: &Path,
+    new_path: &Path,
+) -> Result<Vec<JournalOperation>, SharedError> {
+    let legacy_path = legacy_operations_log_path(repo_path);
+    let legacy_data = match fs::read(&legacy_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read legacy local operations from '{}': {err}",
+                legacy_path.display()
+            )))
+        }
+    };
+
+    if legacy_data.is_empty() {
+        let _ = fs::remove_file(&legacy_path);
+        return Ok(Vec::new());
+    }
+
+    let operations: Vec<JournalOperation> = cbor_from_slice(&legacy_data).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to decode legacy local operations from '{}': {err}",
+            legacy_path.display()
+        ))
+    })?;
+
+    let encoded = encode_journal_operations(&operations)?;
+    fs::write(new_path, &encoded).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to write migrated operations to '{}': {err}",
+            new_path.display()
+        ))
+    })?;
+
+    match fs::remove_file(&legacy_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to remove legacy operations file '{}': {err}",
+                legacy_path.display()
+            )))
+        }
+    }
+
     Ok(operations)
 }
 
@@ -373,6 +431,10 @@ fn clear_local_operations(repo_path: &Path) -> Result<(), SharedError> {
 
 fn operations_log_path(repo_path: &Path) -> PathBuf {
     repo_path.join(LOCAL_OPERATIONS_FILE)
+}
+
+fn legacy_operations_log_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(LEGACY_LOCAL_OPERATIONS_FILE)
 }
 
 fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
