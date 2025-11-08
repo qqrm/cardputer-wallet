@@ -981,13 +981,13 @@ fn handle_pull(
         .unwrap_or(false);
 
     if host_in_sync && ctx.journal_ops.is_empty() && ctx.pending_sequence.is_none() {
-        return Ok(DeviceResponse::Ack(AckResponse {
-            protocol_version: PROTOCOL_VERSION,
-            message: format!(
-                "vault already synchronized (generation {})",
-                ctx.vault_generation
-            ),
-        }));
+        let chunk = ctx.next_transfer_chunk(request.max_chunk_size as usize);
+        let checksum = chunk.checksum;
+        let sequence = chunk.sequence;
+        ctx.pending_sequence = Some((sequence, checksum));
+        ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
+
+        return Ok(DeviceResponse::VaultChunk(chunk));
     }
 
     if !ctx.journal_ops.is_empty() {
@@ -1262,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_with_matching_generation_returns_ack() {
+    fn pull_request_with_matching_generation_returns_placeholder_chunk() {
         let mut ctx = fresh_context();
         ctx.vault_generation = 7;
 
@@ -1273,18 +1273,22 @@ mod tests {
             known_generation: Some(7),
         };
 
-        let response = handle_pull(&request, &mut ctx).expect("pull ack");
+        let response = handle_pull(&request, &mut ctx).expect("pull chunk");
         match response {
-            DeviceResponse::Ack(ack) => {
-                assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
-                assert!(ack.message.contains("synchronized"));
+            DeviceResponse::VaultChunk(chunk) => {
+                assert_eq!(chunk.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(chunk.sequence, 1);
+                assert!(chunk.data.is_empty());
+                assert_eq!(chunk.total_size, 0);
+                assert_eq!(chunk.remaining_bytes, 0);
+                assert!(chunk.is_last);
+                assert_eq!(ctx.pending_sequence, Some((chunk.sequence, chunk.checksum)));
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
         assert!(ctx.journal_ops.is_empty());
-        assert!(ctx.pending_sequence.is_none());
-        assert_eq!(ctx.next_sequence, 1);
+        assert_eq!(ctx.next_sequence, 2);
     }
 
     #[test]
