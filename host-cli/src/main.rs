@@ -7,16 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use serialport::{SerialPort, SerialPortType};
 
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
-    decode_device_response, decode_journal_operations, encode_host_request,
-    encode_journal_operations, AckRequest, AckResponse, DeviceResponse, GetTimeRequest,
-    HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
-    StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    decode_journal_operations, encode_journal_operations, AckRequest, AckResponse, DeviceResponse,
+    GetTimeRequest, HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -27,7 +27,7 @@ const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
-const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
+const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.postcard";
 const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
 
 #[derive(Parser, Debug)]
@@ -814,7 +814,7 @@ fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), Sha
 where
     W: Write + ?Sized,
 {
-    let payload = encode_host_request(request)?;
+    let payload = postcard_to_allocvec(request).map_err(SharedError::from)?;
     let command = command_for_request(request);
     write_framed_message(writer, command, &payload)
 }
@@ -824,7 +824,7 @@ where
     R: Read + ?Sized,
 {
     let (command, payload) = read_framed_message(reader)?;
-    let response = decode_device_response(&payload)?;
+    let response = postcard_from_bytes(&payload).map_err(SharedError::from)?;
     validate_response_command(command, &response)?;
     Ok(response)
 }
@@ -1053,7 +1053,8 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 mod tests {
     use super::*;
     use shared::schema::{
-        decode_host_request, encode_device_response, DeviceErrorCode, NackResponse,
+        decode_host_request, encode_device_response, encode_host_request, DeviceErrorCode,
+        NackResponse,
     };
     use std::fs;
     use std::io::Cursor;
