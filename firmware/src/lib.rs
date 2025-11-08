@@ -6,6 +6,8 @@ extern crate alloc;
 use alloc::{format, string::String, string::ToString, vec, vec::Vec};
 use core::{cmp, ops::Range};
 
+pub mod ui;
+
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
@@ -79,7 +81,6 @@ mod actions {
 #[cfg(any(test, target_arch = "xtensa"))]
 use actions::DeviceAction;
 
-#[cfg(target_arch = "xtensa")]
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{CdcCommand, FrameHeader, compute_crc32};
 use shared::schema::{
@@ -1190,7 +1191,18 @@ fn handle_pull(
         .unwrap_or(false);
 
     if host_in_sync && ctx.journal_ops.is_empty() && ctx.pending_sequence.is_none() {
-        let chunk = ctx.next_transfer_chunk(request.max_chunk_size as usize);
+        let chunk = ctx.next_transfer_chunk(
+            request.max_chunk_size as usize,
+            request.host_buffer_size as usize,
+        )?;
+        let encoded_len = encode_response(&DeviceResponse::VaultChunk(chunk.clone()))?.len();
+        let frame_size = encoded_len + FRAME_HEADER_SIZE;
+        if frame_size > request.host_buffer_size as usize {
+            return Err(ProtocolError::HostBufferTooSmall {
+                required: frame_size,
+                provided: request.host_buffer_size as usize,
+            });
+        }
         let checksum = chunk.checksum;
         let sequence = chunk.sequence;
         ctx.pending_sequence = Some((sequence, checksum));
@@ -1218,6 +1230,14 @@ fn handle_pull(
             request.max_chunk_size as usize,
             request.host_buffer_size as usize,
         )?;
+        let encoded_len = encode_response(&DeviceResponse::VaultChunk(chunk.clone()))?.len();
+        let frame_size = encoded_len + FRAME_HEADER_SIZE;
+        if frame_size > request.host_buffer_size as usize {
+            return Err(ProtocolError::HostBufferTooSmall {
+                required: frame_size,
+                provided: request.host_buffer_size as usize,
+            });
+        }
         let checksum = chunk.checksum;
         let sequence = chunk.sequence;
         ctx.pending_sequence = Some((sequence, checksum));
@@ -1352,6 +1372,8 @@ mod tasks {
 
     use esp_storage::FlashStorageError;
 
+    use crate::ui::transport;
+
     #[cfg(target_arch = "xtensa")]
     extern "C" {
         fn ets_printf(format: *const c_char, ...) -> i32;
@@ -1370,18 +1392,29 @@ mod tasks {
             log_boot_failure(error);
         }
 
+        transport::set_usb_connected(true);
         loop {
             match read_frame(&mut serial).await {
                 Ok((command, frame)) => {
+                    transport::set_usb_connected(true);
                     if let Some(error) = boot_error.take() {
                         let payload = boot_failure_payload(&error);
-                        let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                        if let Err(err) = write_frame(&mut serial, CdcCommand::Nack, &payload) {
+                            if matches!(err, ProtocolError::Transport) {
+                                transport::set_usb_connected(false);
+                            }
+                        }
                         continue;
                     }
 
                     match process_host_frame(command, &frame, &mut context) {
                         Ok((response_command, response)) => {
-                            let _ = write_frame(&mut serial, response_command, &response);
+                            if let Err(err) = write_frame(&mut serial, response_command, &response)
+                            {
+                                if matches!(err, ProtocolError::Transport) {
+                                    transport::set_usb_connected(false);
+                                }
+                            }
                         }
                         Err(err) => {
                             let payload =
@@ -1393,7 +1426,11 @@ mod tasks {
                                             .unwrap_or_default()
                                     }
                                 };
-                            let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                            if let Err(err) = write_frame(&mut serial, CdcCommand::Nack, &payload) {
+                                if matches!(err, ProtocolError::Transport) {
+                                    transport::set_usb_connected(false);
+                                }
+                            }
                         }
                     }
                 }
@@ -1405,7 +1442,14 @@ mod tasks {
                             encode_device_response(&DeviceResponse::Nack(fatal)).unwrap_or_default()
                         }
                     };
-                    let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                    if matches!(err, ProtocolError::Transport) {
+                        transport::set_usb_connected(false);
+                    }
+                    if let Err(err) = write_frame(&mut serial, CdcCommand::Nack, &payload) {
+                        if matches!(err, ProtocolError::Transport) {
+                            transport::set_usb_connected(false);
+                        }
+                    }
                 }
             }
         }
@@ -1506,13 +1550,17 @@ mod tasks {
     pub async fn ble_profile(mut receiver: crate::actions::ActionReceiver) {
         let _capabilities = IoCapabilities::KeyboardDisplay;
 
+        transport::set_ble_connected(false);
         loop {
             let action = receiver.receive().await;
             match action {
                 crate::actions::DeviceAction::StartSession { session_id } => {
                     let _ = session_id;
+                    transport::set_ble_connected(true);
                 }
-                crate::actions::DeviceAction::EndSession => {}
+                crate::actions::DeviceAction::EndSession => {
+                    transport::set_ble_connected(false);
+                }
             }
         }
     }
