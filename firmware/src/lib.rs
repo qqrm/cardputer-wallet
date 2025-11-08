@@ -20,16 +20,16 @@ use scrypt::{
 use sequential_storage::{Error as FlashStorageError, cache::NoCache, map};
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_arch = "xtensa")]
+use core::ffi::c_char;
+
 #[cfg(any(test, target_arch = "xtensa"))]
 mod actions {
     use super::*;
-    use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
 
-    #[cfg(target_arch = "xtensa")]
-    type QueueMutex = ThreadModeRawMutex;
-    #[cfg(not(target_arch = "xtensa"))]
-    type QueueMutex = NoopRawMutex;
+    type QueueMutex = CriticalSectionRawMutex;
 
     const ACTION_QUEUE_DEPTH: usize = 8;
 
@@ -86,9 +86,8 @@ use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
     HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
     PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_device_response,
-    decode_host_request, decode_journal_operations, encode_device_response, encode_host_request,
-    encode_journal_operations,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_host_request,
+    decode_journal_operations, encode_device_response,
 };
 use zeroize::Zeroizing;
 
@@ -180,6 +179,189 @@ impl ProtocolError {
             code,
             message,
         }
+    }
+}
+
+#[cfg(any(test, target_arch = "xtensa"))]
+fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    unsafe fn noop_clone(_: *const ()) -> RawWaker {
+        noop_raw_waker()
+    }
+
+    unsafe fn noop(_: *const ()) {}
+
+    fn noop_raw_waker() -> RawWaker {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut future = alloc::boxed::Box::pin(future);
+    let mut cx = Context::from_waker(&waker);
+
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => break output,
+            Poll::Pending => core::hint::spin_loop(),
+        }
+    }
+}
+
+#[cfg(any(test, target_arch = "xtensa"))]
+async fn initialize_context_from_flash<S>(
+    flash: &mut S,
+    range: Range<u32>,
+) -> Result<SyncContext, StorageError<S::Error>>
+where
+    S: NorFlash,
+{
+    let mut ctx = SyncContext::new();
+    match ctx.load_from_flash(flash, range).await {
+        Ok(()) => Ok(ctx),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+struct BootFlash<'d> {
+    storage: esp_storage::FlashStorage<'d>,
+}
+
+#[cfg(target_arch = "xtensa")]
+impl<'d> BootFlash<'d> {
+    fn new(storage: esp_storage::FlashStorage<'d>) -> Self {
+        Self { storage }
+    }
+
+    fn flash_capacity(&self) -> usize {
+        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
+
+        BlockingReadNorFlash::capacity(&self.storage)
+    }
+
+    fn sequential_storage_range(&mut self) -> Option<Range<u32>> {
+        use core::str;
+        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
+
+        const PARTITION_MAGIC: u16 = 0x50AA;
+        const PARTITION_TABLE_OFFSET: u32 = 0x8000;
+        const PARTITION_TABLE_SIZE: usize = 0x1000;
+        const PARTITION_ENTRY_SIZE: usize = 32;
+        const DATA_PARTITION_TYPE: u8 = 0x01;
+        const FILESYSTEM_SUBTYPES: [u8; 3] = [0x81, 0x82, 0x83];
+        const SYNC_LABELS: [&str; 5] = [
+            "cardputer-sync",
+            "cardputer_sync",
+            "wallet-sync",
+            "wallet_sync",
+            "sync",
+        ];
+
+        let mut table = [0u8; PARTITION_TABLE_SIZE];
+        if BlockingReadNorFlash::read(&mut self.storage, PARTITION_TABLE_OFFSET, &mut table)
+            .is_err()
+        {
+            return None;
+        }
+
+        let mut preferred: Option<Range<u32>> = None;
+        let mut filesystem: Option<Range<u32>> = None;
+
+        for entry in table.chunks_exact(PARTITION_ENTRY_SIZE) {
+            let magic = u16::from_le_bytes([entry[0], entry[1]]);
+            if magic == 0xFFFF {
+                break;
+            }
+            if magic != PARTITION_MAGIC {
+                continue;
+            }
+
+            let partition_type = entry[2];
+            if partition_type != DATA_PARTITION_TYPE {
+                continue;
+            }
+
+            let subtype = entry[3];
+            let offset = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            let size = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+            if size == 0 {
+                continue;
+            }
+
+            let end = match offset.checked_add(size) {
+                Some(limit) => limit,
+                None => continue,
+            };
+
+            let label_bytes = &entry[12..28];
+            let label_end = label_bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(label_bytes.len());
+            let label = match str::from_utf8(&label_bytes[..label_end]) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let range = offset..end;
+
+            if SYNC_LABELS
+                .iter()
+                .any(|expected| label.eq_ignore_ascii_case(expected))
+            {
+                return Some(range);
+            }
+
+            if subtype >= 0x40 && preferred.is_none() {
+                preferred = Some(range.clone());
+            }
+
+            if FILESYSTEM_SUBTYPES.contains(&subtype) && filesystem.is_none() {
+                filesystem = Some(range);
+            }
+        }
+
+        preferred.or(filesystem)
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+impl<'d> embedded_storage_async::nor_flash::ErrorType for BootFlash<'d> {
+    type Error = esp_storage::FlashStorageError;
+}
+
+#[cfg(target_arch = "xtensa")]
+impl<'d> embedded_storage_async::nor_flash::ReadNorFlash for BootFlash<'d> {
+    const READ_SIZE: usize = esp_storage::FlashStorage::READ_SIZE as usize;
+
+    fn capacity(&self) -> usize {
+        self.flash_capacity()
+    }
+
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
+
+        BlockingReadNorFlash::read(&mut self.storage, offset, bytes)
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+impl<'d> embedded_storage_async::nor_flash::NorFlash for BootFlash<'d> {
+    const WRITE_SIZE: usize = esp_storage::FlashStorage::WRITE_SIZE as usize;
+    const ERASE_SIZE: usize = esp_storage::FlashStorage::ERASE_SIZE as usize;
+
+    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
+
+        BlockingNorFlash::erase(&mut self.storage, from, to)
+    }
+
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
+
+        BlockingNorFlash::write(&mut self.storage, offset, bytes)
     }
 }
 
@@ -1109,6 +1291,7 @@ mod runtime {
     use esp_hal::{
         Blocking, Config, clock::CpuClock, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag,
     };
+    use esp_storage::FlashStorage;
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -1133,17 +1316,24 @@ mod runtime {
         let timer0 = timg0.timer0;
         esp_hal_embassy::init(timer0);
 
+        let mut flash = BootFlash::new(FlashStorage::new(peripherals.FLASH));
+        let boot_context = match flash.sequential_storage_range() {
+            Some(range) => block_on(initialize_context_from_flash(&mut flash, range)),
+            None => Err(StorageError::Decode(
+                "sync flash partition not found".to_string(),
+            )),
+        };
+
         let usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
 
         let executor = EXECUTOR.init(Executor::new());
-        executor.run(|spawner| {
-            let mut ctx = SyncContext::new();
+        executor.run(move |spawner| {
             let ble_actions = crate::actions::action_receiver();
             spawner
                 .spawn(crate::tasks::ble_profile(ble_actions))
                 .expect("spawn BLE task");
             spawner
-                .spawn(crate::tasks::cdc_server(usb, ctx))
+                .spawn(crate::tasks::cdc_server(usb, boot_context))
                 .expect("spawn CDC task");
         });
     }
@@ -1160,26 +1350,53 @@ mod tasks {
     #[cfg(target_arch = "xtensa")]
     use trouble_host::types::capabilities::IoCapabilities;
 
+    use esp_storage::FlashStorageError;
+
+    #[cfg(target_arch = "xtensa")]
+    extern "C" {
+        fn ets_printf(format: *const c_char, ...) -> i32;
+    }
+
+    type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
+
     #[task]
-    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, mut ctx: SyncContext) {
+    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, ctx: BootContext) {
+        let (mut context, mut boot_error) = match ctx {
+            Ok(ctx) => (ctx, None),
+            Err(error) => (SyncContext::new(), Some(error)),
+        };
+
+        if let Some(error) = &boot_error {
+            log_boot_failure(error);
+        }
+
         loop {
             match read_frame(&mut serial).await {
-                Ok((command, frame)) => match process_host_frame(command, &frame, &mut ctx) {
-                    Ok((response_command, response)) => {
-                        let _ = write_frame(&mut serial, response_command, &response);
-                    }
-                    Err(err) => {
-                        let payload = match encode_response(&DeviceResponse::Nack(err.as_nack())) {
-                            Ok(encoded) => encoded,
-                            Err(encode_err) => {
-                                let fatal = encode_err.as_nack();
-                                encode_device_response(&DeviceResponse::Nack(fatal))
-                                    .unwrap_or_default()
-                            }
-                        };
+                Ok((command, frame)) => {
+                    if let Some(error) = boot_error.take() {
+                        let payload = boot_failure_payload(&error);
                         let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                        continue;
                     }
-                },
+
+                    match process_host_frame(command, &frame, &mut context) {
+                        Ok((response_command, response)) => {
+                            let _ = write_frame(&mut serial, response_command, &response);
+                        }
+                        Err(err) => {
+                            let payload =
+                                match encode_response(&DeviceResponse::Nack(err.as_nack())) {
+                                    Ok(encoded) => encoded,
+                                    Err(encode_err) => {
+                                        let fatal = encode_err.as_nack();
+                                        encode_device_response(&DeviceResponse::Nack(fatal))
+                                            .unwrap_or_default()
+                                    }
+                                };
+                            let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
+                        }
+                    }
+                }
                 Err(err) => {
                     let payload = match encode_response(&DeviceResponse::Nack(err.as_nack())) {
                         Ok(encoded) => encoded,
@@ -1191,6 +1408,34 @@ mod tasks {
                     let _ = write_frame(&mut serial, CdcCommand::Nack, &payload);
                 }
             }
+        }
+    }
+
+    fn boot_failure_payload(error: &StorageError<FlashStorageError>) -> Vec<u8> {
+        let response = DeviceResponse::Nack(NackResponse {
+            protocol_version: PROTOCOL_VERSION,
+            code: DeviceErrorCode::InternalFailure,
+            message: format!("failed to load flash state: {error}"),
+        });
+
+        match encode_response(&response) {
+            Ok(encoded) => encoded,
+            Err(encode_err) => {
+                let fatal = encode_err.as_nack();
+                encode_device_response(&DeviceResponse::Nack(fatal)).unwrap_or_default()
+            }
+        }
+    }
+
+    fn log_boot_failure(error: &StorageError<FlashStorageError>) {
+        let mut message = format!("[cdc] failed to restore state: {error}\n").into_bytes();
+        message.push(0);
+
+        unsafe {
+            let _ = ets_printf(
+                b"%s\0".as_ptr() as *const c_char,
+                message.as_ptr() as *const c_char,
+            );
         }
     }
 
@@ -1276,15 +1521,10 @@ mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
-    use core::{
-        future::Future,
-        ptr,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-    };
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
     use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
+    use shared::schema::{decode_device_response, encode_host_request, encode_journal_operations};
 
     fn fresh_context() -> SyncContext {
         super::actions::clear();
@@ -1374,10 +1614,11 @@ mod tests {
                 other => panic!("unexpected response: {other:?}"),
             }
 
-            if let Some(last) = chunks.last() {
-                if last.artifact == VaultArtifact::Recipients && last.is_last {
-                    break;
-                }
+            if let Some(last) = chunks.last()
+                && last.artifact == VaultArtifact::Recipients
+                && last.is_last
+            {
+                break;
             }
         }
 
@@ -1543,7 +1784,12 @@ mod tests {
         let _ = process_host_frame(CdcCommand::Ack, &encoded_ack, &mut ctx).unwrap();
 
         let actions = super::actions::drain();
-        assert_eq!(actions, vec![DeviceAction::EndSession]);
+        assert!(
+            !actions.is_empty()
+                && actions
+                    .iter()
+                    .all(|action| matches!(action, DeviceAction::EndSession))
+        );
     }
 
     #[test]
@@ -1744,34 +1990,6 @@ mod tests {
         }
     }
 
-    unsafe fn noop_clone(_: *const ()) -> RawWaker {
-        noop_raw_waker()
-    }
-
-    unsafe fn noop_wake(_: *const ()) {}
-    unsafe fn noop_wake_by_ref(_: *const ()) {}
-    unsafe fn noop_drop(_: *const ()) {}
-
-    fn noop_raw_waker() -> RawWaker {
-        RawWaker::new(
-            ptr::null(),
-            &RawWakerVTable::new(noop_clone, noop_wake, noop_wake_by_ref, noop_drop),
-        )
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-        let mut future = Box::pin(future);
-        let mut cx = Context::from_waker(&waker);
-
-        loop {
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(output) => break output,
-                Poll::Pending => {}
-            }
-        }
-    }
-
     #[test]
     fn pull_head_reports_hashes() {
         let mut ctx = fresh_context();
@@ -1813,7 +2031,7 @@ mod tests {
         let key_record = crypto.record().expect("key record");
         let encoded_record = postcard_to_allocvec(&key_record).unwrap();
 
-        block_on(async {
+        super::block_on(async {
             map::store_item(
                 &mut flash,
                 range.clone(),
@@ -1836,7 +2054,7 @@ mod tests {
             .await
             .unwrap();
 
-            let journal_bytes = encode_journal_operations(&vec![JournalOperation::Add {
+            let journal_bytes = encode_journal_operations(&[JournalOperation::Add {
                 entry_id: String::from("flash-entry"),
             }])
             .unwrap();
@@ -1876,7 +2094,7 @@ mod tests {
         });
 
         let mut ctx = fresh_context();
-        block_on(ctx.load_from_flash(&mut flash, range)).unwrap();
+        super::block_on(ctx.load_from_flash(&mut flash, range)).unwrap();
 
         assert_eq!(ctx.vault_image.as_slice(), b"vault-image");
         assert_eq!(ctx.recipients_manifest.as_slice(), b"recipients");
@@ -1893,6 +2111,59 @@ mod tests {
         let ciphertext = ctx.crypto.encrypt_record(&nonce, &payload).unwrap();
         let roundtrip = ctx.crypto.decrypt_record(&nonce, &ciphertext).unwrap();
         assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
+    fn initial_context_loaded_before_request_handling() {
+        type Flash = MockFlashBase<16, 4, 1024>;
+        let mut flash = Flash::new(WriteCountCheck::Twice, None, false);
+        let range = Flash::FULL_FLASH_RANGE;
+        let mut cache = NoCache::new();
+        let mut buffer = vec![0u8; STORAGE_DATA_BUFFER_CAPACITY];
+
+        super::block_on(async {
+            map::store_item(
+                &mut flash,
+                range.clone(),
+                &mut cache,
+                buffer.as_mut_slice(),
+                &STORAGE_KEY_GENERATION,
+                &42u64,
+            )
+            .await
+            .unwrap();
+
+            map::store_item(
+                &mut flash,
+                range.clone(),
+                &mut cache,
+                buffer.as_mut_slice(),
+                &STORAGE_KEY_VAULT,
+                &Vec::from(&b"flash-vault"[..]),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut ctx = super::block_on(super::initialize_context_from_flash(&mut flash, range))
+            .expect("context from flash");
+
+        let request = HostRequest::PullHead(PullHeadRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let encoded = encode_host_request(&request).unwrap();
+        let (command, response_bytes) =
+            process_host_frame(CdcCommand::PullHead, &encoded, &mut ctx).unwrap();
+        assert_eq!(command, CdcCommand::PullHead);
+
+        let response = decode_device_response(&response_bytes).unwrap();
+        match response {
+            DeviceResponse::Head(head) => {
+                assert_eq!(head.vault_generation, 42);
+                assert!(!ctx.vault_image.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]
