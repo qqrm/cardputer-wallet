@@ -1,0 +1,156 @@
+use alloc::{string::String, vec::Vec};
+use core::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+/// Journal page version marker.
+pub const JOURNAL_PAGE_VERSION: u16 = 1;
+
+/// Additional authenticated data for journal page envelopes.
+pub const JOURNAL_AAD: &[u8] = b"cardputer.vault.journal.v1";
+
+/// Metadata describing the decrypted vault payload shipped over sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultMetadata {
+    pub generation: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Supported hashing algorithm for TOTP codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TotpAlgorithm {
+    #[serde(rename = "sha1")]
+    Sha1,
+    #[serde(rename = "sha256")]
+    Sha256,
+    #[serde(rename = "sha512")]
+    Sha512,
+}
+
+/// Wrapper around sensitive strings that zeroize their memory on drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretString(pub Zeroizing<String>);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_owned())
+    }
+}
+
+impl Deref for SecretString {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SecretString {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::new(value))
+    }
+}
+
+/// Time based OTP configuration associated with an entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotpConfig {
+    pub secret: SecretString,
+    pub algorithm: TotpAlgorithm,
+    pub digits: u8,
+    pub period: u16,
+}
+
+/// Password vault entry aligned with SPEC §6 fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultEntry {
+    pub id: Uuid,
+    pub title: String,
+    pub service: String,
+    pub domains: Vec<String>,
+    pub username: String,
+    pub password: SecretString,
+    pub totp: Option<TotpConfig>,
+    pub tags: Vec<String>,
+    pub r#macro: Option<String>,
+    pub updated_at: String,
+    pub used_at: Option<String>,
+}
+
+/// Field level updates as required by SPEC §7 for journal operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EntryUpdate {
+    pub title: Option<String>,
+    pub service: Option<String>,
+    pub domains: Option<Vec<String>>,
+    pub username: Option<String>,
+    pub password: Option<SecretString>,
+    pub totp: Option<TotpConfig>,
+    pub tags: Option<Vec<String>>,
+    pub r#macro: Option<String>,
+    pub updated_at: Option<String>,
+    pub used_at: Option<Option<String>>,
+}
+
+/// Journal operations captured in the sequential log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalOperation {
+    Add { entry: VaultEntry },
+    Update { id: Uuid, changes: EntryUpdate },
+    Delete { id: Uuid },
+}
+
+/// Timestamped operation stored on a journal page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalRecord {
+    pub operation: JournalOperation,
+    pub timestamp: String,
+}
+
+/// Plaintext journal page that gets encrypted before hitting flash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPage {
+    pub version: u16,
+    pub counter: u64,
+    pub records: Vec<JournalRecord>,
+}
+
+/// Ciphertext payload stored in sequential-storage pages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedJournalPage {
+    pub counter: u64,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
