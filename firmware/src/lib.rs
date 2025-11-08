@@ -7,17 +7,17 @@ use alloc::{format, string::String, string::ToString, vec, vec::Vec};
 use core::{cmp, ops::Range};
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit},
 };
 use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use rand_core::{CryptoRng, RngCore};
 use scrypt::{
-    errors::{InvalidOutputLen, InvalidParams},
     Params as ScryptParams,
+    errors::{InvalidOutputLen, InvalidParams},
 };
-use sequential_storage::{cache::NoCache, map, Error as FlashStorageError};
+use sequential_storage::{Error as FlashStorageError, cache::NoCache, map};
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -81,14 +81,14 @@ use actions::DeviceAction;
 
 #[cfg(target_arch = "xtensa")]
 use shared::cdc::FRAME_HEADER_SIZE;
-use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
+use shared::cdc::{CdcCommand, FrameHeader, compute_crc32};
 use shared::schema::{
-    decode_device_response, decode_host_request, decode_journal_operations, encode_device_response,
-    encode_host_request, encode_journal_operations, AckRequest, AckResponse, DeviceErrorCode,
-    DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse, HostRequest, JournalFrame,
-    JournalOperation, NackResponse, PullHeadRequest, PullHeadResponse, PullVaultRequest,
-    PushOperationsFrame, SetTimeRequest, StatusRequest, StatusResponse, TimeResponse,
-    VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
+    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_device_response,
+    decode_host_request, decode_journal_operations, encode_device_response, encode_host_request,
+    encode_journal_operations,
 };
 use zeroize::Zeroizing;
 
@@ -1062,7 +1062,7 @@ mod runtime {
     use embassy_executor::Executor;
     use esp_alloc::EspHeap;
     use esp_hal::{
-        clock::CpuClock, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag, Blocking, Config,
+        Blocking, Config, clock::CpuClock, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag,
     };
     use static_cell::StaticCell;
 
@@ -1109,7 +1109,7 @@ mod tasks {
     use super::*;
     use embassy_executor::task;
     use embassy_time::{Duration, Timer};
-    use esp_hal::{usb_serial_jtag::UsbSerialJtag, Blocking};
+    use esp_hal::{Blocking, usb_serial_jtag::UsbSerialJtag};
     use nb::Error as NbError;
 
     #[cfg(target_arch = "xtensa")]
@@ -1305,12 +1305,16 @@ mod tests {
             }
         }
 
-        assert!(chunks
-            .iter()
-            .any(|chunk| chunk.artifact == VaultArtifact::Vault));
-        assert!(chunks
-            .iter()
-            .any(|chunk| chunk.artifact == VaultArtifact::Vault && chunk.is_last));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.artifact == VaultArtifact::Vault)
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.artifact == VaultArtifact::Vault && chunk.is_last)
+        );
         let last = chunks.last().expect("at least one chunk");
         assert_eq!(last.artifact, VaultArtifact::Recipients);
         assert!(last.is_last);
