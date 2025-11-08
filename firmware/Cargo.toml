@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 shared = { path = "../shared", default-features = false }
-zeroize = { version = "1.7", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.7", default-features = false, features = ["alloc", "zeroize_derive"] }
 sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 embedded-storage-async = { version = "0.4", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
@@ -15,6 +15,7 @@ scrypt = { version = "0.12.0-rc.2", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 embassy-sync = { version = "0.7.2", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["alloc", "static_secrets", "zeroize"] }
 
 [dev-dependencies]
 rand_chacha = { version = "0.3", default-features = false, features = ["std"] }

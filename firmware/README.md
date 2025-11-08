@@ -7,7 +7,10 @@ This crate contains the embedded firmware for the Cardputer wallet prototype tar
 - Initializes the ESP32-S3 clock tree, watchdogs, and USB Serial/JTAG peripheral.
 - Boots the [Embassy](https://embassy.dev/) executor to manage asynchronous tasks.
 - Implements a USB CDC control loop that exchanges CBOR-encoded frames with the host.
-- Provides journalling buffers for vault operations and placeholder cryptographic material that is securely wiped between sessions.
+- Provides journalling buffers for vault operations and zeroizes sensitive state between sessions.
+- Derives a key-encryption key with scrypt (`N = 16384`, `r = 8`, `p = 1`) to wrap the vault symmetric key and device X25519 keypair.
+- Encrypts vault records with ChaCha20-Poly1305 using fresh nonces per record.
+- Tracks PIN failures with exponential backoff and escalates to a device wipe trigger after too many attempts.
 
 ## Building
 
