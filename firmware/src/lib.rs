@@ -21,6 +21,65 @@ use sequential_storage::{cache::NoCache, map, Error as FlashStorageError};
 use serde::{Deserialize, Serialize};
 use serde_cbor::de::from_slice as cbor_from_slice;
 
+#[cfg(any(test, target_arch = "xtensa"))]
+mod actions {
+    use super::*;
+    use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
+    use embassy_sync::channel::{Channel, Receiver, Sender};
+
+    #[cfg(target_arch = "xtensa")]
+    type QueueMutex = ThreadModeRawMutex;
+    #[cfg(not(target_arch = "xtensa"))]
+    type QueueMutex = NoopRawMutex;
+
+    const ACTION_QUEUE_DEPTH: usize = 8;
+
+    static ACTION_CHANNEL: Channel<QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH> = Channel::new();
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DeviceAction {
+        StartSession { session_id: u32 },
+        EndSession,
+    }
+
+    pub type ActionSender = Sender<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
+    pub type ActionReceiver = Receiver<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
+
+    pub fn action_sender() -> ActionSender {
+        ACTION_CHANNEL.sender()
+    }
+
+    pub fn action_receiver() -> ActionReceiver {
+        ACTION_CHANNEL.receiver()
+    }
+
+    pub fn publish(action: DeviceAction) {
+        let sender = action_sender();
+        let _ = sender.try_send(action);
+    }
+
+    #[cfg(test)]
+    pub fn clear() {
+        action_sender().clear();
+        // Drain any pending receivers to ensure deterministic tests.
+        let receiver = action_receiver();
+        while receiver.try_receive().is_ok() {}
+    }
+
+    #[cfg(test)]
+    pub fn drain() -> Vec<DeviceAction> {
+        let receiver = action_receiver();
+        let mut collected = Vec::new();
+        while let Ok(action) = receiver.try_receive() {
+            collected.push(action);
+        }
+        collected
+    }
+}
+
+#[cfg(any(test, target_arch = "xtensa"))]
+use actions::DeviceAction;
+
 #[cfg(target_arch = "xtensa")]
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader};
@@ -847,6 +906,11 @@ fn handle_hello(
     ctx.next_sequence = 1;
     ctx.reset_transfer_state();
 
+    #[cfg(any(test, target_arch = "xtensa"))]
+    crate::actions::publish(DeviceAction::StartSession {
+        session_id: ctx.session_id,
+    });
+
     Ok(DeviceResponse::Hello(HelloResponse {
         protocol_version: PROTOCOL_VERSION,
         device_name: ctx.device_name.clone(),
@@ -994,6 +1058,10 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
         {
             ctx.pending_sequence = None;
             ctx.wipe_sensitive();
+
+            #[cfg(any(test, target_arch = "xtensa"))]
+            crate::actions::publish(DeviceAction::EndSession);
+
             Ok(DeviceResponse::Ack(AckResponse {
                 protocol_version: PROTOCOL_VERSION,
                 message: format!(
@@ -1042,6 +1110,10 @@ mod runtime {
         let executor = EXECUTOR.init(Executor::new());
         executor.run(|spawner| {
             let mut ctx = SyncContext::new();
+            let ble_actions = crate::actions::action_receiver();
+            spawner
+                .spawn(crate::tasks::ble_profile(ble_actions))
+                .expect("spawn BLE task");
             spawner
                 .spawn(crate::tasks::cdc_server(usb, ctx))
                 .expect("spawn CDC task");
@@ -1056,6 +1128,9 @@ mod tasks {
     use embassy_time::{Duration, Timer};
     use esp_hal::{usb_serial_jtag::UsbSerialJtag, Blocking};
     use nb::Error as NbError;
+
+    #[cfg(target_arch = "xtensa")]
+    use trouble_host::types::capabilities::IoCapabilities;
 
     #[task]
     pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, mut ctx: SyncContext) {
@@ -1153,6 +1228,21 @@ mod tasks {
         }
         serial.flush_tx().map_err(|_| ProtocolError::Transport)
     }
+
+    #[task]
+    pub async fn ble_profile(mut receiver: crate::actions::ActionReceiver) {
+        let _capabilities = IoCapabilities::KeyboardDisplay;
+
+        loop {
+            let action = receiver.receive().await;
+            match action {
+                crate::actions::DeviceAction::StartSession { session_id } => {
+                    let _ = session_id;
+                }
+                crate::actions::DeviceAction::EndSession => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1168,9 +1258,14 @@ mod tests {
     use rand_core::SeedableRng;
     use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
 
+    fn fresh_context() -> SyncContext {
+        super::actions::clear();
+        SyncContext::new()
+    }
+
     #[test]
     fn pull_request_emits_journal_frame() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.record_operation(JournalOperation::Add {
             entry_id: String::from("entry-42"),
         });
@@ -1200,7 +1295,7 @@ mod tests {
 
     #[test]
     fn pull_request_streams_vault_then_recipients() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.vault_image.extend_from_slice(b"vault-data");
         ctx.recipients_manifest.extend_from_slice(b"rec");
         ctx.reset_transfer_state();
@@ -1241,7 +1336,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_clears_pending_sequence() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.record_operation(JournalOperation::Delete {
             entry_id: String::from("obsolete"),
         });
@@ -1283,8 +1378,64 @@ mod tests {
     }
 
     #[test]
+    fn hello_enqueues_ble_session_action() {
+        let mut ctx = fresh_context();
+        let request = HostRequest::Hello(HelloRequest {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: "cli".into(),
+            client_version: "0.1.0".into(),
+        });
+
+        let encoded = encode_host_request(&request).unwrap();
+        let _ = process_host_frame(CdcCommand::Hello, &encoded, &mut ctx).unwrap();
+
+        let actions = super::actions::drain();
+        assert_eq!(
+            actions,
+            vec![DeviceAction::StartSession {
+                session_id: ctx.session_id,
+            }]
+        );
+    }
+
+    #[test]
+    fn ack_enqueues_session_end_action() {
+        let mut ctx = fresh_context();
+        ctx.record_operation(JournalOperation::Add {
+            entry_id: String::from("to-sync"),
+        });
+
+        let pull = HostRequest::PullVault(PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 64 * 1024,
+            max_chunk_size: 1024,
+            known_generation: None,
+        });
+        let encoded_pull = encode_host_request(&pull).unwrap();
+        let (_, response_bytes) =
+            process_host_frame(CdcCommand::PullVault, &encoded_pull, &mut ctx).unwrap();
+        let (sequence, checksum) = match decode_device_response(&response_bytes).unwrap() {
+            DeviceResponse::JournalFrame(frame) => (frame.sequence, frame.checksum),
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        super::actions::drain();
+
+        let ack = HostRequest::Ack(AckRequest {
+            protocol_version: PROTOCOL_VERSION,
+            last_frame_sequence: sequence,
+            journal_checksum: checksum,
+        });
+        let encoded_ack = encode_host_request(&ack).unwrap();
+        let _ = process_host_frame(CdcCommand::Ack, &encoded_ack, &mut ctx).unwrap();
+
+        let actions = super::actions::drain();
+        assert_eq!(actions, vec![DeviceAction::EndSession]);
+    }
+
+    #[test]
     fn acknowledgement_keeps_vault_generation() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.vault_generation = 7;
         let expected_generation = ctx.vault_generation;
         let pending = (12, 0xABCD_1234);
@@ -1312,7 +1463,7 @@ mod tests {
 
     #[test]
     fn push_operations_are_acknowledged() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let operations = vec![JournalOperation::Add {
             entry_id: String::from("pushed"),
         }];
@@ -1343,7 +1494,7 @@ mod tests {
 
     #[test]
     fn unsupported_protocol_is_rejected() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let request = HostRequest::PullVault(PullVaultRequest {
             protocol_version: PROTOCOL_VERSION + 1,
             host_buffer_size: 1,
@@ -1358,7 +1509,7 @@ mod tests {
 
     #[test]
     fn mismatched_command_is_rejected() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let request = HostRequest::PullVault(PullVaultRequest {
             protocol_version: PROTOCOL_VERSION,
             host_buffer_size: 1,
@@ -1373,6 +1524,7 @@ mod tests {
 
     #[test]
     fn checksum_validation_detects_corruption() {
+        super::actions::clear();
         let payload = b"payload".to_vec();
         let mut header = FrameHeader::new(
             PROTOCOL_VERSION,
@@ -1391,7 +1543,7 @@ mod tests {
 
     #[test]
     fn hello_establishes_session() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let request = HostRequest::Hello(HelloRequest {
             protocol_version: PROTOCOL_VERSION,
             client_name: "cli".into(),
@@ -1416,7 +1568,7 @@ mod tests {
 
     #[test]
     fn status_reflects_context_state() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.vault_image.extend_from_slice(b"demo-vault");
         ctx.recipients_manifest.extend_from_slice(b"recipients");
         ctx.record_operation(JournalOperation::Add {
@@ -1446,7 +1598,7 @@ mod tests {
 
     #[test]
     fn set_time_updates_clock_and_get_time_reports_it() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let set_request = HostRequest::SetTime(SetTimeRequest {
             protocol_version: PROTOCOL_VERSION,
             epoch_millis: 9_876,
@@ -1509,7 +1661,7 @@ mod tests {
 
     #[test]
     fn pull_head_reports_hashes() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.vault_image.extend_from_slice(b"encrypted");
         ctx.recipients_manifest
             .extend_from_slice(b"{\"recipients\":[\"device\"]}");
@@ -1610,7 +1762,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         block_on(ctx.load_from_flash(&mut flash, range)).unwrap();
 
         assert_eq!(ctx.vault_image.as_slice(), b"vault-image");
@@ -1668,7 +1820,7 @@ mod tests {
 
     #[test]
     fn wrap_new_keys_and_wipe_clears_sensitive_state() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         ctx.vault_image.extend_from_slice(b"data");
         ctx.recipients_manifest.extend_from_slice(b"recips");
 
@@ -1689,7 +1841,7 @@ mod tests {
 
     #[test]
     fn unlock_with_wrong_pin_is_rejected() {
-        let mut ctx = SyncContext::new();
+        let mut ctx = fresh_context();
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
         ctx.crypto.wrap_new_keys(b"123456", &mut rng).unwrap();
         ctx.crypto.wipe();
