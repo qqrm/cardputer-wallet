@@ -127,6 +127,8 @@ pub enum ProtocolError {
     ChecksumMismatch,
     /// Host acknowledged a journal frame with mismatching metadata.
     InvalidAcknowledgement,
+    /// Host advertised a receive buffer that cannot fit even the smallest response chunk.
+    HostBufferTooSmall { required: usize, provided: usize },
 }
 
 #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
@@ -164,6 +166,12 @@ impl ProtocolError {
             ProtocolError::InvalidAcknowledgement => (
                 DeviceErrorCode::ChecksumMismatch,
                 "received acknowledgement that does not match the last frame".into(),
+            ),
+            ProtocolError::HostBufferTooSmall { required, provided } => (
+                DeviceErrorCode::ResourceExhausted,
+                format!(
+                    "host receive buffer {provided} bytes cannot fit the smallest chunk (needs {required})"
+                ),
             ),
         };
 
@@ -689,7 +697,11 @@ impl SyncContext {
         };
     }
 
-    fn next_transfer_chunk(&mut self, max_chunk: usize) -> VaultChunk {
+    fn next_transfer_chunk(
+        &mut self,
+        max_chunk: usize,
+        host_buffer_size: usize,
+    ) -> Result<VaultChunk, ProtocolError> {
         let artifact = match self.transfer_stage {
             TransferStage::Vault => VaultArtifact::Vault,
             TransferStage::Recipients => VaultArtifact::Recipients,
@@ -705,7 +717,8 @@ impl SyncContext {
         };
 
         let available = buffer.len().saturating_sub(*offset);
-        let max_payload = cmp::min(max_chunk, FRAME_MAX_SIZE);
+        let frame_budget = cmp::min(host_buffer_size, FRAME_MAX_SIZE);
+        let max_payload = cmp::min(max_chunk, frame_budget);
         let mut chunk_size = cmp::min(max_payload, available);
         let device_chunk_size = cmp::max(1, max_payload) as u32;
 
@@ -735,10 +748,10 @@ impl SyncContext {
             let encoded_len =
                 match encode_device_response(&DeviceResponse::VaultChunk(chunk.clone())) {
                     Ok(bytes) => bytes.len(),
-                    Err(_) => return chunk,
+                    Err(_) => return Ok(chunk),
                 };
 
-            if encoded_len <= FRAME_MAX_SIZE {
+            if encoded_len <= frame_budget {
                 *offset = slice_end;
                 self.last_artifact = artifact;
 
@@ -763,20 +776,27 @@ impl SyncContext {
                     };
                 }
 
-                return chunk;
+                return Ok(chunk);
             }
 
             if chunk_size == 0 {
-                return chunk;
+                if available > 0 || frame_budget < encoded_len {
+                    return Err(ProtocolError::HostBufferTooSmall {
+                        required: encoded_len,
+                        provided: host_buffer_size,
+                    });
+                }
+
+                return Ok(chunk);
             }
 
             let overhead = encoded_len.saturating_sub(chunk.data.len());
-            if overhead >= FRAME_MAX_SIZE {
+            if overhead >= frame_budget {
                 chunk_size = 0;
                 continue;
             }
 
-            let target_size = FRAME_MAX_SIZE - overhead;
+            let target_size = frame_budget - overhead;
             let max_allowed = cmp::min(max_payload, available);
             let new_size = cmp::min(target_size, max_allowed);
 
@@ -990,7 +1010,10 @@ fn handle_pull(
             checksum,
         }))
     } else {
-        let chunk = ctx.next_transfer_chunk(request.max_chunk_size as usize);
+        let chunk = ctx.next_transfer_chunk(
+            request.max_chunk_size as usize,
+            request.host_buffer_size as usize,
+        )?;
         let checksum = chunk.checksum;
         let sequence = chunk.sequence;
         ctx.pending_sequence = Some((sequence, checksum));
@@ -1319,6 +1342,55 @@ mod tests {
         assert_eq!(last.artifact, VaultArtifact::Recipients);
         assert!(last.is_last);
         assert_eq!(last.data, b"rec");
+    }
+
+    #[test]
+    fn pull_request_respects_host_buffer_limit() {
+        let mut ctx = fresh_context();
+        ctx.vault_image.extend_from_slice(&[0xAA; 64]);
+        ctx.reset_transfer_state();
+
+        let request = PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 96,
+            max_chunk_size: 256,
+            known_generation: None,
+        };
+
+        let response = handle_pull(&request, &mut ctx).expect("pull chunk");
+        let chunk = match response {
+            DeviceResponse::VaultChunk(chunk) => chunk,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        assert!(chunk.data.len() as u32 <= request.max_chunk_size);
+
+        let encoded =
+            encode_device_response(&DeviceResponse::VaultChunk(chunk.clone())).expect("encode");
+        assert!(encoded.len() as u32 <= request.host_buffer_size);
+    }
+
+    #[test]
+    fn pull_request_rejects_tiny_host_buffer() {
+        let mut ctx = fresh_context();
+        ctx.vault_image.extend_from_slice(b"payload");
+        ctx.reset_transfer_state();
+
+        let request = PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 24,
+            max_chunk_size: 1024,
+            known_generation: None,
+        };
+
+        let error = handle_pull(&request, &mut ctx).expect_err("expected buffer error");
+        assert!(matches!(
+            error,
+            ProtocolError::HostBufferTooSmall {
+                required: _,
+                provided: 24
+            }
+        ));
     }
 
     #[test]
