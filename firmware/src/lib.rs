@@ -1002,6 +1002,21 @@ fn handle_pull(
         return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
     }
 
+    let host_in_sync = request
+        .known_generation
+        .map(|generation| generation == ctx.vault_generation)
+        .unwrap_or(false);
+
+    if host_in_sync && ctx.journal_ops.is_empty() && ctx.pending_sequence.is_none() {
+        let chunk = ctx.next_transfer_chunk(request.max_chunk_size as usize);
+        let checksum = chunk.checksum;
+        let sequence = chunk.sequence;
+        ctx.pending_sequence = Some((sequence, checksum));
+        ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
+
+        return Ok(DeviceResponse::VaultChunk(chunk));
+    }
+
     if !ctx.journal_ops.is_empty() {
         let operations = core::mem::take(&mut ctx.journal_ops);
         let checksum = ctx.compute_journal_checksum(&operations);
@@ -1277,6 +1292,36 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_with_matching_generation_returns_placeholder_chunk() {
+        let mut ctx = fresh_context();
+        ctx.vault_generation = 7;
+
+        let request = PullVaultRequest {
+            protocol_version: PROTOCOL_VERSION,
+            host_buffer_size: 64 * 1024,
+            max_chunk_size: 1024,
+            known_generation: Some(7),
+        };
+
+        let response = handle_pull(&request, &mut ctx).expect("pull chunk");
+        match response {
+            DeviceResponse::VaultChunk(chunk) => {
+                assert_eq!(chunk.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(chunk.sequence, 1);
+                assert!(chunk.data.is_empty());
+                assert_eq!(chunk.total_size, 0);
+                assert_eq!(chunk.remaining_bytes, 0);
+                assert!(chunk.is_last);
+                assert_eq!(ctx.pending_sequence, Some((chunk.sequence, chunk.checksum)));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        assert!(ctx.journal_ops.is_empty());
+        assert_eq!(ctx.next_sequence, 2);
+    }
+
+    #[test]
     fn pull_request_emits_journal_frame() {
         let mut ctx = fresh_context();
         ctx.record_operation(JournalOperation::Add {
@@ -1301,6 +1346,7 @@ mod tests {
                 assert_eq!(frame.protocol_version, PROTOCOL_VERSION);
                 assert_eq!(frame.sequence, 1);
                 assert_eq!(frame.operations.len(), 1);
+                assert_eq!(ctx.pending_sequence, Some((frame.sequence, frame.checksum)));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1349,6 +1395,7 @@ mod tests {
         assert_eq!(last.artifact, VaultArtifact::Recipients);
         assert!(last.is_last);
         assert_eq!(last.data, b"rec");
+        assert_eq!(ctx.pending_sequence, Some((last.sequence, last.checksum)));
     }
 
     #[test]
