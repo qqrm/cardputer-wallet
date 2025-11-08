@@ -19,7 +19,6 @@ use scrypt::{
 };
 use sequential_storage::{cache::NoCache, map, Error as FlashStorageError};
 use serde::{Deserialize, Serialize};
-use serde_cbor::de::from_slice as cbor_from_slice;
 
 #[cfg(any(test, target_arch = "xtensa"))]
 mod actions {
@@ -93,7 +92,7 @@ use shared::schema::{
 };
 use zeroize::Zeroizing;
 
-/// Maximum payload size (in bytes) that a single CBOR frame is allowed to occupy on the wire.
+/// Maximum payload size (in bytes) that a single postcard frame is allowed to occupy on the wire.
 pub const FRAME_MAX_SIZE: usize = 4096;
 
 /// Capacity provisioned for the encrypted vault image buffer.
@@ -116,9 +115,9 @@ pub enum ProtocolError {
     FrameTooLarge(usize),
     /// Transport layer could not deliver or send a frame.
     Transport,
-    /// Incoming CBOR payload could not be decoded.
+    /// Incoming postcard payload could not be decoded.
     Decode(String),
-    /// Outgoing CBOR payload could not be encoded.
+    /// Outgoing postcard payload could not be encoded.
     Encode(String),
     /// Host requested a protocol version that we do not understand.
     UnsupportedProtocol(u16),
@@ -144,11 +143,11 @@ impl ProtocolError {
             ),
             ProtocolError::Decode(err) => (
                 DeviceErrorCode::InternalFailure,
-                format!("failed to decode CBOR request: {err}"),
+                format!("failed to decode postcard request: {err}"),
             ),
             ProtocolError::Encode(err) => (
                 DeviceErrorCode::InternalFailure,
-                format!("failed to encode CBOR response: {err}"),
+                format!("failed to encode postcard response: {err}"),
             ),
             ProtocolError::UnsupportedProtocol(version) => (
                 DeviceErrorCode::StaleGeneration,
@@ -542,20 +541,9 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            match decode_journal_operations(&journal_bytes) {
-                Ok(operations) => {
-                    self.journal_ops = operations;
-                }
-                Err(postcard_err) => {
-                    let operations = cbor_from_slice::<Vec<JournalOperation>>(&journal_bytes)
-                        .map_err(|cbor_err| {
-                            StorageError::Decode(format!(
-                                "postcard journal decode failed: {postcard_err}; legacy CBOR decode failed: {cbor_err}"
-                            ))
-                        })?;
-                    self.journal_ops = operations;
-                }
-            }
+            self.journal_ops = decode_journal_operations(&journal_bytes).map_err(|err| {
+                StorageError::Decode(format!("failed to decode journal operations: {err}"))
+            })?;
         } else {
             self.journal_ops.clear();
         }
@@ -583,14 +571,9 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            let record: KeyRecord = match postcard_from_bytes(&key_bytes) {
-                Ok(record) => record,
-                Err(postcard_err) => cbor_from_slice(&key_bytes).map_err(|cbor_err| {
-                    StorageError::Decode(format!(
-                        "postcard key record decode failed: {postcard_err}; legacy CBOR decode failed: {cbor_err}"
-                    ))
-                })?,
-            };
+            let record: KeyRecord = postcard_from_bytes(&key_bytes).map_err(|err| {
+                StorageError::Decode(format!("failed to decode key record: {err}"))
+            })?;
             self.crypto.configure_from_record(&record)?;
         }
 

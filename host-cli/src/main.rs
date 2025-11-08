@@ -7,16 +7,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
+use serde_cbor::from_slice as cbor_from_slice;
 use serialport::{SerialPort, SerialPortType};
 
 use shared::cdc::{compute_crc32, CdcCommand, FrameHeader, FRAME_HEADER_SIZE};
 use shared::error::SharedError;
 use shared::schema::{
-    decode_device_response, decode_journal_operations, encode_host_request,
-    encode_journal_operations, AckRequest, AckResponse, DeviceResponse, GetTimeRequest,
-    HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest, StatusRequest,
-    StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
+    decode_journal_operations, encode_journal_operations, AckRequest, AckResponse, DeviceResponse,
+    GetTimeRequest, HelloRequest, HelloResponse, HostRequest, JournalFrame, JournalOperation,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, PROTOCOL_VERSION,
 };
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
@@ -27,7 +28,8 @@ const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
 const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
-const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
+const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.postcard";
+const LEGACY_LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
 const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
 
 #[derive(Parser, Debug)]
@@ -291,7 +293,9 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
     let path = operations_log_path(repo_path);
     let data = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return migrate_legacy_operations(repo_path, &path)
+        }
         Err(err) => {
             return Err(SharedError::Transport(format!(
                 "failed to read local operations from '{}': {err}",
@@ -300,11 +304,65 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
         }
     };
 
+    decode_postcard_operations(data)
+}
+
+fn decode_postcard_operations(data: Vec<u8>) -> Result<Vec<JournalOperation>, SharedError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
     let operations = decode_journal_operations(&data)?;
+    Ok(operations)
+}
+
+fn migrate_legacy_operations(
+    repo_path: &Path,
+    new_path: &Path,
+) -> Result<Vec<JournalOperation>, SharedError> {
+    let legacy_path = legacy_operations_log_path(repo_path);
+    let legacy_data = match fs::read(&legacy_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to read legacy local operations from '{}': {err}",
+                legacy_path.display()
+            )))
+        }
+    };
+
+    if legacy_data.is_empty() {
+        let _ = fs::remove_file(&legacy_path);
+        return Ok(Vec::new());
+    }
+
+    let operations: Vec<JournalOperation> = cbor_from_slice(&legacy_data).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to decode legacy local operations from '{}': {err}",
+            legacy_path.display()
+        ))
+    })?;
+
+    let encoded = encode_journal_operations(&operations)?;
+    fs::write(new_path, &encoded).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to write migrated operations to '{}': {err}",
+            new_path.display()
+        ))
+    })?;
+
+    match fs::remove_file(&legacy_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(SharedError::Transport(format!(
+                "failed to remove legacy operations file '{}': {err}",
+                legacy_path.display()
+            )))
+        }
+    }
+
     Ok(operations)
 }
 
@@ -373,6 +431,10 @@ fn clear_local_operations(repo_path: &Path) -> Result<(), SharedError> {
 
 fn operations_log_path(repo_path: &Path) -> PathBuf {
     repo_path.join(LOCAL_OPERATIONS_FILE)
+}
+
+fn legacy_operations_log_path(repo_path: &Path) -> PathBuf {
+    repo_path.join(LEGACY_LOCAL_OPERATIONS_FILE)
 }
 
 fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
@@ -814,7 +876,7 @@ fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), Sha
 where
     W: Write + ?Sized,
 {
-    let payload = encode_host_request(request)?;
+    let payload = postcard_to_allocvec(request).map_err(SharedError::from)?;
     let command = command_for_request(request);
     write_framed_message(writer, command, &payload)
 }
@@ -824,7 +886,7 @@ where
     R: Read + ?Sized,
 {
     let (command, payload) = read_framed_message(reader)?;
-    let response = decode_device_response(&payload)?;
+    let response = postcard_from_bytes(&payload).map_err(SharedError::from)?;
     validate_response_command(command, &response)?;
     Ok(response)
 }
@@ -1053,7 +1115,8 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 mod tests {
     use super::*;
     use shared::schema::{
-        decode_host_request, encode_device_response, DeviceErrorCode, NackResponse,
+        decode_host_request, encode_device_response, encode_host_request, DeviceErrorCode,
+        NackResponse,
     };
     use std::fs;
     use std::io::Cursor;
