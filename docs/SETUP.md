@@ -1,0 +1,55 @@
+# Development environment setup
+
+Follow these steps to prepare a development workstation for the Cardputer wallet project.
+
+## Prerequisites
+
+Install the following tools before proceeding:
+
+- [Rust](https://www.rust-lang.org/tools/install)
+- [Git](https://git-scm.com/downloads)
+- [`just`](https://github.com/casey/just) (optional helper for running recurring commands)
+
+Ensure the `cargo` binary directory is available on your `PATH`:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+## Installing the Espressif Rust toolchain with `espup`
+
+The firmware crate targets the ESP32-S3 and requires the custom Xtensa-enabled Rust toolchain provided by Espressif. Install and activate it with [`espup`](https://github.com/esp-rs/espup):
+
+```bash
+cargo install espup
+espup install --targets esp32s3
+source "$HOME/.cargo/env"
+source "$HOME/export-esp.sh"
+```
+
+The `espup install` command downloads the LLVM-based Xtensa toolchain and generates the `export-esp.sh` script. Sourcing the script exports `PATH`, `LIBRARY_PATH`, and `RUSTFLAGS` so that subsequent `cargo` invocations pick up the correct linker and build configuration.
+
+## Firmware build prerequisites
+
+Once the toolchain is active, install the Espressif flashing utility:
+
+```bash
+cargo install espflash
+```
+
+You can now build and flash the firmware:
+
+```bash
+cargo build --release -p firmware --target xtensa-esp32s3-none-elf
+espflash flash target/xtensa-esp32s3-none-elf/release/firmware
+```
+
+## Host tooling
+
+The host-side crates (`host-cli` and `shared`) target the standard Rust toolchain. After activating the Espressif environment you can run workspace checks as usual:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --exclude firmware -- -D warnings
+cargo test --workspace --exclude firmware
+```

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install espup
+        run: cargo install espup
+
+      - name: Install Xtensa toolchain
+        run: espup install --targets esp32s3
+
+      - name: Run workspace checks
+        run: bash -lc '. "$HOME/.cargo/env" && if [ -f "$HOME/export-esp.sh" ]; then . "$HOME/export-esp.sh"; fi && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --exclude firmware -- -D warnings && cargo test --workspace --exclude firmware && cargo +esp check -p firmware --target xtensa-esp32s3-none-elf'
