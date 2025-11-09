@@ -89,9 +89,8 @@ pub struct Keymap {
     bindings: Vec<Binding>,
 }
 
-impl Keymap {
-    /// Default key layout derived from the v0.1 specification.
-    pub fn default() -> Self {
+impl Default for Keymap {
+    fn default() -> Self {
         let mut map = Self {
             bindings: Vec::new(),
         };
@@ -176,6 +175,13 @@ impl Keymap {
         );
         map
     }
+}
+
+impl Keymap {
+    /// Default key layout derived from the v0.1 specification.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Add or override a custom binding.
     pub fn add_binding(&mut self, key: PhysicalKey, modifiers: KeyModifiers, command: UiCommand) {
@@ -200,16 +206,20 @@ impl Keymap {
             return None;
         }
 
-        if let PhysicalKey::Char(c) = event.key {
-            if !event.modifiers.control && !event.modifiers.alt && !event.modifiers.function {
-                return Some(UiCommand::InsertChar(c));
-            }
+        if let PhysicalKey::Char(c) = event.key
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.function
+        {
+            return Some(UiCommand::InsertChar(c));
         }
 
-        if let PhysicalKey::Space = event.key {
-            if !event.modifiers.control && !event.modifiers.alt && !event.modifiers.function {
-                return Some(UiCommand::InsertChar(' '));
-            }
+        if let PhysicalKey::Space = event.key
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.function
+        {
+            return Some(UiCommand::InsertChar(' '));
         }
 
         self.bindings

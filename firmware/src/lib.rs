@@ -474,7 +474,7 @@ pub struct PinLockStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PinFailureFeedback {
+pub struct PinFailureFeedback {
     backoff_until_ms: Option<u64>,
     wipe_triggered: bool,
 }
@@ -488,6 +488,11 @@ pub struct PinLockState {
     wipe_triggered: bool,
 }
 
+impl Default for PinLockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl PinLockState {
     pub const fn new() -> Self {
         Self {
@@ -615,11 +620,11 @@ struct KeyRecord {
 }
 
 /// Nonce used to envelope-encrypt individual vault records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RecordNonce([u8; 12]);
 
 impl RecordNonce {
-    pub const fn new(bytes: [u8; 12]) -> Self {
+    pub fn new(bytes: [u8; 12]) -> Self {
         Self(bytes)
     }
 
@@ -627,7 +632,7 @@ impl RecordNonce {
         &self.0
     }
 
-    pub const fn into_inner(self) -> [u8; 12] {
+    pub fn into_inner(self) -> [u8; 12] {
         self.0
     }
 }
@@ -714,10 +719,7 @@ impl CryptoMaterial {
             return None;
         }
 
-        let public_key = match self.device_public_key {
-            Some(value) => value,
-            None => return None,
-        };
+        let public_key = self.device_public_key?;
 
         Some(KeyRecord {
             salt: self.pin_salt,
@@ -749,7 +751,7 @@ impl CryptoMaterial {
         rng.fill_bytes(device_secret.as_mut());
         let static_secret = X25519StaticSecret::from(*device_secret);
         let device_public = X25519PublicKey::from(&static_secret);
-        let mut device_private_key = Zeroizing::new(static_secret.to_bytes());
+        let device_private_key = Zeroizing::new(static_secret.to_bytes());
         drop(static_secret);
 
         self.derive_kek(pin)?;
@@ -1095,12 +1097,12 @@ impl SyncContext {
                     if self.pin_lock.wipe_pending() {
                         return Err(PinUnlockError::WipeRequired);
                     }
-                    if let Some(remaining) = self.pin_lock.remaining_backoff(now_ms) {
-                        if remaining > 0 {
-                            return Err(PinUnlockError::Backoff {
-                                remaining_ms: remaining,
-                            });
-                        }
+                    if let Some(remaining) = self.pin_lock.remaining_backoff(now_ms)
+                        && remaining > 0
+                    {
+                        return Err(PinUnlockError::Backoff {
+                            remaining_ms: remaining,
+                        });
                     }
                 }
                 Err(PinUnlockError::Key(err))

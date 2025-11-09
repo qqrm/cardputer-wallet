@@ -23,19 +23,20 @@ pub enum UiScreen {
 }
 
 /// Message emitted when the UI requests a system side effect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum UiEffect {
+    #[default]
     None,
     StartSync,
-    BeginEdit { entry_id: String },
-    SaveEdit { entry_id: String },
-    CancelEdit { entry_id: String },
-}
-
-impl Default for UiEffect {
-    fn default() -> Self {
-        UiEffect::None
-    }
+    BeginEdit {
+        entry_id: String,
+    },
+    SaveEdit {
+        entry_id: String,
+    },
+    CancelEdit {
+        entry_id: String,
+    },
 }
 
 /// Entry metadata used to populate views.
@@ -335,36 +336,35 @@ impl UiRuntime {
     fn handle_edit(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::InsertChar(c) => {
-                if let Some(edit) = self.edit.as_mut() {
-                    if let Some(field) = edit.fields.get_mut(edit.active_index) {
-                        if !c.is_control() {
-                            field.value.push(c);
-                        }
-                    }
+                if let Some(edit) = self.edit.as_mut()
+                    && let Some(field) = edit.fields.get_mut(edit.active_index)
+                    && !c.is_control()
+                {
+                    field.value.push(c);
                 }
                 UiEffect::None
             }
             UiCommand::DeleteChar => {
-                if let Some(edit) = self.edit.as_mut() {
-                    if let Some(field) = edit.fields.get_mut(edit.active_index) {
-                        field.value.pop();
-                    }
+                if let Some(edit) = self.edit.as_mut()
+                    && let Some(field) = edit.fields.get_mut(edit.active_index)
+                {
+                    field.value.pop();
                 }
                 UiEffect::None
             }
             UiCommand::MoveSelectionUp | UiCommand::PreviousWidget => {
-                if let Some(edit) = self.edit.as_mut() {
-                    if edit.active_index > 0 {
-                        edit.active_index -= 1;
-                    }
+                if let Some(edit) = self.edit.as_mut()
+                    && edit.active_index > 0
+                {
+                    edit.active_index -= 1;
                 }
                 UiEffect::None
             }
             UiCommand::MoveSelectionDown | UiCommand::NextWidget => {
-                if let Some(edit) = self.edit.as_mut() {
-                    if edit.active_index + 1 < edit.fields.len() {
-                        edit.active_index += 1;
-                    }
+                if let Some(edit) = self.edit.as_mut()
+                    && edit.active_index + 1 < edit.fields.len()
+                {
+                    edit.active_index += 1;
                 }
                 UiEffect::None
             }
