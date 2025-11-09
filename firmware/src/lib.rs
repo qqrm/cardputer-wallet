@@ -474,7 +474,7 @@ pub struct PinLockStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PinFailureFeedback {
+pub struct PinFailureFeedback {
     backoff_until_ms: Option<u64>,
     wipe_triggered: bool,
 }
@@ -615,7 +615,7 @@ struct KeyRecord {
 }
 
 /// Nonce used to envelope-encrypt individual vault records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RecordNonce([u8; 12]);
 
 impl RecordNonce {
@@ -627,7 +627,7 @@ impl RecordNonce {
         &self.0
     }
 
-    pub const fn into_inner(self) -> [u8; 12] {
+    pub fn into_inner(self) -> [u8; 12] {
         self.0
     }
 }
@@ -749,7 +749,7 @@ impl CryptoMaterial {
         rng.fill_bytes(device_secret.as_mut());
         let static_secret = X25519StaticSecret::from(*device_secret);
         let device_public = X25519PublicKey::from(&static_secret);
-        let mut device_private_key = Zeroizing::new(static_secret.to_bytes());
+        let device_private_key = Zeroizing::new(static_secret.to_bytes());
         drop(static_secret);
 
         self.derive_kek(pin)?;
