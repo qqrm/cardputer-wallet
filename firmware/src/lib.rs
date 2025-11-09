@@ -1604,7 +1604,7 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
 }
 
 #[cfg(target_arch = "xtensa")]
-mod runtime {
+pub mod runtime {
     use super::*;
     use embassy_executor::Executor;
     use esp_alloc::EspHeap;
@@ -1625,8 +1625,7 @@ mod runtime {
 
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
-    #[esp_hal::entry]
-    fn main() -> ! {
+    pub fn main() -> ! {
         init_allocator();
 
         let mut peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
