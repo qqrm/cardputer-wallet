@@ -885,6 +885,13 @@ impl SyncContext {
         max_chunk: usize,
         host_buffer_size: usize,
     ) -> Result<VaultChunk, ProtocolError> {
+        if host_buffer_size < FRAME_HEADER_SIZE {
+            return Err(ProtocolError::HostBufferTooSmall {
+                required: FRAME_HEADER_SIZE,
+                provided: host_buffer_size,
+            });
+        }
+
         let artifact = match self.transfer_stage {
             TransferStage::Vault => VaultArtifact::Vault,
             TransferStage::Recipients => VaultArtifact::Recipients,
@@ -900,7 +907,7 @@ impl SyncContext {
         };
 
         let available = buffer.len().saturating_sub(*offset);
-        let frame_budget = cmp::min(host_buffer_size, FRAME_MAX_SIZE);
+        let frame_budget = cmp::min(host_buffer_size - FRAME_HEADER_SIZE, FRAME_MAX_SIZE);
         let max_payload = cmp::min(max_chunk, frame_budget);
         let mut chunk_size = cmp::min(max_payload, available);
         let device_chunk_size = cmp::max(1, max_payload) as u32;
@@ -937,7 +944,7 @@ impl SyncContext {
             if encoded_len <= frame_budget {
                 if chunk_size == 0 && available > 0 {
                     return Err(ProtocolError::HostBufferTooSmall {
-                        required: encoded_len,
+                        required: encoded_len + FRAME_HEADER_SIZE,
                         provided: host_buffer_size,
                     });
                 }
@@ -972,7 +979,7 @@ impl SyncContext {
             if chunk_size == 0 {
                 if available > 0 || frame_budget < encoded_len {
                     return Err(ProtocolError::HostBufferTooSmall {
-                        required: encoded_len,
+                        required: encoded_len + FRAME_HEADER_SIZE,
                         provided: host_buffer_size,
                     });
                 }
