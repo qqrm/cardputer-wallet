@@ -1069,6 +1069,11 @@ impl SyncContext {
     }
 
     pub fn unlock_with_pin(&mut self, pin: &[u8], now_ms: u64) -> Result<(), PinUnlockError> {
+        if self.pin_lock.wipe_pending() {
+            self.current_time_ms = now_ms;
+            return Err(PinUnlockError::WipeRequired);
+        }
+
         if let Some(remaining) = self.pin_lock.remaining_backoff(now_ms) {
             self.current_time_ms = now_ms;
             return Err(PinUnlockError::Backoff {
