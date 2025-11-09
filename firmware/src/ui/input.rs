@@ -91,7 +91,7 @@ pub struct Keymap {
 
 impl Keymap {
     /// Default key layout derived from the v0.1 specification.
-    pub fn default() -> Self {
+    pub fn standard() -> Self {
         let mut map = Self {
             bindings: Vec::new(),
         };
@@ -200,21 +200,31 @@ impl Keymap {
             return None;
         }
 
-        if let PhysicalKey::Char(c) = event.key {
-            if !event.modifiers.control && !event.modifiers.alt && !event.modifiers.function {
-                return Some(UiCommand::InsertChar(c));
-            }
+        if let PhysicalKey::Char(c) = event.key
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.function
+        {
+            return Some(UiCommand::InsertChar(c));
         }
 
-        if let PhysicalKey::Space = event.key {
-            if !event.modifiers.control && !event.modifiers.alt && !event.modifiers.function {
-                return Some(UiCommand::InsertChar(' '));
-            }
+        if let PhysicalKey::Space = event.key
+            && !event.modifiers.control
+            && !event.modifiers.alt
+            && !event.modifiers.function
+        {
+            return Some(UiCommand::InsertChar(' '));
         }
 
         self.bindings
             .iter()
             .find(|binding| binding.key == event.key && binding.modifiers == event.modifiers)
             .map(|binding| binding.command.clone())
+    }
+}
+
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::standard()
     }
 }
