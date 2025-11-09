@@ -206,6 +206,36 @@ mod tests {
     fn journal_flow_aes() {
         run_flow(PageCipher::aes256_gcm([0x22; 32]));
     }
+
+    #[test]
+    fn clear_keeps_nonce_counter_monotonic() {
+        block_on(async {
+            let mut flash = init_flash();
+            let flash_range = Flash::FULL_FLASH_RANGE.clone();
+
+            let mut journal = VaultJournal::new(PageCipher::chacha20_poly1305([0x33; 32]));
+            let record = JournalRecord {
+                operation: JournalOperation::Delete {
+                    id: Uuid::from_bytes([9; 16]),
+                },
+                timestamp: "2024-02-01T00:00:00Z".into(),
+            };
+
+            journal
+                .append_record(&mut flash, flash_range.clone(), &mut NoCache::new(), record)
+                .await
+                .unwrap();
+
+            let counter_after_append = journal.next_counter;
+
+            journal
+                .clear(&mut flash, flash_range, &mut NoCache::new())
+                .await
+                .unwrap();
+
+            assert_eq!(journal.next_counter, counter_after_append);
+        });
+    }
 }
 
 impl<SE> From<SequentialStorageError<SE>> for VaultStorageError<SE>
@@ -351,6 +381,9 @@ impl VaultJournal {
     }
 
     /// Remove every stored record by erasing the configured range.
+    ///
+    /// The nonce counter remains monotonic so future appends continue to use
+    /// fresh nonces for the configured cipher key.
     pub async fn clear<S, CI, SE>(
         &mut self,
         flash: &mut S,
@@ -363,7 +396,6 @@ impl VaultJournal {
         SE: core::fmt::Debug,
     {
         erase_all(flash, flash_range.clone()).await?;
-        self.next_counter = 0;
         Ok(())
     }
 
