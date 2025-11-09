@@ -2583,6 +2583,32 @@ mod tests {
     }
 
     #[test]
+    fn wipe_lockout_blocks_subsequent_successful_pin() {
+        let mut ctx = fresh_context();
+        let mut rng = ChaCha20Rng::from_seed([15u8; 32]);
+        ctx.crypto.wrap_new_keys(b"666666", &mut rng).unwrap();
+        ctx.crypto.wipe();
+
+        let mut now = 0u64;
+        let wrong_pin = b"000000";
+
+        loop {
+            match ctx.unlock_with_pin(wrong_pin, now) {
+                Err(PinUnlockError::Key(KeyError::CryptoFailure)) => now += 250,
+                Err(PinUnlockError::Backoff { remaining_ms }) => now += remaining_ms + 1,
+                Err(PinUnlockError::WipeRequired) => break,
+                other => panic!("unexpected unlock result: {other:?}"),
+            }
+        }
+
+        let error = ctx
+            .unlock_with_pin(b"666666", now)
+            .expect_err("wipe lockout should reject correct PIN");
+        assert_eq!(error, PinUnlockError::WipeRequired);
+        assert!(ctx.crypto.vault_key.is_none());
+    }
+
+    #[test]
     fn successful_pin_resets_backoff() {
         let mut ctx = fresh_context();
         let mut rng = ChaCha20Rng::from_seed([14u8; 32]);
