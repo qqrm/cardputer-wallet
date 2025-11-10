@@ -625,22 +625,47 @@ fn handle_device_response(
 #[derive(Default)]
 struct PullArtifacts {
     vault: ArtifactBuffer,
+    recipients: ArtifactBuffer,
     recipients_manifest: Option<Vec<u8>>,
     log_context: Vec<String>,
 }
 
 impl PullArtifacts {
     fn record_vault_chunk(&mut self, chunk: &VaultChunk) {
-        self.vault.bytes.extend_from_slice(&chunk.data);
-        self.vault.metadata.push(VaultChunkMetadata {
-            protocol_version: chunk.protocol_version,
-            sequence: chunk.sequence,
-            total_size: chunk.total_size,
-            remaining_bytes: chunk.remaining_bytes,
-            device_chunk_size: chunk.device_chunk_size,
-            checksum: chunk.checksum,
-            is_last: chunk.is_last,
-        });
+        match chunk.artifact {
+            VaultArtifact::Vault => {
+                self.vault.bytes.extend_from_slice(&chunk.data);
+                self.vault.metadata.push(VaultChunkMetadata {
+                    protocol_version: chunk.protocol_version,
+                    sequence: chunk.sequence,
+                    total_size: chunk.total_size,
+                    remaining_bytes: chunk.remaining_bytes,
+                    device_chunk_size: chunk.device_chunk_size,
+                    checksum: chunk.checksum,
+                    is_last: chunk.is_last,
+                });
+            }
+            VaultArtifact::Recipients => {
+                if chunk.sequence == 1 {
+                    self.recipients.bytes.clear();
+                    self.recipients.metadata.clear();
+                }
+                self.recipients.bytes.extend_from_slice(&chunk.data);
+                self.recipients.metadata.push(VaultChunkMetadata {
+                    protocol_version: chunk.protocol_version,
+                    sequence: chunk.sequence,
+                    total_size: chunk.total_size,
+                    remaining_bytes: chunk.remaining_bytes,
+                    device_chunk_size: chunk.device_chunk_size,
+                    checksum: chunk.checksum,
+                    is_last: chunk.is_last,
+                });
+                if chunk.is_last {
+                    let data = self.recipients.bytes.clone();
+                    self.record_recipients_manifest(&data);
+                }
+            }
+        }
     }
 
     fn record_journal_frame(&mut self, frame: &JournalFrame) {
@@ -678,6 +703,7 @@ impl PullArtifacts {
             }
             fs::write(&vault_path, &self.vault.bytes)
                 .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
+            println!("Saved vault artifact to '{}'.", vault_path.display());
         }
 
         if let Some(recipients) = &self.recipients_manifest {
@@ -688,6 +714,10 @@ impl PullArtifacts {
             }
             fs::write(&recipients_path, recipients)
                 .map_err(|err| io_error("write recipients artifact", &recipients_path, err))?;
+            println!(
+                "Saved recipients manifest to '{}'.",
+                recipients_path.display()
+            );
         }
 
         Ok(())
@@ -1441,6 +1471,52 @@ mod tests {
 
         let recipients_path = args.repo.join("recips.json");
         assert!(!recipients_path.exists(), "unexpected recipients manifest");
+    }
+
+    #[test]
+    fn pull_persists_vault_and_recipients_chunks_to_files() {
+        let responses = [
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: 5,
+                remaining_bytes: 17,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![9, 8, 7, 6, 5],
+                checksum: 0x0BAD_F00D,
+                is_last: false,
+                artifact: VaultArtifact::Vault,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: 17,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: br#"{"recipients":[]}"#.to_vec(),
+                checksum: 0x0D15_EA5E,
+                is_last: true,
+                artifact: VaultArtifact::Recipients,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("combined/repo"),
+            credentials: temp.path().join("creds"),
+        };
+
+        execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let vault_path = args.repo.join("vault.enc");
+        let vault_content = fs::read(&vault_path).expect("vault file");
+        assert_eq!(vault_content, vec![9, 8, 7, 6, 5]);
+
+        let recipients_path = args.repo.join("recips.json");
+        let recipients_content = fs::read(&recipients_path).expect("recipients file");
+        assert_eq!(recipients_content, br#"{"recipients":[]}"#.to_vec());
     }
 
     #[test]
