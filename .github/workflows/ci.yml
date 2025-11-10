@@ -60,3 +60,11 @@ jobs:
 
       - name: Run cargo test (host-cli)
         run: bash -lc 'cargo test -p host-cli --all-features'
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run cargo check (firmware xtensa)
+        run: bash -lc 'cargo +esp check -p firmware --all-features'
