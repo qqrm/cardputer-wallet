@@ -24,4 +24,8 @@ jobs:
           buildtargets: esp32s3
 
       - name: Run workspace checks
-        run: bash -lc '. "$HOME/.cargo/env" && if [ -f "$HOME/export-esp.sh" ]; then . "$HOME/export-esp.sh"; fi && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --exclude firmware -- -D warnings && cargo test --workspace --exclude firmware && cargo +esp check -p firmware --target xtensa-esp32s3-none-elf'
+        run: >-
+          bash -lc 'set -euo pipefail; source "$HOME/.cargo/env";
+          if [ -n "${ESPUP_EXPORT_FILE:-}" ] && [ -f "${ESPUP_EXPORT_FILE}" ]; then source "${ESPUP_EXPORT_FILE}";
+          elif [ -f "$HOME/export-esp.sh" ]; then source "$HOME/export-esp.sh"; fi;
+          cargo fmt --all -- --check && cargo clippy --workspace --all-targets --exclude firmware -- -D warnings && cargo test --workspace --exclude firmware && cargo +esp check -p firmware --target xtensa-esp32s3-none-elf'
