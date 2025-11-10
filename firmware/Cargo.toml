@@ -25,6 +25,7 @@ x25519-dalek = { version = "2", default-features = false, features = ["alloc", "
 [dev-dependencies]
 rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
 critical-section = { version = "1.2", default-features = false, features = ["std"] }
+shared = { path = "../shared", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "cardputer-firmware"

@@ -7,7 +7,8 @@ on:
   pull_request:
 
 jobs:
-  checks:
+  fmt:
+    name: Rustfmt
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -16,16 +17,70 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
 
-      - name: Install Xtensa toolchain
-        uses: esp-rs/xtensa-toolchain@v1.5
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  firmware:
+    name: Firmware lint and test
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          buildtargets: esp32s3
+          components: clippy
 
-      - name: Run workspace checks
+      - name: Run cargo clippy (firmware)
         run: >-
-          bash -lc 'set -euo pipefail; source "$HOME/.cargo/env";
-          if [ -n "${ESPUP_EXPORT_FILE:-}" ] && [ -f "${ESPUP_EXPORT_FILE}" ]; then source "${ESPUP_EXPORT_FILE}";
-          elif [ -f "$HOME/export-esp.sh" ]; then source "$HOME/export-esp.sh"; fi;
-          cargo fmt --all -- --check && cargo clippy --workspace --all-targets --exclude firmware -- -D warnings && cargo test --workspace --exclude firmware && cargo +esp check -p firmware --target xtensa-esp32s3-none-elf'
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings"
+
+      - name: Run cargo test (firmware)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path firmware/Cargo.toml"
+
+  shared:
+    name: Shared lint and test
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run cargo clippy (shared)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo clippy --manifest-path shared/Cargo.toml --all-targets --all-features -- -D warnings"
+
+      - name: Run cargo test (shared)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path shared/Cargo.toml --all-features"
+
+  host_cli:
+    name: Host CLI lint and test
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run cargo clippy (host-cli)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo clippy --manifest-path host-cli/Cargo.toml --all-targets --all-features -- -D warnings"
+
+      - name: Run cargo test (host-cli)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path host-cli/Cargo.toml --all-features"

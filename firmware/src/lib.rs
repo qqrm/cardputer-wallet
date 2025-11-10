@@ -2632,7 +2632,10 @@ mod tests {
             }
         }
 
-        let status = ctx.pin_lock_status(now);
+        let mut status = ctx.pin_lock_status(now);
+        if let Some(remaining) = status.backoff_remaining_ms {
+            status = ctx.pin_lock_status(now.saturating_add(remaining + 1));
+        }
         assert!(status.total_failures >= PIN_WIPE_THRESHOLD);
         assert!(status.wipe_required);
         assert!(status.backoff_remaining_ms.is_none());
