@@ -30,3 +30,4 @@ This roadmap keeps the embedded password device focused on the minimum set of de
 - Keep dependencies on the latest compatible releases and audit changelogs before upgrading (`firmware`, `shared`, `host-cli`).
 - Capture feedback from hardware dry runs and adjust UX or timing parameters accordingly (SPEC §8, §9).
 - Monitor CI stability; treat regressions as release blockers.
+- Run `./scripts/dev-check.sh` before committing to keep the workspace aligned with the standard validation suite.

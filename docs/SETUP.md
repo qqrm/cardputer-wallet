@@ -46,12 +46,11 @@ espflash flash target/xtensa-esp32s3-none-elf/release/firmware
 
 ## Host tooling
 
-The host-side crates (`host-cli` and `shared`) target the standard Rust toolchain. After activating the Espressif environment you can run workspace checks as usual:
+The host-side crates (`host-cli` and `shared`) target the standard Rust toolchain. After installing the Espressif toolchain with `espup` and sourcing the generated environment script, you can run the consolidated validation flow:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --exclude firmware -- -D warnings
-cargo test --workspace --exclude firmware
+source "$HOME/export-esp.sh"
+./scripts/dev-check.sh
 ```
 
 ## Reproducing the CI workflow locally
@@ -71,3 +70,4 @@ cargo test --manifest-path firmware/Cargo.toml --target x86_64-unknown-linux-gnu
 ```
 
 The additional `cargo check` and `cargo build` steps ensure that Xtensa-specific code paths link correctly, while the explicit host-targeted `cargo test` run preserves fast feedback for unit tests.
+The helper script executes `cargo fmt`, `cargo clippy`, `cargo test`, and finally `cargo check` for the firmware target, ensuring both the host and embedded crates are validated with a single command.
