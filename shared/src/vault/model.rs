@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

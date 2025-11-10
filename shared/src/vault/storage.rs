@@ -9,20 +9,21 @@ use sequential_storage::{Error as SequentialStorageError, cache::CacheImpl, eras
 use zeroize::Zeroizing;
 
 /// Errors raised while persisting encrypted journal pages.
-#[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "std", derive(thiserror::Error))]
+#[derive(Debug)]
 pub enum VaultStorageError<SE>
 where
     SE: core::fmt::Debug,
 {
-    #[error("storage error: {0:?}")]
+    #[cfg_attr(feature = "std", error("storage error: {0:?}"))]
     Storage(SequentialStorageError<SE>),
-    #[error("serialization error: {0}")]
-    Codec(#[from] postcard::Error),
-    #[error("authentication failed")]
+    #[cfg_attr(feature = "std", error("serialization error: {0}"))]
+    Codec(postcard::Error),
+    #[cfg_attr(feature = "std", error("authentication failed"))]
     Authentication,
-    #[error("unsupported journal version {0}")]
+    #[cfg_attr(feature = "std", error("unsupported journal version {0}"))]
     UnsupportedVersion(u16),
-    #[error("nonce counter exhausted")]
+    #[cfg_attr(feature = "std", error("nonce counter exhausted"))]
     NonceExhausted,
 }
 
@@ -244,6 +245,15 @@ where
 {
     fn from(value: SequentialStorageError<SE>) -> Self {
         Self::Storage(value)
+    }
+}
+
+impl<SE> From<postcard::Error> for VaultStorageError<SE>
+where
+    SE: core::fmt::Debug,
+{
+    fn from(value: postcard::Error) -> Self {
+        Self::Codec(value)
     }
 }
 

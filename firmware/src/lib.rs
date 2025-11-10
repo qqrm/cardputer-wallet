@@ -521,6 +521,7 @@ impl PinLockState {
 
         if self.total_failures >= PIN_WIPE_THRESHOLD {
             self.wipe_triggered = true;
+            self.backoff_until_ms = None;
         }
 
         PinFailureFeedback {
