@@ -1,4 +1,8 @@
 fn main() {
+    if !is_xtensa_target() {
+        return;
+    }
+
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
@@ -53,4 +57,11 @@ fn linker_be_nice() {
         "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
         std::env::current_exe().unwrap().display()
     );
+}
+
+fn is_xtensa_target() -> bool {
+    matches!(
+        std::env::var("CARGO_CFG_TARGET_ARCH"),
+        Ok(arch) if arch == "xtensa"
+    )
 }
