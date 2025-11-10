@@ -35,13 +35,30 @@ jobs:
         with:
           components: clippy
 
+      - name: Install espup
+        run: cargo install espup
+
+      - name: Install ESP toolchain
+        run: espup install --targets esp32s3
+
+      - name: Select ESP toolchain
+        run: rustup default esp
+
       - name: Run cargo clippy (firmware)
         run: >-
-          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings"
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings"
 
-      - name: Run cargo test (firmware)
+      - name: Run cargo check (firmware Xtensa)
         run: >-
-          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path firmware/Cargo.toml"
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo check -p firmware --target xtensa-esp32s3-none-elf"
+
+      - name: Run cargo build (firmware Xtensa release)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf"
+
+      - name: Run cargo test (firmware host)
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path firmware/Cargo.toml --target x86_64-unknown-linux-gnu"
 
   shared:
     name: Shared lint and test

@@ -53,3 +53,21 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --exclude firmware -- -D warnings
 cargo test --workspace --exclude firmware
 ```
+
+## Reproducing the CI workflow locally
+
+The CI pipeline now validates the firmware crate with both the Espressif Xtensa toolchain and the host toolchain. To mirror the job locally, run the steps below in the specified order after installing `espup`:
+
+```bash
+source "$HOME/.cargo/env"
+cargo install espup
+espup install --targets esp32s3
+rustup default esp
+source "$HOME/export-esp.sh"
+cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings
+cargo check -p firmware --target xtensa-esp32s3-none-elf
+cargo build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf
+cargo test --manifest-path firmware/Cargo.toml --target x86_64-unknown-linux-gnu
+```
+
+The additional `cargo check` and `cargo build` steps ensure that Xtensa-specific code paths link correctly, while the explicit host-targeted `cargo test` run preserves fast feedback for unit tests.
