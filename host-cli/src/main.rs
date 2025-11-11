@@ -1603,6 +1603,95 @@ mod tests {
     }
 
     #[test]
+    fn pull_persists_multi_chunk_recipients_manifest() {
+        let first_fragment = br#"{"recipients":[{"#.to_vec();
+        let second_fragment = br#"address":"deadbeef"}]}"#.to_vec();
+        let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 11,
+                vault_hash: [0x33; 32],
+                recipients_hash: [0x44; 32],
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: 4096,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![1, 3, 3, 7],
+                checksum: 0x0123_4567,
+                is_last: true,
+                artifact: VaultArtifact::Vault,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: (first_fragment.len() + second_fragment.len()) as u64,
+                remaining_bytes: second_fragment.len() as u64,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: first_fragment.clone(),
+                checksum: 0x89AB_CDEF,
+                is_last: false,
+                artifact: VaultArtifact::Recipients,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 3,
+                total_size: (first_fragment.len() + second_fragment.len()) as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: second_fragment.clone(),
+                checksum: 0x7654_3210,
+                is_last: true,
+                artifact: VaultArtifact::Recipients,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("multi/recipients"),
+            credentials: temp.path().join("creds"),
+        };
+
+        execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let (first_command, first_payload) =
+            read_framed_message(&mut reader).expect("decode head request frame");
+        assert_eq!(first_command, CdcCommand::PullHead);
+        let decoded_head: HostRequest =
+            decode_host_request(&first_payload).expect("decode head request");
+        assert!(matches!(decoded_head, HostRequest::PullHead(_)));
+
+        for index in 0..3 {
+            let (command, payload) =
+                read_framed_message(&mut reader).expect("decode pull request frame");
+            assert_eq!(
+                command,
+                CdcCommand::PullVault,
+                "expected pull request #{index}"
+            );
+            let decoded: HostRequest = decode_host_request(&payload).expect("decode pull request");
+            assert!(matches!(decoded, HostRequest::PullVault(_)));
+        }
+
+        assert_eq!(
+            reader.position(),
+            reader.get_ref().len() as u64,
+            "expected one head request followed by three pull requests",
+        );
+
+        let recipients_path = args.repo.join("recips.json");
+        let recipients_content = fs::read(&recipients_path).expect("recipients file");
+        let mut expected = first_fragment;
+        expected.extend_from_slice(&second_fragment);
+        assert_eq!(recipients_content, expected);
+    }
+
+    #[test]
     fn status_sends_status_command() {
         let responses = encode_response(DeviceResponse::Status(StatusResponse {
             protocol_version: PROTOCOL_VERSION,
