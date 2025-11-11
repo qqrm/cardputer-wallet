@@ -22,11 +22,9 @@ use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
     HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
+    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
     decode_journal_operations, encode_journal_operations,
 };
 use shared::vault::{
@@ -50,7 +48,6 @@ const VAULT_FILE: &str = "vault.enc";
 const RECIPIENTS_FILE: &str = "recips.json";
 const SIGNATURE_FILE: &str = "vault.sig";
 const CONFIG_FILE: &str = "config.json";
-const SIGNATURE_SIZE: usize = 64;
 const SIGNATURE_DOMAIN: &[u8] = b"cardputer.vault.signature.v1";
 const VAULT_AAD: &[u8] = b"cardputer.vault.snapshot.v1";
 const VAULT_NONCE_SIZE: usize = 12;
