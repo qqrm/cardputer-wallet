@@ -53,6 +53,12 @@ source "$HOME/export-esp.sh"
 ./scripts/dev-check.sh
 ```
 
+Running `cardputer pull` after these steps now persists three artifacts inside the chosen repository:
+
+- `vault.enc` – the encrypted vault image.
+- `recips.json` – the recipients manifest.
+- `vault.sig` – the detached Ed25519 signature covering the vault and manifest.
+
 ## Reproducing the CI workflow locally
 
 The CI pipeline now validates the firmware crate with both the Espressif Xtensa toolchain and the host toolchain. To mirror the job locally, run the steps below in the specified order after installing `espup`:
