@@ -2,6 +2,8 @@
 
 This roadmap keeps the embedded password device focused on the minimum set of deliverables required for a reliable BLE/USB credential typer.
 
+> **Project status:** The firmware, host tooling, and shared libraries are under active greenfield development. No releases have shipped, no builds have been distributed to users, and no backward-compatibility guarantees are currently required.
+
 ## Phase 0 – Minimal foundation
 - Generate a fresh ESP32-S3 workspace with [`esp-generate`](https://github.com/esp-rs/esp-generate) and move existing firmware code into the scaffold (SPEC §3).
 - Lock in the embedded stack: `esp-hal`, `embassy-executor`, `trouble`, `sequential-storage`, and shared codecs derived with `ergot` (SPEC §3).
