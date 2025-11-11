@@ -287,15 +287,15 @@ where
     P: Read + Write + ?Sized,
 {
     let descriptors = [
-        (VaultArtifact::Vault, repo.join("vault.enc"), "vault image"),
+        (VaultArtifact::Vault, repo.join(VAULT_FILE), "vault image"),
         (
             VaultArtifact::Recipients,
-            repo.join("recips.json"),
+            repo.join(RECIPIENTS_FILE),
             "recipients manifest",
         ),
         (
             VaultArtifact::Signature,
-            repo.join("vault.sig"),
+            repo.join(SIGNATURE_FILE),
             "vault signature",
         ),
     ];
@@ -2962,12 +2962,19 @@ mod tests {
             message: String::from("acknowledged"),
         }));
 
-        let mut port = MockPort::new(ack_response);
+        let mut port = MockPort::new(ack_response.repeat(3));
         execute_push(&mut port, &args).expect("push succeeds");
 
         let mut reader = Cursor::new(port.writes);
-        let (command, payload) = read_framed_message(&mut reader).expect("decode push frame");
-        assert_eq!(command, CdcCommand::PushOps);
+        let payload = loop {
+            let (command, payload) =
+                read_framed_message(&mut reader).expect("decode written frame");
+            if command == CdcCommand::PushOps {
+                break payload;
+            }
+
+            assert_eq!(command, CdcCommand::PushVault);
+        };
         let decoded = decode_host_request(&payload).expect("decode push request");
 
         match decoded {
@@ -2987,11 +2994,7 @@ mod tests {
             other => panic!("unexpected request written: {:?}", other),
         }
 
-        assert_eq!(
-            reader.position(),
-            reader.get_ref().len() as u64,
-            "expected exactly one push frame",
-        );
+        assert_eq!(reader.position(), reader.get_ref().len() as u64);
 
         assert!(
             !operations_log_path(&args.repo).exists(),
