@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod cdc;
+pub mod checksum;
 #[cfg(feature = "std")]
 pub mod error;
 pub mod schema;
