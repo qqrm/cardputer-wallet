@@ -25,7 +25,7 @@ use shared::schema::{
     HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
     PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
     StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
-    encode_journal_operations,
+    decode_journal_operations, encode_journal_operations,
 };
 use shared::vault::{
     EntryUpdate, JournalOperation as VaultJournalOperation, PageCipher, VaultEntry, VaultMetadata,
@@ -225,7 +225,7 @@ where
     );
 
     let config = HostConfig::load(&args.credentials)?;
-    let operations = load_local_operations(&args.repo)?;
+    let operations = load_local_operations(&args.repo, &config)?;
     if operations.is_empty() {
         println!("No pending operations to push.");
         return Ok(());
@@ -345,7 +345,10 @@ impl PushPlan {
     }
 }
 
-fn load_local_operations(repo_path: &Path) -> Result<Vec<VaultJournalOperation>, SharedError> {
+fn load_local_operations(
+    repo_path: &Path,
+    config: &HostConfig,
+) -> Result<Vec<VaultJournalOperation>, SharedError> {
     let path = operations_log_path(repo_path);
     let data = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -360,17 +363,27 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<VaultJournalOperation>,
         }
     };
 
-    decode_postcard_operations(data)
-}
-
-fn decode_postcard_operations(data: Vec<u8>) -> Result<Vec<VaultJournalOperation>, SharedError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
-    postcard_from_bytes(&data).map_err(|err| {
-        SharedError::Transport(format!("failed to decode journal operations: {err}"))
-    })
+    match decode_postcard_operations(&data) {
+        Ok(operations) => Ok(operations),
+        Err(primary) => match decode_journal_operations(&data) {
+            Ok(device_ops) => {
+                let converted = convert_device_operations(repo_path, config, device_ops)?;
+                persist_host_operations(&path, &converted)?;
+                Ok(converted)
+            }
+            Err(_) => Err(SharedError::Transport(format!(
+                "failed to decode journal operations: {primary}"
+            ))),
+        },
+    }
+}
+
+fn decode_postcard_operations(data: &[u8]) -> Result<Vec<VaultJournalOperation>, postcard::Error> {
+    postcard_from_bytes(data)
 }
 
 fn migrate_legacy_operations(
@@ -426,6 +439,278 @@ fn migrate_legacy_operations(
     }
 
     Ok(operations)
+}
+
+enum LegacyConvertedOp {
+    Update(Uuid),
+    Add(Uuid),
+    Delete(Uuid),
+}
+
+fn convert_device_operations(
+    repo_path: &Path,
+    config: &HostConfig,
+    device_ops: Vec<DeviceJournalOperation>,
+) -> Result<Vec<VaultJournalOperation>, SharedError> {
+    if device_ops.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vault_key = config
+        .vault_key()
+        .ok_or_else(|| SharedError::Transport("vault key missing from credentials".into()))?;
+    let vault_path = repo_path.join(VAULT_FILE);
+    let encrypted = fs::read(&vault_path).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to read vault from '{}': {err}",
+            vault_path.display()
+        ))
+    })?;
+    let snapshot = decrypt_vault(&encrypted, &vault_key)?;
+
+    let mut pending_updates: Vec<(Uuid, EntryUpdate)> = Vec::new();
+    let mut sequence: Vec<LegacyConvertedOp> = Vec::new();
+
+    for operation in device_ops {
+        match operation {
+            DeviceJournalOperation::Add { entry_id } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                if pending_updates
+                    .iter()
+                    .any(|(existing, _)| existing == &id)
+                    && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
+                {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+                sequence.push(LegacyConvertedOp::Add(id));
+            }
+            DeviceJournalOperation::UpdateField {
+                entry_id,
+                field,
+                value_checksum,
+            } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                let entry = find_entry(&snapshot, &id)?;
+                let update = get_or_insert_update(&mut pending_updates, &id);
+                apply_field_update_from_entry(&id, entry, &field, value_checksum, update)?;
+                if !sequence.iter().any(
+                    |item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id),
+                ) {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+            }
+            DeviceJournalOperation::Delete { entry_id } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                if pending_updates
+                    .iter()
+                    .any(|(existing, _)| existing == &id)
+                    && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
+                {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+                sequence.push(LegacyConvertedOp::Delete(id));
+            }
+        }
+    }
+
+    let mut host_ops = Vec::new();
+    for item in sequence {
+        match item {
+            LegacyConvertedOp::Update(id) => {
+                if let Some(update) = take_pending_update(&mut pending_updates, &id) {
+                    host_ops.push(VaultJournalOperation::Update {
+                        id,
+                        changes: update,
+                    });
+                }
+            }
+            LegacyConvertedOp::Add(id) => {
+                let entry = find_entry(&snapshot, &id)?;
+                host_ops.push(VaultJournalOperation::Add {
+                    entry: entry.clone(),
+                });
+            }
+            LegacyConvertedOp::Delete(id) => {
+                if let Some(update) = take_pending_update(&mut pending_updates, &id) {
+                    host_ops.push(VaultJournalOperation::Update {
+                        id,
+                        changes: update,
+                    });
+                }
+                host_ops.push(VaultJournalOperation::Delete { id });
+            }
+        }
+    }
+
+    for (id, changes) in pending_updates.into_iter() {
+        if !entry_update_is_empty(&changes) {
+            host_ops.push(VaultJournalOperation::Update { id, changes });
+        }
+    }
+
+    Ok(host_ops)
+}
+
+fn persist_host_operations(
+    path: &Path,
+    operations: &[VaultJournalOperation],
+) -> Result<(), SharedError> {
+    let encoded = postcard_to_allocvec(operations).map_err(|err| {
+        SharedError::Transport(format!("failed to encode migrated operations: {err}"))
+    })?;
+    fs::write(path, encoded).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to write migrated operations to '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+fn parse_legacy_uuid(raw: &str) -> Result<Uuid, SharedError> {
+    Uuid::parse_str(raw).map_err(|err| {
+        SharedError::Transport(format!("invalid legacy entry identifier '{raw}': {err}"))
+    })
+}
+
+fn find_entry<'a>(snapshot: &'a VaultSnapshot, id: &Uuid) -> Result<&'a VaultEntry, SharedError> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| &entry.id == id)
+        .ok_or_else(|| {
+            SharedError::Transport(format!("legacy operations reference unknown entry {id}"))
+        })
+}
+
+fn get_or_insert_update<'a>(
+    updates: &'a mut Vec<(Uuid, EntryUpdate)>,
+    id: &Uuid,
+) -> &'a mut EntryUpdate {
+    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
+        return &mut updates[position].1;
+    }
+
+    updates.push((*id, EntryUpdate::default()));
+    let last = updates
+        .last_mut()
+        .expect("pending updates missing newly inserted entry");
+    &mut last.1
+}
+
+fn take_pending_update(updates: &mut Vec<(Uuid, EntryUpdate)>, id: &Uuid) -> Option<EntryUpdate> {
+    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
+        let (_, update) = updates.remove(position);
+        if entry_update_is_empty(&update) {
+            None
+        } else {
+            Some(update)
+        }
+    } else {
+        None
+    }
+}
+
+fn entry_update_is_empty(update: &EntryUpdate) -> bool {
+    update.title.is_none()
+        && update.service.is_none()
+        && update.domains.is_none()
+        && update.username.is_none()
+        && update.password.is_none()
+        && update.totp.is_none()
+        && update.tags.is_none()
+        && update.r#macro.is_none()
+        && update.updated_at.is_none()
+        && update.used_at.is_none()
+}
+
+fn apply_field_update_from_entry(
+    id: &Uuid,
+    entry: &VaultEntry,
+    field: &str,
+    expected_checksum: u32,
+    update: &mut EntryUpdate,
+) -> Result<(), SharedError> {
+    match field {
+        "title" => {
+            verify_checksum(id, field, expected_checksum, entry.title.as_bytes())?;
+            update.title = Some(entry.title.clone());
+        }
+        "service" => {
+            verify_checksum(id, field, expected_checksum, entry.service.as_bytes())?;
+            update.service = Some(entry.service.clone());
+        }
+        "domains" => {
+            let encoded = cbor_to_vec(&entry.domains).map_err(|err| {
+                SharedError::Transport(format!("failed to encode domains for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.domains = Some(entry.domains.clone());
+        }
+        "username" => {
+            verify_checksum(id, field, expected_checksum, entry.username.as_bytes())?;
+            update.username = Some(entry.username.clone());
+        }
+        "password" => {
+            verify_checksum(id, field, expected_checksum, entry.password.as_bytes())?;
+            update.password = Some(entry.password.clone());
+        }
+        "totp" => {
+            let totp = entry.totp.as_ref().ok_or_else(|| {
+                SharedError::Transport(format!(
+                    "legacy operations reference missing TOTP configuration for entry {id}"
+                ))
+            })?;
+            let encoded = cbor_to_vec(totp).map_err(|err| {
+                SharedError::Transport(format!("failed to encode TOTP for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.totp = Some(totp.clone());
+        }
+        "tags" => {
+            let encoded = cbor_to_vec(&entry.tags).map_err(|err| {
+                SharedError::Transport(format!("failed to encode tags for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.tags = Some(entry.tags.clone());
+        }
+        "macro" => {
+            let value = entry.r#macro.as_ref().ok_or_else(|| {
+                SharedError::Transport(format!(
+                    "legacy operations reference missing macro for entry {id}"
+                ))
+            })?;
+            verify_checksum(id, field, expected_checksum, value.as_bytes())?;
+            update.r#macro = Some(value.clone());
+        }
+        "updated_at" => {
+            verify_checksum(id, field, expected_checksum, entry.updated_at.as_bytes())?;
+            update.updated_at = Some(entry.updated_at.clone());
+        }
+        "used_at" => {
+            let encoded = cbor_to_vec(&entry.used_at).map_err(|err| {
+                SharedError::Transport(format!("failed to encode used_at for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.used_at = Some(entry.used_at.clone());
+        }
+        other => {
+            return Err(SharedError::Transport(format!(
+                "unsupported legacy journal field '{other}' for entry {id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_checksum(id: &Uuid, field: &str, expected: u32, bytes: &[u8]) -> Result<(), SharedError> {
+    let actual = compute_crc32(bytes);
+    if actual != expected {
+        return Err(SharedError::Transport(format!(
+            "legacy journal checksum mismatch for field '{field}' in entry {id}"
+        )));
+    }
+    Ok(())
 }
 
 fn build_push_frames(
@@ -2652,6 +2937,57 @@ mod tests {
             .verifying_key()
             .verify(&message, &signature)
             .expect("signature verifies");
+    }
+
+    #[test]
+    fn load_local_operations_migrates_device_format() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path();
+        let credentials = repo.join("creds.json");
+        write_credentials_with_keys(&credentials, true, true);
+
+        let existing_id = Uuid::new_v4();
+        let mut updated_entry = sample_entry(existing_id, "existing");
+        updated_entry.username = "updated-user".into();
+        updated_entry.tags = vec!["tag".into()];
+        updated_entry.updated_at = "2024-02-01T00:00:00Z".into();
+
+        let new_entry = sample_entry(Uuid::new_v4(), "added");
+        let snapshot = sample_snapshot(vec![updated_entry.clone(), new_entry.clone()]);
+        write_encrypted_vault(repo, &snapshot);
+
+        let host_operations = vec![
+            VaultJournalOperation::Update {
+                id: existing_id,
+                changes: EntryUpdate {
+                    username: Some(updated_entry.username.clone()),
+                    tags: Some(updated_entry.tags.clone()),
+                    updated_at: Some(updated_entry.updated_at.clone()),
+                    ..EntryUpdate::default()
+                },
+            },
+            VaultJournalOperation::Add {
+                entry: new_entry.clone(),
+            },
+        ];
+
+        let mut device_operations = Vec::new();
+        for operation in &host_operations {
+            device_operations.extend(operations_for_device(operation).expect("flatten host ops"));
+        }
+
+        let encoded_device =
+            encode_journal_operations(&device_operations).expect("encode device ops");
+        fs::write(operations_log_path(repo), &encoded_device).expect("write legacy operations");
+
+        let config = HostConfig::load(&credentials).expect("load config");
+        let loaded = load_local_operations(repo, &config).expect("load migrated operations");
+        assert_eq!(loaded, host_operations);
+
+        let rewritten = fs::read(operations_log_path(repo)).expect("read rewritten operations");
+        let decoded: Vec<VaultJournalOperation> =
+            postcard_from_bytes(&rewritten).expect("decode rewritten operations");
+        assert_eq!(decoded, host_operations);
     }
 
     #[test]
