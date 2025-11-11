@@ -136,6 +136,30 @@ where
         args.credentials.display()
     );
 
+    let head_request = HostRequest::PullHead(PullHeadRequest {
+        protocol_version: PROTOCOL_VERSION,
+    });
+
+    send_host_request(port, &head_request)?;
+    println!("Requested head metadata. Awaiting response…");
+
+    let mut artifacts = PullArtifacts::default();
+    let head_response = read_device_response(port)?;
+    let head = match head_response {
+        DeviceResponse::Head(head) => head,
+        other => {
+            handle_device_response(other, None, Some(&mut artifacts))?;
+            return Err(SharedError::Transport(
+                "unexpected device response while fetching head metadata".into(),
+            ));
+        }
+    };
+
+    print_head(&head);
+    artifacts.record_log("head response");
+    let recipients_expected = head.recipients_hash != [0u8; 32];
+    artifacts.set_recipients_expected(recipients_expected);
+
     let request = HostRequest::PullVault(PullVaultRequest {
         protocol_version: PROTOCOL_VERSION,
         host_buffer_size: HOST_BUFFER_SIZE,
@@ -147,7 +171,6 @@ where
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = SyncStateTracker::default();
-    let mut artifacts = PullArtifacts::default();
     let mut should_continue = true;
 
     while should_continue {
@@ -602,10 +625,12 @@ fn handle_device_response(
             if let Some(state) = tracker {
                 state.record(chunk.sequence, chunk.checksum);
             }
-            if let Some(storage) = artifacts {
-                storage.record_vault_chunk(&chunk);
-            }
-            Ok(!chunk.is_last)
+            let should_continue = if let Some(storage) = artifacts {
+                storage.record_vault_chunk(&chunk)
+            } else {
+                !chunk.is_last
+            };
+            Ok(should_continue)
         }
         DeviceResponse::Ack(message) => {
             print_ack(&message);
@@ -627,11 +652,17 @@ struct PullArtifacts {
     vault: ArtifactBuffer,
     recipients: ArtifactBuffer,
     recipients_manifest: Option<Vec<u8>>,
+    recipients_expected: bool,
+    recipients_seen: bool,
     log_context: Vec<String>,
 }
 
 impl PullArtifacts {
-    fn record_vault_chunk(&mut self, chunk: &VaultChunk) {
+    fn set_recipients_expected(&mut self, expected: bool) {
+        self.recipients_expected = expected;
+    }
+
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
         match chunk.artifact {
             VaultArtifact::Vault => {
                 self.vault.bytes.extend_from_slice(&chunk.data);
@@ -644,12 +675,16 @@ impl PullArtifacts {
                     checksum: chunk.checksum,
                     is_last: chunk.is_last,
                 });
+                if chunk.is_last && !self.recipients_expected {
+                    return false;
+                }
             }
             VaultArtifact::Recipients => {
-                if chunk.sequence == 1 {
+                if !self.recipients_seen || chunk.sequence == 1 {
                     self.recipients.bytes.clear();
                     self.recipients.metadata.clear();
                 }
+                self.recipients_seen = true;
                 self.recipients.bytes.extend_from_slice(&chunk.data);
                 self.recipients.metadata.push(VaultChunkMetadata {
                     protocol_version: chunk.protocol_version,
@@ -664,7 +699,14 @@ impl PullArtifacts {
                     let data = self.recipients.bytes.clone();
                     self.record_recipients_manifest(&data);
                 }
+                return !chunk.is_last;
             }
+        }
+
+        if chunk.is_last {
+            self.recipients_expected && !self.recipients_seen
+        } else {
+            true
         }
     }
 
@@ -1372,6 +1414,12 @@ mod tests {
     #[test]
     fn pull_reissues_request_until_completion() {
         let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 1,
+                vault_hash: [0u8; 32],
+                recipients_hash: [0u8; 32],
+            })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 1,
@@ -1409,10 +1457,10 @@ mod tests {
         let mut reader = Cursor::new(port.writes);
         let (command_one, payload_one) =
             read_framed_message(&mut reader).expect("decode first written frame");
-        assert_eq!(command_one, CdcCommand::PullVault);
+        assert_eq!(command_one, CdcCommand::PullHead);
         let decoded_one: HostRequest =
             decode_host_request(&payload_one).expect("decode first request");
-        assert!(matches!(decoded_one, HostRequest::PullVault(_)));
+        assert!(matches!(decoded_one, HostRequest::PullHead(_)));
 
         let (command_two, payload_two) =
             read_framed_message(&mut reader).expect("decode second written frame");
@@ -1421,16 +1469,29 @@ mod tests {
             decode_host_request(&payload_two).expect("decode second request");
         assert!(matches!(decoded_two, HostRequest::PullVault(_)));
 
+        let (command_three, payload_three) =
+            read_framed_message(&mut reader).expect("decode third written frame");
+        assert_eq!(command_three, CdcCommand::PullVault);
+        let decoded_three: HostRequest =
+            decode_host_request(&payload_three).expect("decode third request");
+        assert!(matches!(decoded_three, HostRequest::PullVault(_)));
+
         assert_eq!(
             reader.position(),
             reader.get_ref().len() as u64,
-            "expected exactly two pull requests"
+            "expected head request followed by two pull requests"
         );
     }
 
     #[test]
     fn pull_persists_vault_chunks_to_file() {
         let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 3,
+                vault_hash: [0xAA; 32],
+                recipients_hash: [0u8; 32],
+            })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 1,
@@ -1476,15 +1537,21 @@ mod tests {
     #[test]
     fn pull_persists_vault_and_recipients_chunks_to_files() {
         let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 7,
+                vault_hash: [0x11; 32],
+                recipients_hash: [0x22; 32],
+            })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 1,
                 total_size: 5,
-                remaining_bytes: 17,
+                remaining_bytes: 0,
                 device_chunk_size: MAX_CHUNK_SIZE,
                 data: vec![9, 8, 7, 6, 5],
                 checksum: 0x0BAD_F00D,
-                is_last: false,
+                is_last: true,
                 artifact: VaultArtifact::Vault,
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
@@ -1509,6 +1576,22 @@ mod tests {
         };
 
         execute_pull(&mut port, &args).expect("pull succeeds");
+
+        let mut reader = Cursor::new(port.writes);
+        let (first_command, first_payload) =
+            read_framed_message(&mut reader).expect("decode head request frame");
+        assert_eq!(first_command, CdcCommand::PullHead);
+        let decoded_head: HostRequest =
+            decode_host_request(&first_payload).expect("decode head request");
+        assert!(matches!(decoded_head, HostRequest::PullHead(_)));
+
+        let (second_command, _) =
+            read_framed_message(&mut reader).expect("decode first pull request frame");
+        assert_eq!(second_command, CdcCommand::PullVault);
+
+        let (third_command, _) =
+            read_framed_message(&mut reader).expect("decode second pull request frame");
+        assert_eq!(third_command, CdcCommand::PullVault);
 
         let vault_path = args.repo.join("vault.enc");
         let vault_content = fs::read(&vault_path).expect("vault file");
@@ -1602,13 +1685,22 @@ mod tests {
     fn confirm_sends_ack_request_with_saved_state() {
         let sequence = 7;
         let frame_checksum = 0xAABBCCDD;
-        let pull_responses = encode_response(DeviceResponse::JournalFrame(JournalFrame {
-            protocol_version: PROTOCOL_VERSION,
-            sequence,
-            remaining_operations: 0,
-            operations: Vec::new(),
-            checksum: frame_checksum,
-        }));
+        let pull_responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 5,
+                vault_hash: [0x44; 32],
+                recipients_hash: [0u8; 32],
+            })),
+            encode_response(DeviceResponse::JournalFrame(JournalFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                remaining_operations: 0,
+                operations: Vec::new(),
+                checksum: frame_checksum,
+            })),
+        ]
+        .concat();
 
         let temp = tempdir().expect("tempdir");
         let args = RepoArgs {
