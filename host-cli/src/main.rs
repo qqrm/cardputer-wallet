@@ -19,6 +19,7 @@ use serde_json::from_str as json_from_str;
 use serialport::{SerialPort, SerialPortType};
 
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
+use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
@@ -997,13 +998,6 @@ fn compute_local_journal_checksum(operations: &[DeviceJournalOperation]) -> u32 
                 accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
             }
         })
-}
-
-fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
-    for byte in payload {
-        seed = seed.wrapping_mul(16777619) ^ u32::from(*byte);
-    }
-    seed
 }
 
 fn execute_hello<P>(port: &mut P) -> Result<(), SharedError>

@@ -89,6 +89,7 @@ use actions::DeviceAction;
 
 use shared::cdc::FRAME_HEADER_SIZE;
 use shared::cdc::{CdcCommand, FrameHeader, compute_crc32};
+use shared::checksum::accumulate_checksum;
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
     HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
@@ -1510,13 +1511,6 @@ impl SyncContext {
             }
         }
     }
-}
-
-fn accumulate_checksum(mut seed: u32, payload: &[u8]) -> u32 {
-    for byte in payload {
-        seed = seed.wrapping_mul(16777619) ^ (*byte as u32);
-    }
-    seed
 }
 
 fn artifact_hash(data: &[u8]) -> [u8; 32] {
