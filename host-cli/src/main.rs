@@ -6,9 +6,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD as Base64};
+use blake3::Hasher;
 use clap::{Args, Parser, Subcommand};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use hex::decode as hex_decode;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
-use serde_cbor::from_slice as cbor_from_slice;
+use rand_core::{CryptoRng, OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use serde_cbor::{from_slice as cbor_from_slice, to_vec as cbor_to_vec};
+use serde_json::from_str as json_from_str;
 use serialport::{SerialPort, SerialPortType};
 
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
@@ -17,9 +24,15 @@ use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
     HostRequest, JournalFrame, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
     PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
+    HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
     StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
     decode_journal_operations, encode_journal_operations,
 };
+use shared::vault::{
+    EntryUpdate, JournalOperation as VaultJournalOperation, PageCipher, VaultEntry, VaultMetadata,
+};
+use uuid::Uuid;
 
 const SERIAL_BAUD_RATE: u32 = 115_200;
 const DEFAULT_TIMEOUT_SECS: u64 = 2;
@@ -33,6 +46,14 @@ const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
 const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.postcard";
 const LEGACY_LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
 const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
+const VAULT_FILE: &str = "vault.enc";
+const RECIPIENTS_FILE: &str = "recips.json";
+const SIGNATURE_FILE: &str = "vault.sig";
+const CONFIG_FILE: &str = "config.json";
+const SIGNATURE_SIZE: usize = 64;
+const SIGNATURE_DOMAIN: &[u8] = b"cardputer.vault.signature.v1";
+const VAULT_AAD: &[u8] = b"cardputer.vault.snapshot.v1";
+const VAULT_NONCE_SIZE: usize = 12;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -77,6 +98,9 @@ struct RepoArgs {
     /// Path to the credentials file used during the operation.
     #[arg(long, value_name = "PATH")]
     credentials: PathBuf,
+    /// Optional path to a file containing the Ed25519 verifying key in base64 or hex.
+    #[arg(long, value_name = "PATH")]
+    signing_pubkey: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -137,6 +161,9 @@ where
         args.credentials.display()
     );
 
+    let config = HostConfig::load(&args.credentials)?;
+    let verifying_key = load_verifying_key(&config, args.signing_pubkey.as_deref())?;
+
     let head_request = HostRequest::PullHead(PullHeadRequest {
         protocol_version: PROTOCOL_VERSION,
     });
@@ -185,6 +212,7 @@ where
         }
     }
 
+    verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
     artifacts.persist(&args.repo)?;
     persist_sync_state(&args.repo, state_tracker.last_pair())
 }
@@ -199,11 +227,16 @@ where
         args.credentials.display()
     );
 
-    let plan = PushPlan::load(&args.repo)?;
-    if plan.frames.is_empty() {
+    let config = HostConfig::load(&args.credentials)?;
+    let operations = load_local_operations(&args.repo, &config)?;
+    if operations.is_empty() {
         println!("No pending operations to push.");
         return Ok(());
     }
+
+    apply_operations_to_repo(&args.repo, &config, &operations)?;
+
+    let plan = PushPlan::from_operations(&operations)?;
 
     println!(
         "Dispatching {} operation{} across {} frame{}…",
@@ -395,8 +428,7 @@ struct PushPlan {
 }
 
 impl PushPlan {
-    fn load(repo_path: &Path) -> Result<Self, SharedError> {
-        let operations = load_local_operations(repo_path)?;
+    fn from_operations(operations: &[VaultJournalOperation]) -> Result<Self, SharedError> {
         if operations.is_empty() {
             return Ok(Self {
                 frames: Vec::new(),
@@ -414,7 +446,10 @@ impl PushPlan {
     }
 }
 
-fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, SharedError> {
+fn load_local_operations(
+    repo_path: &Path,
+    config: &HostConfig,
+) -> Result<Vec<VaultJournalOperation>, SharedError> {
     let path = operations_log_path(repo_path);
     let data = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -429,22 +464,33 @@ fn load_local_operations(repo_path: &Path) -> Result<Vec<JournalOperation>, Shar
         }
     };
 
-    decode_postcard_operations(data)
-}
-
-fn decode_postcard_operations(data: Vec<u8>) -> Result<Vec<JournalOperation>, SharedError> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
-    let operations = decode_journal_operations(&data)?;
-    Ok(operations)
+    match decode_postcard_operations(&data) {
+        Ok(operations) => Ok(operations),
+        Err(primary) => match decode_journal_operations(&data) {
+            Ok(device_ops) => {
+                let converted = convert_device_operations(repo_path, config, device_ops)?;
+                persist_host_operations(&path, &converted)?;
+                Ok(converted)
+            }
+            Err(_) => Err(SharedError::Transport(format!(
+                "failed to decode journal operations: {primary}"
+            ))),
+        },
+    }
+}
+
+fn decode_postcard_operations(data: &[u8]) -> Result<Vec<VaultJournalOperation>, postcard::Error> {
+    postcard_from_bytes(data)
 }
 
 fn migrate_legacy_operations(
     repo_path: &Path,
     new_path: &Path,
-) -> Result<Vec<JournalOperation>, SharedError> {
+) -> Result<Vec<VaultJournalOperation>, SharedError> {
     let legacy_path = legacy_operations_log_path(repo_path);
     let legacy_data = match fs::read(&legacy_path) {
         Ok(bytes) => bytes,
@@ -462,14 +508,19 @@ fn migrate_legacy_operations(
         return Ok(Vec::new());
     }
 
-    let operations: Vec<JournalOperation> = cbor_from_slice(&legacy_data).map_err(|err| {
+    let operations: Vec<VaultJournalOperation> = cbor_from_slice(&legacy_data).map_err(|err| {
         SharedError::Transport(format!(
             "failed to decode legacy local operations from '{}': {err}",
             legacy_path.display()
         ))
     })?;
 
-    let encoded = encode_journal_operations(&operations)?;
+    let encoded = postcard_to_allocvec(&operations).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to encode migrated operations for '{}': {err}",
+            new_path.display()
+        ))
+    })?;
     fs::write(new_path, &encoded).map_err(|err| {
         SharedError::Transport(format!(
             "failed to write migrated operations to '{}': {err}",
@@ -491,13 +542,290 @@ fn migrate_legacy_operations(
     Ok(operations)
 }
 
-fn build_push_frames(
-    operations: Vec<JournalOperation>,
-) -> Result<Vec<PushOperationsFrame>, SharedError> {
-    let mut frames: Vec<Vec<JournalOperation>> = Vec::new();
-    let mut current: Vec<JournalOperation> = Vec::new();
+enum LegacyConvertedOp {
+    Update(Uuid),
+    Add(Uuid),
+    Delete(Uuid),
+}
 
+fn convert_device_operations(
+    repo_path: &Path,
+    config: &HostConfig,
+    device_ops: Vec<DeviceJournalOperation>,
+) -> Result<Vec<VaultJournalOperation>, SharedError> {
+    if device_ops.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vault_key = config
+        .vault_key()
+        .ok_or_else(|| SharedError::Transport("vault key missing from credentials".into()))?;
+    let vault_path = repo_path.join(VAULT_FILE);
+    let encrypted = fs::read(&vault_path).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to read vault from '{}': {err}",
+            vault_path.display()
+        ))
+    })?;
+    let snapshot = decrypt_vault(&encrypted, &vault_key)?;
+
+    let mut pending_updates: Vec<(Uuid, EntryUpdate)> = Vec::new();
+    let mut sequence: Vec<LegacyConvertedOp> = Vec::new();
+
+    for operation in device_ops {
+        match operation {
+            DeviceJournalOperation::Add { entry_id } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                if pending_updates
+                    .iter()
+                    .any(|(existing, _)| existing == &id)
+                    && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
+                {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+                sequence.push(LegacyConvertedOp::Add(id));
+            }
+            DeviceJournalOperation::UpdateField {
+                entry_id,
+                field,
+                value_checksum,
+            } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                let entry = find_entry(&snapshot, &id)?;
+                let update = get_or_insert_update(&mut pending_updates, &id);
+                apply_field_update_from_entry(&id, entry, &field, value_checksum, update)?;
+                if !sequence.iter().any(
+                    |item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id),
+                ) {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+            }
+            DeviceJournalOperation::Delete { entry_id } => {
+                let id = parse_legacy_uuid(&entry_id)?;
+                if pending_updates
+                    .iter()
+                    .any(|(existing, _)| existing == &id)
+                    && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
+                {
+                    sequence.push(LegacyConvertedOp::Update(id));
+                }
+                sequence.push(LegacyConvertedOp::Delete(id));
+            }
+        }
+    }
+
+    let mut host_ops = Vec::new();
+    for item in sequence {
+        match item {
+            LegacyConvertedOp::Update(id) => {
+                if let Some(update) = take_pending_update(&mut pending_updates, &id) {
+                    host_ops.push(VaultJournalOperation::Update {
+                        id,
+                        changes: update,
+                    });
+                }
+            }
+            LegacyConvertedOp::Add(id) => {
+                let entry = find_entry(&snapshot, &id)?;
+                host_ops.push(VaultJournalOperation::Add {
+                    entry: entry.clone(),
+                });
+            }
+            LegacyConvertedOp::Delete(id) => {
+                if let Some(update) = take_pending_update(&mut pending_updates, &id) {
+                    host_ops.push(VaultJournalOperation::Update {
+                        id,
+                        changes: update,
+                    });
+                }
+                host_ops.push(VaultJournalOperation::Delete { id });
+            }
+        }
+    }
+
+    for (id, changes) in pending_updates.into_iter() {
+        if !entry_update_is_empty(&changes) {
+            host_ops.push(VaultJournalOperation::Update { id, changes });
+        }
+    }
+
+    Ok(host_ops)
+}
+
+fn persist_host_operations(
+    path: &Path,
+    operations: &[VaultJournalOperation],
+) -> Result<(), SharedError> {
+    let encoded = postcard_to_allocvec(operations).map_err(|err| {
+        SharedError::Transport(format!("failed to encode migrated operations: {err}"))
+    })?;
+    fs::write(path, encoded).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to write migrated operations to '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+fn parse_legacy_uuid(raw: &str) -> Result<Uuid, SharedError> {
+    Uuid::parse_str(raw).map_err(|err| {
+        SharedError::Transport(format!("invalid legacy entry identifier '{raw}': {err}"))
+    })
+}
+
+fn find_entry<'a>(snapshot: &'a VaultSnapshot, id: &Uuid) -> Result<&'a VaultEntry, SharedError> {
+    snapshot
+        .entries
+        .iter()
+        .find(|entry| &entry.id == id)
+        .ok_or_else(|| {
+            SharedError::Transport(format!("legacy operations reference unknown entry {id}"))
+        })
+}
+
+fn get_or_insert_update<'a>(
+    updates: &'a mut Vec<(Uuid, EntryUpdate)>,
+    id: &Uuid,
+) -> &'a mut EntryUpdate {
+    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
+        return &mut updates[position].1;
+    }
+
+    updates.push((*id, EntryUpdate::default()));
+    let last = updates
+        .last_mut()
+        .expect("pending updates missing newly inserted entry");
+    &mut last.1
+}
+
+fn take_pending_update(updates: &mut Vec<(Uuid, EntryUpdate)>, id: &Uuid) -> Option<EntryUpdate> {
+    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
+        let (_, update) = updates.remove(position);
+        if entry_update_is_empty(&update) {
+            None
+        } else {
+            Some(update)
+        }
+    } else {
+        None
+    }
+}
+
+fn entry_update_is_empty(update: &EntryUpdate) -> bool {
+    update.title.is_none()
+        && update.service.is_none()
+        && update.domains.is_none()
+        && update.username.is_none()
+        && update.password.is_none()
+        && update.totp.is_none()
+        && update.tags.is_none()
+        && update.r#macro.is_none()
+        && update.updated_at.is_none()
+        && update.used_at.is_none()
+}
+
+fn apply_field_update_from_entry(
+    id: &Uuid,
+    entry: &VaultEntry,
+    field: &str,
+    expected_checksum: u32,
+    update: &mut EntryUpdate,
+) -> Result<(), SharedError> {
+    match field {
+        "title" => {
+            verify_checksum(id, field, expected_checksum, entry.title.as_bytes())?;
+            update.title = Some(entry.title.clone());
+        }
+        "service" => {
+            verify_checksum(id, field, expected_checksum, entry.service.as_bytes())?;
+            update.service = Some(entry.service.clone());
+        }
+        "domains" => {
+            let encoded = cbor_to_vec(&entry.domains).map_err(|err| {
+                SharedError::Transport(format!("failed to encode domains for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.domains = Some(entry.domains.clone());
+        }
+        "username" => {
+            verify_checksum(id, field, expected_checksum, entry.username.as_bytes())?;
+            update.username = Some(entry.username.clone());
+        }
+        "password" => {
+            verify_checksum(id, field, expected_checksum, entry.password.as_bytes())?;
+            update.password = Some(entry.password.clone());
+        }
+        "totp" => {
+            let totp = entry.totp.as_ref().ok_or_else(|| {
+                SharedError::Transport(format!(
+                    "legacy operations reference missing TOTP configuration for entry {id}"
+                ))
+            })?;
+            let encoded = cbor_to_vec(totp).map_err(|err| {
+                SharedError::Transport(format!("failed to encode TOTP for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.totp = Some(totp.clone());
+        }
+        "tags" => {
+            let encoded = cbor_to_vec(&entry.tags).map_err(|err| {
+                SharedError::Transport(format!("failed to encode tags for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.tags = Some(entry.tags.clone());
+        }
+        "macro" => {
+            let value = entry.r#macro.as_ref().ok_or_else(|| {
+                SharedError::Transport(format!(
+                    "legacy operations reference missing macro for entry {id}"
+                ))
+            })?;
+            verify_checksum(id, field, expected_checksum, value.as_bytes())?;
+            update.r#macro = Some(value.clone());
+        }
+        "updated_at" => {
+            verify_checksum(id, field, expected_checksum, entry.updated_at.as_bytes())?;
+            update.updated_at = Some(entry.updated_at.clone());
+        }
+        "used_at" => {
+            let encoded = cbor_to_vec(&entry.used_at).map_err(|err| {
+                SharedError::Transport(format!("failed to encode used_at for entry {id}: {err}"))
+            })?;
+            verify_checksum(id, field, expected_checksum, &encoded)?;
+            update.used_at = Some(entry.used_at.clone());
+        }
+        other => {
+            return Err(SharedError::Transport(format!(
+                "unsupported legacy journal field '{other}' for entry {id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_checksum(id: &Uuid, field: &str, expected: u32, bytes: &[u8]) -> Result<(), SharedError> {
+    let actual = compute_crc32(bytes);
+    if actual != expected {
+        return Err(SharedError::Transport(format!(
+            "legacy journal checksum mismatch for field '{field}' in entry {id}"
+        )));
+    }
+    Ok(())
+}
+
+fn build_push_frames(
+    operations: &[VaultJournalOperation],
+) -> Result<Vec<PushOperationsFrame>, SharedError> {
+    let mut flattened: Vec<DeviceJournalOperation> = Vec::new();
     for operation in operations {
+        flattened.extend(operations_for_device(operation)?);
+    }
+
+    let mut frames: Vec<Vec<DeviceJournalOperation>> = Vec::new();
+    let mut current: Vec<DeviceJournalOperation> = Vec::new();
+
+    for operation in flattened {
         current.push(operation);
         let encoded_len = encode_journal_operations(&current)?.len();
         if encoded_len > PUSH_FRAME_MAX_PAYLOAD {
@@ -542,6 +870,96 @@ fn build_push_frames(
         .collect())
 }
 
+fn operations_for_device(
+    operation: &VaultJournalOperation,
+) -> Result<Vec<DeviceJournalOperation>, SharedError> {
+    match operation {
+        VaultJournalOperation::Add { entry } => Ok(vec![DeviceJournalOperation::Add {
+            entry_id: entry.id.to_string(),
+        }]),
+        VaultJournalOperation::Update { id, changes } => build_update_operations(id, changes),
+        VaultJournalOperation::Delete { id } => Ok(vec![DeviceJournalOperation::Delete {
+            entry_id: id.to_string(),
+        }]),
+    }
+}
+
+fn build_update_operations(
+    id: &Uuid,
+    changes: &EntryUpdate,
+) -> Result<Vec<DeviceJournalOperation>, SharedError> {
+    let entry_id = id.to_string();
+    let mut operations = Vec::new();
+
+    if let Some(value) = &changes.title {
+        push_update_bytes(&mut operations, &entry_id, "title", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.service {
+        push_update_bytes(&mut operations, &entry_id, "service", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.domains {
+        let encoded = cbor_to_vec(value).map_err(|err| {
+            SharedError::Transport(format!("failed to encode domains update: {err}"))
+        })?;
+        push_update_bytes(&mut operations, &entry_id, "domains", &encoded);
+    }
+
+    if let Some(value) = &changes.username {
+        push_update_bytes(&mut operations, &entry_id, "username", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.password {
+        push_update_bytes(&mut operations, &entry_id, "password", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.totp {
+        let encoded = cbor_to_vec(value).map_err(|err| {
+            SharedError::Transport(format!("failed to encode TOTP update: {err}"))
+        })?;
+        push_update_bytes(&mut operations, &entry_id, "totp", &encoded);
+    }
+
+    if let Some(value) = &changes.tags {
+        let encoded = cbor_to_vec(value).map_err(|err| {
+            SharedError::Transport(format!("failed to encode tags update: {err}"))
+        })?;
+        push_update_bytes(&mut operations, &entry_id, "tags", &encoded);
+    }
+
+    if let Some(value) = &changes.r#macro {
+        push_update_bytes(&mut operations, &entry_id, "macro", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.updated_at {
+        push_update_bytes(&mut operations, &entry_id, "updated_at", value.as_bytes());
+    }
+
+    if let Some(value) = &changes.used_at {
+        let encoded = cbor_to_vec(value).map_err(|err| {
+            SharedError::Transport(format!("failed to encode used_at update: {err}"))
+        })?;
+        push_update_bytes(&mut operations, &entry_id, "used_at", &encoded);
+    }
+
+    Ok(operations)
+}
+
+fn push_update_bytes(
+    operations: &mut Vec<DeviceJournalOperation>,
+    entry_id: &str,
+    field: &'static str,
+    bytes: &[u8],
+) {
+    let checksum = compute_crc32(bytes);
+    operations.push(DeviceJournalOperation::UpdateField {
+        entry_id: entry_id.to_owned(),
+        field: field.to_owned(),
+        value_checksum: checksum,
+    });
+}
+
 fn clear_local_operations(repo_path: &Path) -> Result<(), SharedError> {
     let path = operations_log_path(repo_path);
     match fs::remove_file(&path) {
@@ -562,12 +980,14 @@ fn legacy_operations_log_path(repo_path: &Path) -> PathBuf {
     repo_path.join(LEGACY_LOCAL_OPERATIONS_FILE)
 }
 
-fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
+fn compute_local_journal_checksum(operations: &[DeviceJournalOperation]) -> u32 {
     operations
         .iter()
         .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
-            JournalOperation::Add { entry_id } => accumulate_checksum(acc, entry_id.as_bytes()),
-            JournalOperation::UpdateField {
+            DeviceJournalOperation::Add { entry_id } => {
+                accumulate_checksum(acc, entry_id.as_bytes())
+            }
+            DeviceJournalOperation::UpdateField {
                 entry_id,
                 field,
                 value_checksum,
@@ -576,7 +996,7 @@ fn compute_local_journal_checksum(operations: &[JournalOperation]) -> u32 {
                 let updated = accumulate_checksum(updated, field.as_bytes());
                 updated ^ value_checksum
             }
-            JournalOperation::Delete { entry_id } => {
+            DeviceJournalOperation::Delete { entry_id } => {
                 accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
             }
         })
@@ -1324,6 +1744,393 @@ fn missing_cardputer_error(allow_any_port: bool) -> SharedError {
     SharedError::Transport(message)
 }
 
+fn load_verifying_key(
+    config: &HostConfig,
+    override_path: Option<&Path>,
+) -> Result<Option<VerifyingKey>, SharedError> {
+    if let Some(path) = override_path {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            SharedError::Transport(format!(
+                "failed to read verifying key from '{}': {err}",
+                path.display()
+            ))
+        })?;
+        let decoded = decode_key_bytes::<{ SIGNATURE_SIZE / 2 }>(raw.trim())?;
+        return VerifyingKey::from_bytes(&decoded)
+            .map(Some)
+            .map_err(|err| SharedError::Transport(format!("invalid verifying key: {err}")));
+    }
+
+    config.verifying_key()
+}
+
+fn verify_pulled_signature(
+    artifacts: &PullArtifacts,
+    repo: &Path,
+    verifying_key: Option<&VerifyingKey>,
+) -> Result<(), SharedError> {
+    if artifacts.vault.bytes.is_empty() || !artifacts.signature_expected {
+        return Ok(());
+    }
+
+    let key = verifying_key.ok_or_else(|| {
+        SharedError::Transport(
+            "signature verification requested but verifying key is missing".into(),
+        )
+    })?;
+
+    let signature_bytes = artifacts
+        .signature_bytes
+        .as_ref()
+        .ok_or_else(|| SharedError::Transport("vault signature missing from transfer".into()))?;
+
+    let array: [u8; SIGNATURE_SIZE] = signature_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| SharedError::Transport("invalid vault signature length".into()))?;
+    let signature = Signature::from_bytes(&array);
+
+    let recipients = if artifacts.recipients_seen {
+        Some(artifacts.recipients.bytes.as_slice())
+    } else {
+        None
+    };
+
+    let config_path = repo.join(CONFIG_FILE);
+    let config_bytes = if config_path.exists() {
+        Some(fs::read(&config_path).map_err(|err| {
+            SharedError::Transport(format!(
+                "failed to read config.json for signature verification: {err}"
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    let message =
+        compute_signature_message(&artifacts.vault.bytes, recipients, config_bytes.as_deref());
+
+    key.verify(&message, &signature).map_err(|err| {
+        SharedError::Transport(format!("vault signature verification failed: {err}"))
+    })
+}
+
+fn compute_signature_message(
+    vault: &[u8],
+    recipients: Option<&[u8]>,
+    config: Option<&[u8]>,
+) -> [u8; 32] {
+    fn append_component(hasher: &mut Hasher, label: &str, payload: Option<&[u8]>) {
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        if let Some(bytes) = payload {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        } else {
+            hasher.update(&0u64.to_le_bytes());
+        }
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(SIGNATURE_DOMAIN);
+    append_component(&mut hasher, VAULT_FILE, Some(vault));
+    append_component(&mut hasher, RECIPIENTS_FILE, recipients);
+    append_component(&mut hasher, CONFIG_FILE, config);
+    hasher.finalize().into()
+}
+
+fn apply_operations_to_repo(
+    repo: &Path,
+    config: &HostConfig,
+    operations: &[VaultJournalOperation],
+) -> Result<(), SharedError> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+
+    let vault_key = config
+        .vault_key()
+        .ok_or_else(|| SharedError::Transport("vault key missing from credentials".into()))?;
+
+    let vault_path = repo.join(VAULT_FILE);
+    let encrypted = fs::read(&vault_path).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to read vault from '{}': {err}",
+            vault_path.display()
+        ))
+    })?;
+
+    let mut snapshot = decrypt_vault(&encrypted, &vault_key)?;
+    apply_vault_operations(&mut snapshot, operations)?;
+
+    let mut rng = OsRng;
+    let encrypted_vault = encrypt_vault_with_rng(&snapshot, &vault_key, &mut rng)?;
+    fs::write(&vault_path, &encrypted_vault).map_err(|err| {
+        SharedError::Transport(format!(
+            "failed to write updated vault to '{}': {err}",
+            vault_path.display()
+        ))
+    })?;
+
+    let recipients_path = repo.join(RECIPIENTS_FILE);
+    let recipients = if recipients_path.exists() {
+        Some(fs::read(&recipients_path).map_err(|err| {
+            SharedError::Transport(format!(
+                "failed to read recipients manifest from '{}': {err}",
+                recipients_path.display()
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    let config_path = repo.join(CONFIG_FILE);
+    let config_bytes = if config_path.exists() {
+        Some(fs::read(&config_path).map_err(|err| {
+            SharedError::Transport(format!(
+                "failed to read config.json from '{}': {err}",
+                config_path.display()
+            ))
+        })?)
+    } else {
+        None
+    };
+
+    let signing_key = config
+        .signing_key()?
+        .ok_or_else(|| SharedError::Transport("signing key missing from credentials".into()))?;
+
+    let message = compute_signature_message(
+        &encrypted_vault,
+        recipients.as_deref(),
+        config_bytes.as_deref(),
+    );
+    let signature = signing_key.sign(&message);
+
+    let signature_path = repo.join(SIGNATURE_FILE);
+    fs::write(signature_path, signature.to_bytes())
+        .map_err(|err| SharedError::Transport(format!("failed to write vault signature: {err}")))?;
+
+    Ok(())
+}
+
+fn apply_vault_operations(
+    snapshot: &mut VaultSnapshot,
+    operations: &[VaultJournalOperation],
+) -> Result<(), SharedError> {
+    for operation in operations {
+        match operation {
+            VaultJournalOperation::Add { entry } => {
+                snapshot.entries.retain(|existing| existing.id != entry.id);
+                snapshot.entries.push(entry.clone());
+            }
+            VaultJournalOperation::Update { id, changes } => {
+                let entry = snapshot
+                    .entries
+                    .iter_mut()
+                    .find(|item| &item.id == id)
+                    .ok_or_else(|| {
+                        SharedError::Transport(format!("cannot update unknown entry {}", id))
+                    })?;
+                apply_entry_update(entry, changes);
+            }
+            VaultJournalOperation::Delete { id } => {
+                let before = snapshot.entries.len();
+                snapshot.entries.retain(|entry| &entry.id != id);
+                if snapshot.entries.len() == before {
+                    return Err(SharedError::Transport(format!(
+                        "cannot delete unknown entry {}",
+                        id
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_entry_update(entry: &mut VaultEntry, update: &EntryUpdate) {
+    if let Some(value) = &update.title {
+        entry.title = value.clone();
+    }
+
+    if let Some(value) = &update.service {
+        entry.service = value.clone();
+    }
+
+    if let Some(value) = &update.domains {
+        entry.domains = value.clone();
+    }
+
+    if let Some(value) = &update.username {
+        entry.username = value.clone();
+    }
+
+    if let Some(value) = &update.password {
+        entry.password = value.clone();
+    }
+
+    if let Some(value) = &update.totp {
+        entry.totp = Some(value.clone());
+    }
+
+    if let Some(value) = &update.tags {
+        entry.tags = value.clone();
+    }
+
+    if let Some(value) = &update.r#macro {
+        entry.r#macro = Some(value.clone());
+    }
+
+    if let Some(value) = &update.updated_at {
+        entry.updated_at = value.clone();
+    }
+
+    if let Some(value) = &update.used_at {
+        entry.used_at = value.clone();
+    }
+}
+
+fn decrypt_vault(data: &[u8], key: &[u8; 32]) -> Result<VaultSnapshot, SharedError> {
+    if data.len() < VAULT_NONCE_SIZE {
+        return Err(SharedError::Transport(
+            "vault payload too small to contain nonce".into(),
+        ));
+    }
+
+    let (nonce_bytes, ciphertext) = data.split_at(VAULT_NONCE_SIZE);
+    let nonce: [u8; VAULT_NONCE_SIZE] = nonce_bytes
+        .try_into()
+        .expect("nonce slice has fixed length");
+
+    let cipher = PageCipher::chacha20_poly1305(*key);
+    let plaintext = cipher
+        .decrypt(&nonce, VAULT_AAD, ciphertext)
+        .map_err(|err| SharedError::Transport(format!("failed to decrypt vault: {err}")))?;
+
+    cbor_from_slice(&plaintext)
+        .map_err(|err| SharedError::Transport(format!("invalid vault format: {err}")))
+}
+
+fn encrypt_vault_with_rng<R>(
+    snapshot: &VaultSnapshot,
+    key: &[u8; 32],
+    rng: &mut R,
+) -> Result<Vec<u8>, SharedError>
+where
+    R: RngCore + CryptoRng,
+{
+    let plaintext = cbor_to_vec(snapshot)
+        .map_err(|err| SharedError::Transport(format!("failed to encode vault snapshot: {err}")))?;
+    let cipher = PageCipher::chacha20_poly1305(*key);
+    let mut nonce = [0u8; VAULT_NONCE_SIZE];
+    rng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(&nonce, VAULT_AAD, &plaintext)
+        .map_err(|err| SharedError::Transport(format!("failed to encrypt vault: {err}")))?;
+
+    let mut buffer = Vec::with_capacity(VAULT_NONCE_SIZE + ciphertext.len());
+    buffer.extend_from_slice(&nonce);
+    buffer.extend_from_slice(&ciphertext);
+    Ok(buffer)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VaultSnapshot {
+    version: u16,
+    metadata: VaultMetadata,
+    entries: Vec<VaultEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct HostConfig {
+    #[serde(default)]
+    signing_public_key: Option<String>,
+    #[serde(default)]
+    signing_secret_key: Option<String>,
+    #[serde(default)]
+    vault_key: Option<String>,
+}
+
+impl HostConfig {
+    fn load(path: &Path) -> Result<Self, SharedError> {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            SharedError::Transport(format!(
+                "failed to read credentials from '{}': {err}",
+                path.display()
+            ))
+        })?;
+        json_from_str(&raw)
+            .map_err(|err| SharedError::Transport(format!("invalid credentials file: {err}")))
+    }
+
+    fn verifying_key(&self) -> Result<Option<VerifyingKey>, SharedError> {
+        if let Some(public) = &self.signing_public_key {
+            let bytes = decode_key_bytes::<{ SIGNATURE_SIZE / 2 }>(public)?;
+            return VerifyingKey::from_bytes(&bytes)
+                .map(Some)
+                .map_err(|err| SharedError::Transport(format!("invalid verifying key: {err}")));
+        }
+
+        if let Some(secret) = &self.signing_secret_key {
+            let seed = decode_key_bytes::<{ SIGNATURE_SIZE / 2 }>(secret)?;
+            let signing = SigningKey::from_bytes(&seed);
+            return Ok(Some(signing.verifying_key()));
+        }
+
+        Ok(None)
+    }
+
+    fn signing_key(&self) -> Result<Option<SigningKey>, SharedError> {
+        match &self.signing_secret_key {
+            Some(secret) => {
+                let seed = decode_key_bytes::<{ SIGNATURE_SIZE / 2 }>(secret)?;
+                Ok(Some(SigningKey::from_bytes(&seed)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn vault_key(&self) -> Option<[u8; 32]> {
+        self.vault_key
+            .as_deref()
+            .and_then(|value| decode_key_bytes::<32>(value).ok())
+    }
+}
+
+fn decode_key_bytes<const N: usize>(input: &str) -> Result<[u8; N], SharedError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(SharedError::Transport("key material is empty".into()));
+    }
+
+    match Base64.decode(trimmed.as_bytes()) {
+        Ok(bytes) if bytes.len() == N => bytes
+            .try_into()
+            .map_err(|_| SharedError::Transport("failed to read fixed-length key material".into())),
+        Ok(bytes) => Err(SharedError::Transport(format!(
+            "expected {N} decoded bytes but got {}",
+            bytes.len()
+        ))),
+        Err(_) => {
+            let hex_bytes = hex_decode(trimmed).map_err(|err| {
+                SharedError::Transport(format!("failed to decode key material: {err}"))
+            })?;
+            if hex_bytes.len() != N {
+                Err(SharedError::Transport(format!(
+                    "expected {N} decoded bytes but got {}",
+                    hex_bytes.len()
+                )))
+            } else {
+                hex_bytes.try_into().map_err(|_| {
+                    SharedError::Transport("failed to read fixed-length key material".into())
+                })
+            }
+        }
+    }
+}
+
 fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
     move |err| {
         let mut message = format!("{context} failed: {err}");
@@ -1337,15 +2144,109 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD as Base64};
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+    use serde_json::{Map, json};
     use shared::schema::{
         DeviceErrorCode, NackResponse, decode_host_request, encode_device_response,
         encode_host_request,
     };
+    use shared::vault::SecretString;
     use std::fs;
     use std::io::Cursor;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     const SIGNATURE_SIZE: usize = 64;
+    const TEST_SIGNING_SEED: [u8; 32] = [0x21; 32];
+    const TEST_VAULT_KEY: [u8; 32] = [0x34; 32];
+
+    fn write_empty_credentials(path: &Path) {
+        fs::write(path, json!({}).to_string()).expect("write empty credentials");
+    }
+
+    fn write_credentials_with_keys(
+        path: &Path,
+        include_secret: bool,
+        include_vault: bool,
+    ) -> SigningKey {
+        let signing = SigningKey::from_bytes(&TEST_SIGNING_SEED);
+        let verifying = signing.verifying_key();
+        let mut content = Map::new();
+        content.insert(
+            "signing_public_key".into(),
+            json!(Base64.encode(verifying.to_bytes())),
+        );
+        if include_secret {
+            content.insert(
+                "signing_secret_key".into(),
+                json!(Base64.encode(signing.to_bytes())),
+            );
+        }
+        if include_vault {
+            content.insert("vault_key".into(), json!(Base64.encode(TEST_VAULT_KEY)));
+        }
+        fs::write(path, serde_json::Value::Object(content).to_string()).expect("write credentials");
+        signing
+    }
+
+    fn deterministic_rng() -> ChaCha20Rng {
+        ChaCha20Rng::from_seed([0xAA; 32])
+    }
+
+    fn write_encrypted_vault(repo: &Path, snapshot: &VaultSnapshot) {
+        let mut rng = deterministic_rng();
+        let encrypted =
+            encrypt_vault_with_rng(snapshot, &TEST_VAULT_KEY, &mut rng).expect("encrypt vault");
+        let path = repo.join(VAULT_FILE);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create vault directory");
+        }
+        fs::write(path, encrypted).expect("write vault");
+    }
+
+    fn sample_metadata() -> VaultMetadata {
+        VaultMetadata {
+            generation: 1,
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn sample_entry(id: Uuid, title: &str) -> VaultEntry {
+        VaultEntry {
+            id,
+            title: title.into(),
+            service: "service".into(),
+            domains: vec![],
+            username: "user".into(),
+            password: SecretString::from("password"),
+            totp: None,
+            tags: vec![],
+            r#macro: None,
+            updated_at: "2024-01-01T00:00:00Z".into(),
+            used_at: None,
+        }
+    }
+
+    fn sample_snapshot(entries: Vec<VaultEntry>) -> VaultSnapshot {
+        VaultSnapshot {
+            version: 1,
+            metadata: sample_metadata(),
+            entries,
+        }
+    }
+
+    fn sign_artifacts(
+        signing: &SigningKey,
+        vault: &[u8],
+        recipients: Option<&[u8]>,
+        config: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let message = compute_signature_message(vault, recipients, config);
+        signing.sign(&message).to_bytes().to_vec()
+    }
 
     fn usb_port(
         name: &str,
@@ -1603,8 +2504,10 @@ mod tests {
         let args = RepoArgs {
             repo: temp.path().to_path_buf(),
             credentials: temp.path().join("creds"),
+            signing_pubkey: None,
         };
 
+        write_empty_credentials(&args.credentials);
         execute_pull(&mut port, &args).expect("pull succeeds");
 
         let mut reader = Cursor::new(port.writes);
@@ -1676,8 +2579,10 @@ mod tests {
         let args = RepoArgs {
             repo: temp.path().join("nested/repo"),
             credentials: temp.path().join("creds"),
+            signing_pubkey: None,
         };
 
+        write_empty_credentials(&args.credentials);
         execute_pull(&mut port, &args).expect("pull succeeds");
 
         let vault_path = args.repo.join("vault.enc");
@@ -1692,6 +2597,18 @@ mod tests {
 
     #[test]
     fn pull_persists_vault_and_recipients_chunks_to_files() {
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("combined/repo"),
+            credentials: temp.path().join("creds"),
+            signing_pubkey: None,
+        };
+
+        let signing = write_credentials_with_keys(&args.credentials, false, false);
+        let vault_payload = vec![9, 8, 7, 6, 5];
+        let recipients_payload = br#"{"recipients":[]}"#.to_vec();
+        let signature = sign_artifacts(&signing, &vault_payload, Some(&recipients_payload), None);
+
         let responses = [
             encode_response(DeviceResponse::Head(PullHeadResponse {
                 protocol_version: PROTOCOL_VERSION,
@@ -1703,10 +2620,10 @@ mod tests {
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 1,
-                total_size: 5,
+                total_size: vault_payload.len() as u64,
                 remaining_bytes: 0,
                 device_chunk_size: MAX_CHUNK_SIZE,
-                data: vec![9, 8, 7, 6, 5],
+                data: vault_payload.clone(),
                 checksum: 0x0BAD_F00D,
                 is_last: true,
                 artifact: VaultArtifact::Vault,
@@ -1714,10 +2631,10 @@ mod tests {
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
                 sequence: 2,
-                total_size: 17,
+                total_size: recipients_payload.len() as u64,
                 remaining_bytes: 0,
                 device_chunk_size: MAX_CHUNK_SIZE,
-                data: br#"{"recipients":[]}"#.to_vec(),
+                data: recipients_payload.clone(),
                 checksum: 0x0D15_EA5E,
                 is_last: true,
                 artifact: VaultArtifact::Recipients,
@@ -1728,7 +2645,7 @@ mod tests {
                 total_size: SIGNATURE_SIZE as u64,
                 remaining_bytes: 0,
                 device_chunk_size: MAX_CHUNK_SIZE,
-                data: vec![0x55; SIGNATURE_SIZE],
+                data: signature.clone(),
                 checksum: 0x1234_5678,
                 is_last: true,
                 artifact: VaultArtifact::Signature,
@@ -1737,11 +2654,6 @@ mod tests {
         .concat();
 
         let mut port = MockPort::new(responses);
-        let temp = tempdir().expect("tempdir");
-        let args = RepoArgs {
-            repo: temp.path().join("combined/repo"),
-            credentials: temp.path().join("creds"),
-        };
 
         execute_pull(&mut port, &args).expect("pull succeeds");
 
@@ -1773,14 +2685,140 @@ mod tests {
 
         let vault_path = args.repo.join("vault.enc");
         let vault_content = fs::read(&vault_path).expect("vault file");
-        assert_eq!(vault_content, vec![9, 8, 7, 6, 5]);
+        assert_eq!(vault_content, vault_payload);
 
         let recipients_path = args.repo.join("recips.json");
         let recipients_content = fs::read(&recipients_path).expect("recipients file");
-        assert_eq!(recipients_content, br#"{"recipients":[]}"#.to_vec());
+        assert_eq!(recipients_content, recipients_payload);
         let signature_path = args.repo.join("vault.sig");
         let signature_content = fs::read(&signature_path).expect("signature file");
-        assert_eq!(signature_content, vec![0x55; SIGNATURE_SIZE]);
+        assert_eq!(signature_content, signature);
+    }
+
+    #[test]
+    fn pull_errors_when_signature_expected_without_verifying_key() {
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("missing-key/repo"),
+            credentials: temp.path().join("creds"),
+            signing_pubkey: None,
+        };
+
+        write_empty_credentials(&args.credentials);
+        let signing = SigningKey::from_bytes(&TEST_SIGNING_SEED);
+        let vault_payload = vec![1, 2, 3, 4];
+        let signature = sign_artifacts(&signing, &vault_payload, None, None);
+
+        let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 4,
+                vault_hash: [0x55; 32],
+                recipients_hash: [0u8; 32],
+                signature_hash: [0x77; 32],
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: vault_payload.len() as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vault_payload.clone(),
+                checksum: 0x0BAD_F00D,
+                is_last: true,
+                artifact: VaultArtifact::Vault,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: SIGNATURE_SIZE as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: signature,
+                checksum: 0x1234_5678,
+                is_last: true,
+                artifact: VaultArtifact::Signature,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let err = execute_pull(&mut port, &args).expect_err("pull should fail");
+
+        match err {
+            SharedError::Transport(message) => {
+                assert!(message.contains("verifying key is missing"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        assert!(
+            !args.repo.join(VAULT_FILE).exists(),
+            "vault should not be persisted on failure",
+        );
+    }
+
+    #[test]
+    fn pull_errors_when_signature_verification_fails() {
+        let temp = tempdir().expect("tempdir");
+        let args = RepoArgs {
+            repo: temp.path().join("bad-signature/repo"),
+            credentials: temp.path().join("creds"),
+            signing_pubkey: None,
+        };
+
+        let signing = write_credentials_with_keys(&args.credentials, false, false);
+        let vault_payload = vec![4, 3, 2, 1];
+        let mut signature = sign_artifacts(&signing, &vault_payload, None, None);
+        signature[0] ^= 0xFF;
+
+        let responses = [
+            encode_response(DeviceResponse::Head(PullHeadResponse {
+                protocol_version: PROTOCOL_VERSION,
+                vault_generation: 9,
+                vault_hash: [0x66; 32],
+                recipients_hash: [0u8; 32],
+                signature_hash: [0x88; 32],
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                total_size: vault_payload.len() as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vault_payload.clone(),
+                checksum: 0xFACE_CAFE,
+                is_last: true,
+                artifact: VaultArtifact::Vault,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                total_size: SIGNATURE_SIZE as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: signature,
+                checksum: 0x1357_9BDF,
+                is_last: true,
+                artifact: VaultArtifact::Signature,
+            })),
+        ]
+        .concat();
+
+        let mut port = MockPort::new(responses);
+        let err = execute_pull(&mut port, &args).expect_err("pull should fail");
+
+        match err {
+            SharedError::Transport(message) => {
+                assert!(message.contains("vault signature verification failed"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        assert!(
+            !args.repo.join(VAULT_FILE).exists(),
+            "vault should not be persisted on failure",
+        );
     }
 
     #[test]
@@ -1836,8 +2874,10 @@ mod tests {
         let args = RepoArgs {
             repo: temp.path().join("multi/recipients"),
             credentials: temp.path().join("creds"),
+            signing_pubkey: None,
         };
 
+        write_empty_credentials(&args.credentials);
         execute_pull(&mut port, &args).expect("pull succeeds");
 
         let mut reader = Cursor::new(port.writes);
@@ -1901,19 +2941,29 @@ mod tests {
         let args = RepoArgs {
             repo: temp.path().to_path_buf(),
             credentials: temp.path().join("creds"),
+            signing_pubkey: None,
         };
 
-        let operations = vec![
-            JournalOperation::Add {
-                entry_id: String::from("entry-1"),
+        let signing = write_credentials_with_keys(&args.credentials, true, true);
+
+        let base_entry = sample_entry(Uuid::new_v4(), "existing");
+        let initial_snapshot = sample_snapshot(vec![base_entry.clone()]);
+        write_encrypted_vault(&args.repo, &initial_snapshot);
+
+        let new_entry = sample_entry(Uuid::new_v4(), "added");
+        let host_operations = vec![
+            VaultJournalOperation::Add {
+                entry: new_entry.clone(),
             },
-            JournalOperation::UpdateField {
-                entry_id: String::from("entry-1"),
-                field: String::from("username"),
-                value_checksum: 0x1234_5678,
+            VaultJournalOperation::Update {
+                id: base_entry.id,
+                changes: EntryUpdate {
+                    username: Some("updated".into()),
+                    ..EntryUpdate::default()
+                },
             },
         ];
-        let encoded_ops = encode_journal_operations(&operations).expect("encode operations");
+        let encoded_ops = postcard_to_allocvec(&host_operations).expect("encode operations");
         fs::write(operations_log_path(&args.repo), &encoded_ops).expect("write operations");
 
         let ack_response = encode_response(DeviceResponse::Ack(AckResponse {
@@ -1933,7 +2983,11 @@ mod tests {
             HostRequest::PushOps(frame) => {
                 assert_eq!(frame.sequence, 1);
                 assert!(frame.is_last);
-                assert_eq!(frame.operations, operations);
+                let mut expected = Vec::new();
+                for op in &host_operations {
+                    expected.extend(operations_for_device(op).expect("flatten host ops"));
+                }
+                assert_eq!(frame.operations, expected);
                 assert_eq!(
                     frame.checksum,
                     compute_local_journal_checksum(&frame.operations)
@@ -1945,13 +2999,97 @@ mod tests {
         assert_eq!(
             reader.position(),
             reader.get_ref().len() as u64,
-            "expected exactly one push frame"
+            "expected exactly one push frame",
         );
 
         assert!(
             !operations_log_path(&args.repo).exists(),
-            "operations file should be cleared after push"
+            "operations file should be cleared after push",
         );
+
+        let vault_path = args.repo.join(VAULT_FILE);
+        let encrypted_vault = fs::read(&vault_path).expect("encrypted vault");
+        let snapshot = decrypt_vault(&encrypted_vault, &TEST_VAULT_KEY).expect("decrypt vault");
+
+        let added = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == new_entry.id)
+            .expect("added entry persisted");
+        assert_eq!(added.title, new_entry.title);
+        assert_eq!(added.username, new_entry.username);
+
+        let updated = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == base_entry.id)
+            .expect("updated entry present");
+        assert_eq!(updated.username, "updated");
+
+        let signature_path = args.repo.join(SIGNATURE_FILE);
+        let signature_bytes = fs::read(&signature_path).expect("signature file");
+        assert_eq!(signature_bytes.len(), SIGNATURE_SIZE);
+        let signature_array: [u8; SIGNATURE_SIZE] = signature_bytes
+            .as_slice()
+            .try_into()
+            .expect("signature length");
+        let signature = Signature::from_bytes(&signature_array);
+        let message = compute_signature_message(&encrypted_vault, None, None);
+        signing
+            .verifying_key()
+            .verify(&message, &signature)
+            .expect("signature verifies");
+    }
+
+    #[test]
+    fn load_local_operations_migrates_device_format() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path();
+        let credentials = repo.join("creds.json");
+        write_credentials_with_keys(&credentials, true, true);
+
+        let existing_id = Uuid::new_v4();
+        let mut updated_entry = sample_entry(existing_id, "existing");
+        updated_entry.username = "updated-user".into();
+        updated_entry.tags = vec!["tag".into()];
+        updated_entry.updated_at = "2024-02-01T00:00:00Z".into();
+
+        let new_entry = sample_entry(Uuid::new_v4(), "added");
+        let snapshot = sample_snapshot(vec![updated_entry.clone(), new_entry.clone()]);
+        write_encrypted_vault(repo, &snapshot);
+
+        let host_operations = vec![
+            VaultJournalOperation::Update {
+                id: existing_id,
+                changes: EntryUpdate {
+                    username: Some(updated_entry.username.clone()),
+                    tags: Some(updated_entry.tags.clone()),
+                    updated_at: Some(updated_entry.updated_at.clone()),
+                    ..EntryUpdate::default()
+                },
+            },
+            VaultJournalOperation::Add {
+                entry: new_entry.clone(),
+            },
+        ];
+
+        let mut device_operations = Vec::new();
+        for operation in &host_operations {
+            device_operations.extend(operations_for_device(operation).expect("flatten host ops"));
+        }
+
+        let encoded_device =
+            encode_journal_operations(&device_operations).expect("encode device ops");
+        fs::write(operations_log_path(repo), &encoded_device).expect("write legacy operations");
+
+        let config = HostConfig::load(&credentials).expect("load config");
+        let loaded = load_local_operations(repo, &config).expect("load migrated operations");
+        assert_eq!(loaded, host_operations);
+
+        let rewritten = fs::read(operations_log_path(repo)).expect("read rewritten operations");
+        let decoded: Vec<VaultJournalOperation> =
+            postcard_from_bytes(&rewritten).expect("decode rewritten operations");
+        assert_eq!(decoded, host_operations);
     }
 
     #[test]
@@ -1980,8 +3118,10 @@ mod tests {
         let args = RepoArgs {
             repo: temp.path().to_path_buf(),
             credentials: temp.path().join("creds"),
+            signing_pubkey: None,
         };
 
+        write_empty_credentials(&args.credentials);
         {
             let mut port = MockPort::new(pull_responses);
             execute_pull(&mut port, &args).expect("pull succeeds");

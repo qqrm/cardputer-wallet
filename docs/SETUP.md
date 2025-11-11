@@ -61,6 +61,35 @@ Running `cardputer pull` after these steps now persists three artifacts inside t
 
 During a push the firmware verifies the detached signature against its built-in Ed25519 public key before accepting the new
 vault or recipients manifest.
+## Host CLI credentials and signatures
+
+The host CLI validates every signed vault snapshot before writing it to disk. When the device advertises a signature but no verifying key is available locally, `cardputer pull` aborts rather than persisting unverifiable data. Provide the verifying key either in the credentials JSON or via the `--signing-pubkey` flag before invoking pull operations.
+
+### Creating a credentials file
+
+Create a JSON file (referenced by the `--credentials` flag) that contains the host-side secrets encoded as base64 (hex encoding is also accepted):
+
+```json
+{
+  "signing_public_key": "<base64 Ed25519 verifying key>",
+  "signing_secret_key": "<base64 Ed25519 seed>",
+  "vault_key": "<base64 32-byte ChaCha20 key>"
+}
+```
+
+- `signing_public_key` (32 bytes) allows the CLI to verify signatures during `cardputer pull`.
+- `signing_secret_key` (32-byte seed) is required for `cardputer push` so the host can mint a fresh signature after rewriting the vault. Omit this field on pull-only hosts.
+- `vault_key` (32 bytes) is required for `cardputer push` to decrypt the existing vault, apply pending journal operations, and produce a re-encrypted image.
+
+### Verifying vault signatures
+
+After a pull completes, the CLI emits `vault.sig` alongside `vault.enc` (and `recips.json` if the device supplied one). To manually audit the signature:
+
+1. Decode the verifying key from the credentials file (or the `--signing-pubkey` override).
+2. Compute the BLAKE3 digest for the signature domain `cardputer.vault.signature.v1`, sequentially hashing the filenames (`vault.enc`, `recips.json`, `config.json`) together with their lengths and contents. This is the same message the CLI prepares via the internal `compute_signature_message` helper.
+3. Verify the Ed25519 signature in `vault.sig` against the digest using the verifying key. Any Ed25519 tooling (`ed25519-dalek`, `age-plugin`, etc.) can perform this check.
+
+`cardputer push` re-encrypts the vault with the supplied `vault_key`, applies local operations, and signs the resulting snapshot with `signing_secret_key` before uploading frames back to the device. Both keys must therefore be present whenever a push is attempted.
 
 ## Reproducing the CI workflow locally
 
