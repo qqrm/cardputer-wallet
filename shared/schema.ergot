@@ -171,6 +171,8 @@ pub struct PullHeadResponse {
     pub vault_hash: [u8; 32],
     /// Hash of the recipients manifest associated with the vault.
     pub recipients_hash: [u8; 32],
+    /// Hash of the detached signature protecting the vault artefacts.
+    pub signature_hash: [u8; 32],
 }
 
 /// Metadata accompanying the host request to pull the vault from the device.
@@ -252,6 +254,8 @@ pub enum VaultArtifact {
     Vault,
     /// Manifest that enumerates recipients allowed to unlock the vault.
     Recipients,
+    /// Detached Ed25519 signature covering the encrypted vault and manifest.
+    Signature,
 }
 
 /// Chunk of the encrypted vault payload streamed to the host.

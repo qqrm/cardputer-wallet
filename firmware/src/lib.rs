@@ -100,14 +100,18 @@ pub const FRAME_MAX_SIZE: usize = 4096;
 const VAULT_BUFFER_CAPACITY: usize = 64 * 1024;
 /// Capacity provisioned for the recipients manifest buffer.
 const RECIPIENTS_BUFFER_CAPACITY: usize = 4 * 1024;
+/// Capacity provisioned for the detached signature buffer.
+const SIGNATURE_BUFFER_CAPACITY: usize = 64;
 /// Scratch buffer used when interacting with sequential storage.
-const STORAGE_DATA_BUFFER_CAPACITY: usize = VAULT_BUFFER_CAPACITY + 64;
+const STORAGE_DATA_BUFFER_CAPACITY: usize =
+    VAULT_BUFFER_CAPACITY + RECIPIENTS_BUFFER_CAPACITY + SIGNATURE_BUFFER_CAPACITY;
 
 const STORAGE_KEY_VAULT: u8 = 0x01;
 const STORAGE_KEY_RECIPIENTS: u8 = 0x02;
 const STORAGE_KEY_JOURNAL: u8 = 0x03;
 const STORAGE_KEY_GENERATION: u8 = 0x04;
 const STORAGE_KEY_VAULT_KEYS: u8 = 0x05;
+const STORAGE_KEY_SIGNATURE: u8 = 0x06;
 
 const SCRYPT_LOG_N: u8 = 14;
 const SCRYPT_R: u32 = 8;
@@ -866,6 +870,7 @@ impl CryptoMaterial {
 enum TransferStage {
     Vault,
     Recipients,
+    Signature,
     Complete,
 }
 
@@ -878,6 +883,8 @@ pub struct SyncContext {
     vault_offset: usize,
     recipients_offset: usize,
     recipients_manifest: Zeroizing<Vec<u8>>,
+    signature_offset: usize,
+    signature: Zeroizing<Vec<u8>>,
     transfer_stage: TransferStage,
     last_artifact: VaultArtifact,
     crypto: CryptoMaterial,
@@ -906,6 +913,8 @@ impl SyncContext {
             vault_offset: 0,
             recipients_offset: 0,
             recipients_manifest: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
+            signature_offset: 0,
+            signature: Zeroizing::new(Vec::with_capacity(SIGNATURE_BUFFER_CAPACITY)),
             transfer_stage: TransferStage::Vault,
             last_artifact: VaultArtifact::Vault,
             crypto: CryptoMaterial::default(),
@@ -963,6 +972,29 @@ impl SyncContext {
             ) {
                 Ok(blob) => {
                     self.recipients_manifest = blob;
+                }
+                Err(err) => {
+                    self.vault_image = Zeroizing::new(Vec::new());
+                    self.vault_offset = 0;
+                    return Err(err);
+                }
+            }
+        }
+
+        self.signature = Zeroizing::new(Vec::new());
+        if let Some(signature) = map::fetch_item::<u8, Vec<u8>, _>(
+            flash,
+            range.clone(),
+            &mut cache,
+            scratch.as_mut_slice(),
+            &STORAGE_KEY_SIGNATURE,
+        )
+        .await
+        .map_err(StorageError::Flash)?
+        {
+            match Self::validate_signature_blob::<S::Error>(signature) {
+                Ok(blob) => {
+                    self.signature = blob;
                 }
                 Err(err) => {
                     self.vault_image = Zeroizing::new(Vec::new());
@@ -1035,6 +1067,26 @@ impl SyncContext {
                 "{label} exceeds capacity ({} > {})",
                 data.len(),
                 capacity
+            )));
+        }
+
+        Ok(Zeroizing::new(data))
+    }
+
+    fn validate_signature_blob<E>(data: Vec<u8>) -> Result<Zeroizing<Vec<u8>>, StorageError<E>> {
+        if data.len() > SIGNATURE_BUFFER_CAPACITY {
+            return Err(StorageError::Decode(format!(
+                "signature exceeds capacity ({} > {})",
+                data.len(),
+                SIGNATURE_BUFFER_CAPACITY
+            )));
+        }
+
+        if !(data.is_empty() || data.len() == SIGNATURE_BUFFER_CAPACITY) {
+            return Err(StorageError::Decode(format!(
+                "signature must be exactly {} bytes when present (found {})",
+                SIGNATURE_BUFFER_CAPACITY,
+                data.len()
             )));
         }
 
@@ -1129,6 +1181,9 @@ impl SyncContext {
             .for_each(|byte| *byte = 0);
         self.recipients_manifest.clear();
 
+        self.signature.iter_mut().for_each(|byte| *byte = 0);
+        self.signature.clear();
+
         self.crypto.wipe();
         self.reset_transfer_state();
         self.pending_sequence = None;
@@ -1158,18 +1213,29 @@ impl SyncContext {
     fn reset_transfer_state(&mut self) {
         self.vault_offset = 0;
         self.recipients_offset = 0;
-        self.transfer_stage = if self.vault_image.is_empty() {
-            if self.recipients_manifest.is_empty() {
-                TransferStage::Complete
-            } else {
-                TransferStage::Recipients
-            }
-        } else {
+        self.signature_offset = 0;
+        self.transfer_stage = if !self.vault_image.is_empty() {
             TransferStage::Vault
+        } else if !self.recipients_manifest.is_empty() {
+            TransferStage::Recipients
+        } else if !self.signature.is_empty() {
+            TransferStage::Signature
+        } else {
+            TransferStage::Complete
         };
         self.last_artifact = match self.transfer_stage {
+            TransferStage::Vault => VaultArtifact::Vault,
             TransferStage::Recipients => VaultArtifact::Recipients,
-            _ => VaultArtifact::Vault,
+            TransferStage::Signature => VaultArtifact::Signature,
+            TransferStage::Complete => {
+                if !self.signature.is_empty() {
+                    VaultArtifact::Signature
+                } else if !self.recipients_manifest.is_empty() {
+                    VaultArtifact::Recipients
+                } else {
+                    VaultArtifact::Vault
+                }
+            }
         };
     }
 
@@ -1188,6 +1254,7 @@ impl SyncContext {
         let artifact = match self.transfer_stage {
             TransferStage::Vault => VaultArtifact::Vault,
             TransferStage::Recipients => VaultArtifact::Recipients,
+            TransferStage::Signature => VaultArtifact::Signature,
             TransferStage::Complete => self.last_artifact,
         };
 
@@ -1197,6 +1264,7 @@ impl SyncContext {
                 self.recipients_manifest.as_slice(),
                 &mut self.recipients_offset,
             ),
+            VaultArtifact::Signature => (self.signature.as_slice(), &mut self.signature_offset),
         };
 
         let available = buffer.len().saturating_sub(*offset);
@@ -1248,14 +1316,25 @@ impl SyncContext {
                 if chunk.is_last {
                     match artifact {
                         VaultArtifact::Vault => {
-                            if self.recipients_manifest.is_empty() {
-                                self.transfer_stage = TransferStage::Complete;
-                            } else {
+                            if !self.recipients_manifest.is_empty() {
                                 self.transfer_stage = TransferStage::Recipients;
                                 self.recipients_offset = 0;
+                            } else if !self.signature.is_empty() {
+                                self.transfer_stage = TransferStage::Signature;
+                                self.signature_offset = 0;
+                            } else {
+                                self.transfer_stage = TransferStage::Complete;
                             }
                         }
                         VaultArtifact::Recipients => {
+                            if !self.signature.is_empty() {
+                                self.transfer_stage = TransferStage::Signature;
+                                self.signature_offset = 0;
+                            } else {
+                                self.transfer_stage = TransferStage::Complete;
+                            }
+                        }
+                        VaultArtifact::Signature => {
                             self.transfer_stage = TransferStage::Complete;
                         }
                     }
@@ -1263,6 +1342,7 @@ impl SyncContext {
                     self.transfer_stage = match artifact {
                         VaultArtifact::Vault => TransferStage::Vault,
                         VaultArtifact::Recipients => TransferStage::Recipients,
+                        VaultArtifact::Signature => TransferStage::Signature,
                     };
                 }
 
@@ -1468,12 +1548,14 @@ fn handle_pull_head(
 
     let vault_hash = artifact_hash(&ctx.vault_image);
     let recipients_hash = artifact_hash(&ctx.recipients_manifest);
+    let signature_hash = artifact_hash(&ctx.signature);
 
     Ok(DeviceResponse::Head(PullHeadResponse {
         protocol_version: PROTOCOL_VERSION,
         vault_generation: ctx.vault_generation,
         vault_hash,
         recipients_hash,
+        signature_hash,
     }))
 }
 
@@ -2343,6 +2425,8 @@ mod tests {
         ctx.vault_image.extend_from_slice(b"encrypted");
         ctx.recipients_manifest
             .extend_from_slice(b"{\"recipients\":[\"device\"]}");
+        ctx.signature
+            .extend_from_slice(&[0x99; SIGNATURE_BUFFER_CAPACITY]);
         ctx.vault_generation = 2;
 
         let request = HostRequest::PullHead(PullHeadRequest {
@@ -2358,6 +2442,7 @@ mod tests {
             DeviceResponse::Head(head) => {
                 assert_eq!(head.vault_generation, ctx.vault_generation);
                 assert_ne!(head.vault_hash, [0u8; 32]);
+                assert_ne!(head.signature_hash, [0u8; 32]);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2397,6 +2482,17 @@ mod tests {
                 buffer.as_mut_slice(),
                 &STORAGE_KEY_RECIPIENTS,
                 &Vec::from(&b"recipients"[..]),
+            )
+            .await
+            .unwrap();
+
+            map::store_item(
+                &mut flash,
+                range.clone(),
+                &mut cache,
+                buffer.as_mut_slice(),
+                &STORAGE_KEY_SIGNATURE,
+                &Vec::from(&[0xAB; SIGNATURE_BUFFER_CAPACITY]),
             )
             .await
             .unwrap();
@@ -2445,6 +2541,7 @@ mod tests {
 
         assert_eq!(ctx.vault_image.as_slice(), b"vault-image");
         assert_eq!(ctx.recipients_manifest.as_slice(), b"recipients");
+        assert_eq!(ctx.signature.as_slice(), &[0xAB; SIGNATURE_BUFFER_CAPACITY]);
         assert_eq!(ctx.vault_generation, 7);
         assert_eq!(ctx.journal_ops.len(), 1);
         assert_eq!(ctx.vault_offset, 0);
@@ -2553,10 +2650,40 @@ mod tests {
     }
 
     #[test]
+    fn load_from_flash_rejects_oversized_signature() {
+        let oversized_signature = vec![0xCC; SIGNATURE_BUFFER_CAPACITY + 1];
+        let error = SyncContext::validate_signature_blob::<()>(oversized_signature)
+            .expect_err("oversized signature should be rejected");
+
+        match error {
+            StorageError::Decode(message) => {
+                assert!(message.contains("signature exceeds capacity"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_from_flash_rejects_partial_signature() {
+        let partial_signature = vec![0xDD; SIGNATURE_BUFFER_CAPACITY - 1];
+        let error = SyncContext::validate_signature_blob::<()>(partial_signature)
+            .expect_err("incomplete signature should be rejected");
+
+        match error {
+            StorageError::Decode(message) => {
+                assert!(message.contains("signature must be exactly"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn wrap_new_keys_and_wipe_clears_sensitive_state() {
         let mut ctx = fresh_context();
         ctx.vault_image.extend_from_slice(b"data");
         ctx.recipients_manifest.extend_from_slice(b"recips");
+        ctx.signature
+            .extend_from_slice(&[0xEE; SIGNATURE_BUFFER_CAPACITY]);
 
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
         ctx.crypto.wrap_new_keys(b"222222", &mut rng).unwrap();
@@ -2574,6 +2701,7 @@ mod tests {
         assert!(ctx.crypto.device_private_key.is_none());
         assert!(ctx.vault_image.is_empty());
         assert!(ctx.recipients_manifest.is_empty());
+        assert!(ctx.signature.is_empty());
     }
 
     #[test]

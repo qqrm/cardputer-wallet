@@ -159,6 +159,8 @@ where
     artifacts.record_log("head response");
     let recipients_expected = head.recipients_hash != [0u8; 32];
     artifacts.set_recipients_expected(recipients_expected);
+    let signature_expected = head.signature_hash != [0u8; 32];
+    artifacts.set_signature_expected(signature_expected);
 
     let request = HostRequest::PullVault(PullVaultRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -654,12 +656,20 @@ struct PullArtifacts {
     recipients_manifest: Option<Vec<u8>>,
     recipients_expected: bool,
     recipients_seen: bool,
+    signature: ArtifactBuffer,
+    signature_bytes: Option<Vec<u8>>,
+    signature_expected: bool,
+    signature_seen: bool,
     log_context: Vec<String>,
 }
 
 impl PullArtifacts {
     fn set_recipients_expected(&mut self, expected: bool) {
         self.recipients_expected = expected;
+    }
+
+    fn set_signature_expected(&mut self, expected: bool) {
+        self.signature_expected = expected;
     }
 
     fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
@@ -675,9 +685,16 @@ impl PullArtifacts {
                     checksum: chunk.checksum,
                     is_last: chunk.is_last,
                 });
-                if chunk.is_last && !self.recipients_expected {
+                if chunk.is_last {
+                    if self.recipients_expected && !self.recipients_seen {
+                        return true;
+                    }
+                    if self.signature_expected && !self.signature_seen {
+                        return true;
+                    }
                     return false;
                 }
+                true
             }
             VaultArtifact::Recipients => {
                 if !self.recipients_seen || chunk.sequence == 1 {
@@ -698,15 +715,35 @@ impl PullArtifacts {
                 if chunk.is_last {
                     let data = self.recipients.bytes.clone();
                     self.record_recipients_manifest(&data);
+                    if self.signature_expected && !self.signature_seen {
+                        return true;
+                    }
+                    return false;
                 }
-                return !chunk.is_last;
+                true
             }
-        }
-
-        if chunk.is_last {
-            self.recipients_expected && !self.recipients_seen
-        } else {
-            true
+            VaultArtifact::Signature => {
+                if !self.signature_seen || chunk.sequence == 1 {
+                    self.signature.bytes.clear();
+                    self.signature.metadata.clear();
+                }
+                self.signature_seen = true;
+                self.signature.bytes.extend_from_slice(&chunk.data);
+                self.signature.metadata.push(VaultChunkMetadata {
+                    protocol_version: chunk.protocol_version,
+                    sequence: chunk.sequence,
+                    total_size: chunk.total_size,
+                    remaining_bytes: chunk.remaining_bytes,
+                    device_chunk_size: chunk.device_chunk_size,
+                    checksum: chunk.checksum,
+                    is_last: chunk.is_last,
+                });
+                if chunk.is_last {
+                    self.signature_bytes = Some(self.signature.bytes.clone());
+                    return false;
+                }
+                true
+            }
         }
     }
 
@@ -760,6 +797,17 @@ impl PullArtifacts {
                 "Saved recipients manifest to '{}'.",
                 recipients_path.display()
             );
+        }
+
+        if let Some(signature) = &self.signature_bytes {
+            let signature_path = repo.join("vault.sig");
+            if let Some(parent) = signature_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("prepare signature directory", parent, err))?;
+            }
+            fs::write(&signature_path, signature)
+                .map_err(|err| io_error("write signature artifact", &signature_path, err))?;
+            println!("Saved vault signature to '{}'.", signature_path.display());
         }
 
         Ok(())
@@ -890,6 +938,7 @@ fn print_vault_chunk(chunk: &VaultChunk) {
     let artifact = match chunk.artifact {
         VaultArtifact::Vault => "vault image",
         VaultArtifact::Recipients => "recipients manifest",
+        VaultArtifact::Signature => "vault signature",
     };
     println!(
         "Received {artifact} chunk #{sequence} ({size} bytes, {remaining} bytes remaining).",
@@ -931,6 +980,7 @@ fn print_head(head: &PullHeadResponse) {
     );
     println!("  Vault hash   : {}", hex_encode(&head.vault_hash));
     println!("  Recipients hash: {}", hex_encode(&head.recipients_hash));
+    println!("  Signature hash : {}", hex_encode(&head.signature_hash));
 }
 
 fn print_ack(message: &AckResponse) {
@@ -1195,6 +1245,8 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
 
+    const SIGNATURE_SIZE: usize = 64;
+
     fn usb_port(
         name: &str,
         vid: u16,
@@ -1419,6 +1471,7 @@ mod tests {
                 vault_generation: 1,
                 vault_hash: [0u8; 32],
                 recipients_hash: [0u8; 32],
+                signature_hash: [0u8; 32],
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1491,6 +1544,7 @@ mod tests {
                 vault_generation: 3,
                 vault_hash: [0xAA; 32],
                 recipients_hash: [0u8; 32],
+                signature_hash: [0u8; 32],
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1532,6 +1586,8 @@ mod tests {
 
         let recipients_path = args.repo.join("recips.json");
         assert!(!recipients_path.exists(), "unexpected recipients manifest");
+        let signature_path = args.repo.join("vault.sig");
+        assert!(!signature_path.exists(), "unexpected signature artifact");
     }
 
     #[test]
@@ -1542,6 +1598,7 @@ mod tests {
                 vault_generation: 7,
                 vault_hash: [0x11; 32],
                 recipients_hash: [0x22; 32],
+                signature_hash: [0x33; 32],
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1564,6 +1621,17 @@ mod tests {
                 checksum: 0x0D15_EA5E,
                 is_last: true,
                 artifact: VaultArtifact::Recipients,
+            })),
+            encode_response(DeviceResponse::VaultChunk(VaultChunk {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 3,
+                total_size: SIGNATURE_SIZE as u64,
+                remaining_bytes: 0,
+                device_chunk_size: MAX_CHUNK_SIZE,
+                data: vec![0x55; SIGNATURE_SIZE],
+                checksum: 0x1234_5678,
+                is_last: true,
+                artifact: VaultArtifact::Signature,
             })),
         ]
         .concat();
@@ -1593,6 +1661,16 @@ mod tests {
             read_framed_message(&mut reader).expect("decode second pull request frame");
         assert_eq!(third_command, CdcCommand::PullVault);
 
+        let (fourth_command, _) =
+            read_framed_message(&mut reader).expect("decode third pull request frame");
+        assert_eq!(fourth_command, CdcCommand::PullVault);
+
+        assert_eq!(
+            reader.position(),
+            reader.get_ref().len() as u64,
+            "expected head request followed by three pull requests",
+        );
+
         let vault_path = args.repo.join("vault.enc");
         let vault_content = fs::read(&vault_path).expect("vault file");
         assert_eq!(vault_content, vec![9, 8, 7, 6, 5]);
@@ -1600,6 +1678,9 @@ mod tests {
         let recipients_path = args.repo.join("recips.json");
         let recipients_content = fs::read(&recipients_path).expect("recipients file");
         assert_eq!(recipients_content, br#"{"recipients":[]}"#.to_vec());
+        let signature_path = args.repo.join("vault.sig");
+        let signature_content = fs::read(&signature_path).expect("signature file");
+        assert_eq!(signature_content, vec![0x55; SIGNATURE_SIZE]);
     }
 
     #[test]
@@ -1612,6 +1693,7 @@ mod tests {
                 vault_generation: 11,
                 vault_hash: [0x33; 32],
                 recipients_hash: [0x44; 32],
+                signature_hash: [0u8; 32],
             })),
             encode_response(DeviceResponse::VaultChunk(VaultChunk {
                 protocol_version: PROTOCOL_VERSION,
@@ -1689,6 +1771,8 @@ mod tests {
         let mut expected = first_fragment;
         expected.extend_from_slice(&second_fragment);
         assert_eq!(recipients_content, expected);
+        let signature_path = args.repo.join("vault.sig");
+        assert!(!signature_path.exists(), "unexpected signature artifact");
     }
 
     #[test]
@@ -1780,6 +1864,7 @@ mod tests {
                 vault_generation: 5,
                 vault_hash: [0x44; 32],
                 recipients_hash: [0u8; 32],
+                signature_hash: [0u8; 32],
             })),
             encode_response(DeviceResponse::JournalFrame(JournalFrame {
                 protocol_version: PROTOCOL_VERSION,
