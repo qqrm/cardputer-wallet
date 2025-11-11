@@ -22,6 +22,8 @@ use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
+    HostRequest, JournalFrame, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
     HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
     PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
     StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
@@ -36,6 +38,7 @@ const SERIAL_BAUD_RATE: u32 = 115_200;
 const DEFAULT_TIMEOUT_SECS: u64 = 2;
 const HOST_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_CHUNK_SIZE: u32 = 4 * 1024;
+const SIGNATURE_SIZE: usize = 64;
 const CARDPUTER_USB_VID: u16 = 0x303A;
 const CARDPUTER_USB_PID: u16 = 0x4001;
 const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
@@ -243,6 +246,8 @@ where
         if plan.frames.len() == 1 { "" } else { "s" }
     );
 
+    push_vault_artifacts(port, &args.repo)?;
+
     for frame in plan.frames.into_iter() {
         let sequence = frame.sequence;
         let operation_count = frame.operations.len();
@@ -276,6 +281,102 @@ where
 
     clear_local_operations(&args.repo)?;
     println!("Push operations completed. Cleared local journal state.");
+    Ok(())
+}
+
+fn push_vault_artifacts<P>(port: &mut P, repo: &Path) -> Result<(), SharedError>
+where
+    P: Read + Write + ?Sized,
+{
+    let descriptors = [
+        (VaultArtifact::Vault, repo.join("vault.enc"), "vault image"),
+        (
+            VaultArtifact::Recipients,
+            repo.join("recips.json"),
+            "recipients manifest",
+        ),
+        (
+            VaultArtifact::Signature,
+            repo.join("vault.sig"),
+            "vault signature",
+        ),
+    ];
+
+    let mut sequence = 1u32;
+
+    for (artifact, path, label) in descriptors.into_iter() {
+        if !path.exists() {
+            continue;
+        }
+
+        let data = fs::read(&path).map_err(|err| io_error("read artifact", &path, err))?;
+
+        if matches!(artifact, VaultArtifact::Signature) && data.len() != SIGNATURE_SIZE {
+            return Err(SharedError::Transport(format!(
+                "signature artifact '{}' must be exactly {} bytes (found {})",
+                path.display(),
+                SIGNATURE_SIZE,
+                data.len()
+            )));
+        }
+
+        println!(
+            "Sending {label} ({} byte{}).",
+            data.len(),
+            if data.len() == 1 { "" } else { "s" }
+        );
+
+        let total_size = data.len() as u64;
+        let chunk_size = MAX_CHUNK_SIZE as usize;
+        let mut offset = 0usize;
+        let mut first = true;
+
+        while offset < data.len() || (first && data.is_empty()) {
+            first = false;
+            let end = (offset + chunk_size).min(data.len());
+            let chunk = data[offset..end].to_vec();
+            let remaining = total_size.saturating_sub(end as u64);
+            offset = end;
+
+            let frame = PushVaultFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                artifact,
+                total_size,
+                remaining_bytes: remaining,
+                data: chunk.clone(),
+                checksum: accumulate_checksum(0, &chunk),
+                is_last: remaining == 0,
+            };
+            sequence = sequence.saturating_add(1);
+
+            let request = HostRequest::PushVault(frame);
+            send_host_request(port, &request)?;
+            let response = read_device_response(port)?;
+            match response {
+                DeviceResponse::Ack(message) => {
+                    print_ack(&message);
+                }
+                DeviceResponse::Nack(nack) => {
+                    return Err(SharedError::Transport(format!(
+                        "device rejected {label}: {}",
+                        nack.message
+                    )));
+                }
+                other => {
+                    let description = format!("{other:?}");
+                    return Err(SharedError::Transport(format!(
+                        "unexpected device response while pushing {label}: {description}"
+                    )));
+                }
+            }
+
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1511,6 +1612,7 @@ fn command_for_request(request: &HostRequest) -> CdcCommand {
         HostRequest::GetTime(_) => CdcCommand::GetTime,
         HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::PushVault(_) => CdcCommand::PushVault,
         HostRequest::PushOps(_) => CdcCommand::PushOps,
         HostRequest::Ack(_) => CdcCommand::Ack,
     }

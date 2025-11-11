@@ -25,6 +25,8 @@ pub enum HostRequest {
     PullHead(PullHeadRequest),
     /// Request the device to stream its latest vault back to the host.
     PullVault(PullVaultRequest),
+    /// Deliver encrypted vault artifacts for the device to replace locally.
+    PushVault(PushVaultFrame),
     /// Deliver a batch of journal operations for the device to apply.
     PushOps(PushOperationsFrame),
     /// Confirm that a sequence of journal frames has been applied successfully by the host.
@@ -279,6 +281,27 @@ pub struct VaultChunk {
     pub is_last: bool,
     /// Artifact associated with this chunk.
     pub artifact: VaultArtifact,
+}
+
+/// Chunk of encrypted vault data pushed by the host to the device.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Schema)]
+pub struct PushVaultFrame {
+    /// Protocol version understood by the host while sending the frame.
+    pub protocol_version: u16,
+    /// Sequential identifier for the payload chunk within the push session.
+    pub sequence: u32,
+    /// Artifact associated with the payload chunk.
+    pub artifact: VaultArtifact,
+    /// Total size in bytes of the artifact being transferred.
+    pub total_size: u64,
+    /// Number of bytes that remain to be delivered after this chunk.
+    pub remaining_bytes: u64,
+    /// Raw encrypted data payload from the host artifact.
+    pub data: Vec<u8>,
+    /// CRC32 protecting the payload bytes in this chunk.
+    pub checksum: u32,
+    /// Whether this chunk completes transmission of the artifact.
+    pub is_last: bool,
 }
 
 /// Response sent when a host command completes successfully.

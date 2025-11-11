@@ -59,6 +59,8 @@ Running `cardputer pull` after these steps now persists three artifacts inside t
 - `recips.json` – the recipients manifest.
 - `vault.sig` – the detached Ed25519 signature covering the vault and manifest.
 
+During a push the firmware verifies the detached signature against its built-in Ed25519 public key before accepting the new
+vault or recipients manifest.
 ## Host CLI credentials and signatures
 
 The host CLI validates every signed vault snapshot before writing it to disk. When the device advertises a signature but no verifying key is available locally, `cardputer pull` aborts rather than persisting unverifiable data. Provide the verifying key either in the credentials JSON or via the `--signing-pubkey` flag before invoking pull operations.

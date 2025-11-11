@@ -19,6 +19,7 @@ pub enum CdcCommand {
     PushOps = 0x0007,
     Ack = 0x0008,
     Nack = 0x0009,
+    PushVault = 0x000A,
 }
 
 impl TryFrom<u16> for CdcCommand {
@@ -35,6 +36,7 @@ impl TryFrom<u16> for CdcCommand {
             0x0007 => Ok(CdcCommand::PushOps),
             0x0008 => Ok(CdcCommand::Ack),
             0x0009 => Ok(CdcCommand::Nack),
+            0x000A => Ok(CdcCommand::PushVault),
             other => Err(FrameHeaderError::UnknownCommand(other)),
         }
     }
