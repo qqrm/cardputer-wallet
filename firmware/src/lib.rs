@@ -4,7 +4,11 @@
 extern crate alloc;
 
 use alloc::{format, string::String, string::ToString, vec, vec::Vec};
-use core::{cmp, ops::Range};
+use core::{
+    cmp,
+    convert::{TryFrom, TryInto},
+    ops::Range,
+};
 
 pub mod ui;
 
@@ -12,6 +16,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
+use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use rand_core::{CryptoRng, RngCore};
@@ -87,9 +92,9 @@ use shared::cdc::{CdcCommand, FrameHeader, compute_crc32};
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
     HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_host_request,
-    decode_journal_operations, encode_device_response,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
+    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
+    decode_host_request, decode_journal_operations, encode_device_response,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -102,6 +107,11 @@ const VAULT_BUFFER_CAPACITY: usize = 64 * 1024;
 const RECIPIENTS_BUFFER_CAPACITY: usize = 4 * 1024;
 /// Capacity provisioned for the detached signature buffer.
 const SIGNATURE_BUFFER_CAPACITY: usize = 64;
+/// Ed25519 public key that signs repository vault artifacts.
+const VAULT_SIGNATURE_PUBLIC_KEY: [u8; 32] = [
+    0xD7, 0x5A, 0x98, 0x01, 0x82, 0xB1, 0x0A, 0xB7, 0xD5, 0x4B, 0xFE, 0xD3, 0xC9, 0x64, 0x07, 0x3A,
+    0x0E, 0xE1, 0x72, 0xF3, 0xDA, 0xA6, 0x23, 0x25, 0xAF, 0x02, 0x1A, 0x68, 0xF7, 0x07, 0x51, 0x1A,
+];
 /// Scratch buffer used when interacting with sequential storage.
 const STORAGE_DATA_BUFFER_CAPACITY: usize =
     VAULT_BUFFER_CAPACITY + RECIPIENTS_BUFFER_CAPACITY + SIGNATURE_BUFFER_CAPACITY;
@@ -885,6 +895,13 @@ pub struct SyncContext {
     recipients_manifest: Zeroizing<Vec<u8>>,
     signature_offset: usize,
     signature: Zeroizing<Vec<u8>>,
+    expected_signature: Option<[u8; SIGNATURE_BUFFER_CAPACITY]>,
+    incoming_vault: Zeroizing<Vec<u8>>,
+    incoming_recipients: Zeroizing<Vec<u8>>,
+    incoming_signature: Zeroizing<Vec<u8>>,
+    incoming_vault_complete: bool,
+    incoming_recipients_complete: bool,
+    incoming_signature_complete: bool,
     transfer_stage: TransferStage,
     last_artifact: VaultArtifact,
     crypto: CryptoMaterial,
@@ -915,6 +932,13 @@ impl SyncContext {
             recipients_manifest: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
             signature_offset: 0,
             signature: Zeroizing::new(Vec::with_capacity(SIGNATURE_BUFFER_CAPACITY)),
+            expected_signature: None,
+            incoming_vault: Zeroizing::new(Vec::with_capacity(VAULT_BUFFER_CAPACITY)),
+            incoming_recipients: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
+            incoming_signature: Zeroizing::new(Vec::with_capacity(SIGNATURE_BUFFER_CAPACITY)),
+            incoming_vault_complete: false,
+            incoming_recipients_complete: false,
+            incoming_signature_complete: false,
             transfer_stage: TransferStage::Vault,
             last_artifact: VaultArtifact::Vault,
             crypto: CryptoMaterial::default(),
@@ -982,6 +1006,7 @@ impl SyncContext {
         }
 
         self.signature = Zeroizing::new(Vec::new());
+        self.expected_signature = None;
         if let Some(signature) = map::fetch_item::<u8, Vec<u8>, _>(
             flash,
             range.clone(),
@@ -995,6 +1020,11 @@ impl SyncContext {
             match Self::validate_signature_blob::<S::Error>(signature) {
                 Ok(blob) => {
                     self.signature = blob;
+                    if self.signature.len() == SIGNATURE_BUFFER_CAPACITY
+                        && let Ok(bytes) = self.signature.as_slice().try_into()
+                    {
+                        self.expected_signature = Some(bytes);
+                    }
                 }
                 Err(err) => {
                     self.vault_image = Zeroizing::new(Vec::new());
@@ -1183,6 +1213,8 @@ impl SyncContext {
 
         self.signature.iter_mut().for_each(|byte| *byte = 0);
         self.signature.clear();
+        self.expected_signature = None;
+        self.reset_incoming_state();
 
         self.crypto.wipe();
         self.reset_transfer_state();
@@ -1237,6 +1269,107 @@ impl SyncContext {
                 }
             }
         };
+    }
+
+    fn reset_incoming_state(&mut self) {
+        self.incoming_vault.iter_mut().for_each(|byte| *byte = 0);
+        self.incoming_vault.clear();
+        self.incoming_recipients
+            .iter_mut()
+            .for_each(|byte| *byte = 0);
+        self.incoming_recipients.clear();
+        self.incoming_signature
+            .iter_mut()
+            .for_each(|byte| *byte = 0);
+        self.incoming_signature.clear();
+        self.incoming_vault_complete = false;
+        self.incoming_recipients_complete = false;
+        self.incoming_signature_complete = false;
+    }
+
+    fn finalize_incoming_payload(&mut self) -> Result<String, NackResponse> {
+        if self.incoming_signature.len() != SIGNATURE_BUFFER_CAPACITY {
+            self.reset_incoming_state();
+            return Err(NackResponse {
+                protocol_version: PROTOCOL_VERSION,
+                code: DeviceErrorCode::ChecksumMismatch,
+                message: format!(
+                    "signature must contain exactly {} bytes",
+                    SIGNATURE_BUFFER_CAPACITY
+                ),
+            });
+        }
+
+        let signature_bytes: [u8; SIGNATURE_BUFFER_CAPACITY] =
+            match self.incoming_signature.as_slice().try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    self.reset_incoming_state();
+                    return Err(NackResponse {
+                        protocol_version: PROTOCOL_VERSION,
+                        code: DeviceErrorCode::ChecksumMismatch,
+                        message: "failed to decode signature payload".into(),
+                    });
+                }
+            };
+
+        let verifying_key = match VerifyingKey::from_bytes(&VAULT_SIGNATURE_PUBLIC_KEY) {
+            Ok(key) => key,
+            Err(_) => {
+                self.reset_incoming_state();
+                return Err(NackResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    code: DeviceErrorCode::InternalFailure,
+                    message: "invalid vault signing public key".into(),
+                });
+            }
+        };
+
+        let signature = match Ed25519Signature::try_from(signature_bytes.as_slice()) {
+            Ok(sig) => sig,
+            Err(_) => {
+                self.reset_incoming_state();
+                return Err(NackResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    code: DeviceErrorCode::ChecksumMismatch,
+                    message: "signature payload rejected".into(),
+                });
+            }
+        };
+
+        let mut signed_payload =
+            Vec::with_capacity(self.incoming_vault.len() + self.incoming_recipients.len());
+        signed_payload.extend_from_slice(self.incoming_vault.as_slice());
+        signed_payload.extend_from_slice(self.incoming_recipients.as_slice());
+
+        if verifying_key.verify(&signed_payload, &signature).is_err() {
+            self.reset_incoming_state();
+            return Err(NackResponse {
+                protocol_version: PROTOCOL_VERSION,
+                code: DeviceErrorCode::ChecksumMismatch,
+                message: "vault signature verification failed".into(),
+            });
+        }
+
+        self.vault_image.iter_mut().for_each(|byte| *byte = 0);
+        self.vault_image = Zeroizing::new(self.incoming_vault.as_slice().to_vec());
+        self.recipients_manifest
+            .iter_mut()
+            .for_each(|byte| *byte = 0);
+        self.recipients_manifest = Zeroizing::new(self.incoming_recipients.as_slice().to_vec());
+        self.signature.iter_mut().for_each(|byte| *byte = 0);
+        self.signature = Zeroizing::new(signature_bytes.to_vec());
+        self.expected_signature = Some(signature_bytes);
+
+        self.vault_generation = self.vault_generation.saturating_add(1);
+        self.reset_transfer_state();
+        self.reset_incoming_state();
+
+        Ok(format!(
+            "updated vault artifacts (vault {} bytes, recipients {} bytes)",
+            self.vault_image.len(),
+            self.recipients_manifest.len()
+        ))
     }
 
     fn next_transfer_chunk(
@@ -1409,6 +1542,7 @@ fn command_for_request(request: &HostRequest) -> CdcCommand {
         HostRequest::GetTime(_) => CdcCommand::GetTime,
         HostRequest::PullHead(_) => CdcCommand::PullHead,
         HostRequest::PullVault(_) => CdcCommand::PullVault,
+        HostRequest::PushVault(_) => CdcCommand::PushVault,
         HostRequest::PushOps(_) => CdcCommand::PushOps,
         HostRequest::Ack(_) => CdcCommand::Ack,
     }
@@ -1455,6 +1589,7 @@ pub fn process_host_frame(
         HostRequest::GetTime(get_time) => handle_get_time(&get_time, ctx)?,
         HostRequest::PullHead(head) => handle_pull_head(&head, ctx)?,
         HostRequest::PullVault(pull) => handle_pull(&pull, ctx)?,
+        HostRequest::PushVault(frame) => handle_push_vault(&frame, ctx)?,
         HostRequest::PushOps(push) => handle_push_ops(&push, ctx)?,
         HostRequest::Ack(ack) => handle_ack(&ack, ctx)?,
     };
@@ -1682,6 +1817,116 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
             }))
         }
         _ => Err(ProtocolError::InvalidAcknowledgement),
+    }
+}
+
+fn handle_push_vault(
+    frame: &PushVaultFrame,
+    ctx: &mut SyncContext,
+) -> Result<DeviceResponse, ProtocolError> {
+    if frame.protocol_version != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedProtocol(frame.protocol_version));
+    }
+
+    let calculated = accumulate_checksum(0, &frame.data);
+    if calculated != frame.checksum {
+        return Err(ProtocolError::ChecksumMismatch);
+    }
+
+    if frame.artifact == VaultArtifact::Vault && frame.sequence == 1 {
+        ctx.reset_incoming_state();
+    }
+
+    let (buffer, capacity, complete_flag) = match frame.artifact {
+        VaultArtifact::Vault => (
+            &mut ctx.incoming_vault,
+            VAULT_BUFFER_CAPACITY,
+            &mut ctx.incoming_vault_complete,
+        ),
+        VaultArtifact::Recipients => (
+            &mut ctx.incoming_recipients,
+            RECIPIENTS_BUFFER_CAPACITY,
+            &mut ctx.incoming_recipients_complete,
+        ),
+        VaultArtifact::Signature => (
+            &mut ctx.incoming_signature,
+            SIGNATURE_BUFFER_CAPACITY,
+            &mut ctx.incoming_signature_complete,
+        ),
+    };
+
+    if frame.sequence == 1 {
+        buffer.iter_mut().for_each(|byte| *byte = 0);
+        buffer.clear();
+        *complete_flag = false;
+    }
+
+    if buffer.len().saturating_add(frame.data.len()) > capacity {
+        ctx.reset_incoming_state();
+        return Ok(DeviceResponse::Nack(NackResponse {
+            protocol_version: PROTOCOL_VERSION,
+            code: DeviceErrorCode::ResourceExhausted,
+            message: format!(
+                "{} payload exceeds device capacity",
+                match frame.artifact {
+                    VaultArtifact::Vault => "vault",
+                    VaultArtifact::Recipients => "recipients",
+                    VaultArtifact::Signature => "signature",
+                }
+            ),
+        }));
+    }
+
+    buffer.extend_from_slice(&frame.data);
+
+    if frame.is_last {
+        *complete_flag = true;
+        if matches!(frame.artifact, VaultArtifact::Signature)
+            && buffer.len() != SIGNATURE_BUFFER_CAPACITY
+        {
+            ctx.reset_incoming_state();
+            return Ok(DeviceResponse::Nack(NackResponse {
+                protocol_version: PROTOCOL_VERSION,
+                code: DeviceErrorCode::ChecksumMismatch,
+                message: format!(
+                    "signature must contain exactly {} bytes",
+                    SIGNATURE_BUFFER_CAPACITY
+                ),
+            }));
+        }
+    } else if matches!(frame.artifact, VaultArtifact::Signature)
+        && buffer.len() >= SIGNATURE_BUFFER_CAPACITY
+    {
+        ctx.reset_incoming_state();
+        return Ok(DeviceResponse::Nack(NackResponse {
+            protocol_version: PROTOCOL_VERSION,
+            code: DeviceErrorCode::ResourceExhausted,
+            message: "signature chunk exceeds capacity".into(),
+        }));
+    }
+
+    if ctx.incoming_vault_complete
+        && ctx.incoming_recipients_complete
+        && ctx.incoming_signature_complete
+    {
+        match ctx.finalize_incoming_payload() {
+            Ok(message) => Ok(DeviceResponse::Ack(AckResponse {
+                protocol_version: PROTOCOL_VERSION,
+                message,
+            })),
+            Err(nack) => Ok(DeviceResponse::Nack(nack)),
+        }
+    } else {
+        Ok(DeviceResponse::Ack(AckResponse {
+            protocol_version: PROTOCOL_VERSION,
+            message: format!(
+                "received {:?} chunk #{} ({} bytes, {} remaining)",
+                frame.artifact,
+                frame.sequence,
+                frame.data.len(),
+                frame.remaining_bytes
+            ),
+        }))
     }
 }
 
@@ -1950,6 +2195,7 @@ mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
     use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
@@ -2278,6 +2524,188 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_vault_with_valid_signature_applies_changes() {
+        let mut ctx = fresh_context();
+        let vault = b"vault-bytes".to_vec();
+        let recipients = b"{\"recipients\":[]}".to_vec();
+
+        let signing_key = SigningKey::from_bytes(&[
+            0x9D, 0x61, 0xB1, 0x9D, 0xEF, 0xFD, 0x5A, 0x60, 0xBA, 0x84, 0x4A, 0xF4, 0x92, 0xEC,
+            0x2C, 0xC4, 0x44, 0x49, 0xC5, 0x69, 0x7B, 0x32, 0x69, 0x19, 0x70, 0x3B, 0xAC, 0x03,
+            0x1C, 0xAE, 0x7F, 0x60,
+        ]);
+        let mut signed_payload = Vec::new();
+        signed_payload.extend_from_slice(&vault);
+        signed_payload.extend_from_slice(&recipients);
+        let signature = signing_key.sign(&signed_payload);
+        let signature_bytes = signature.to_bytes();
+
+        let vault_request = HostRequest::PushVault(PushVaultFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 1,
+            artifact: VaultArtifact::Vault,
+            total_size: vault.len() as u64,
+            remaining_bytes: 0,
+            data: vault.clone(),
+            checksum: accumulate_checksum(0, &vault),
+            is_last: true,
+        });
+        let encoded_vault = encode_host_request(&vault_request).expect("encode vault frame");
+        let (command_vault, response_vault) =
+            process_host_frame(CdcCommand::PushVault, &encoded_vault, &mut ctx)
+                .expect("process vault chunk");
+        assert_eq!(command_vault, CdcCommand::Ack);
+        match decode_device_response(&response_vault).expect("decode vault ack") {
+            DeviceResponse::Ack(message) => {
+                assert!(message.message.contains("Vault"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let recipients_request = HostRequest::PushVault(PushVaultFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 2,
+            artifact: VaultArtifact::Recipients,
+            total_size: recipients.len() as u64,
+            remaining_bytes: 0,
+            data: recipients.clone(),
+            checksum: accumulate_checksum(0, &recipients),
+            is_last: true,
+        });
+        let encoded_recipients =
+            encode_host_request(&recipients_request).expect("encode recipients frame");
+        let (command_recips, response_recips) =
+            process_host_frame(CdcCommand::PushVault, &encoded_recipients, &mut ctx)
+                .expect("process recipients chunk");
+        assert_eq!(command_recips, CdcCommand::Ack);
+        match decode_device_response(&response_recips).expect("decode recipients ack") {
+            DeviceResponse::Ack(message) => {
+                assert!(message.message.contains("Recipients"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let signature_vec = signature_bytes.to_vec();
+        let signature_request = HostRequest::PushVault(PushVaultFrame {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 3,
+            artifact: VaultArtifact::Signature,
+            total_size: SIGNATURE_BUFFER_CAPACITY as u64,
+            remaining_bytes: 0,
+            data: signature_vec.clone(),
+            checksum: accumulate_checksum(0, &signature_vec),
+            is_last: true,
+        });
+        let encoded_signature =
+            encode_host_request(&signature_request).expect("encode signature frame");
+        let (command_sig, response_sig) =
+            process_host_frame(CdcCommand::PushVault, &encoded_signature, &mut ctx)
+                .expect("process signature chunk");
+        assert_eq!(command_sig, CdcCommand::Ack);
+        match decode_device_response(&response_sig).expect("decode signature ack") {
+            DeviceResponse::Ack(message) => {
+                assert!(message.message.contains("updated vault artifacts"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        assert_eq!(ctx.vault_image.as_slice(), vault.as_slice());
+        assert_eq!(ctx.recipients_manifest.as_slice(), recipients.as_slice());
+        assert_eq!(ctx.signature.as_slice(), signature_vec.as_slice());
+        assert_eq!(ctx.expected_signature, Some(signature_bytes));
+        assert_eq!(ctx.vault_generation, 1);
+        assert!(ctx.incoming_vault.is_empty());
+        assert!(ctx.incoming_recipients.is_empty());
+        assert!(ctx.incoming_signature.is_empty());
+    }
+
+    #[test]
+    fn push_vault_with_invalid_signature_is_rejected() {
+        let mut ctx = fresh_context();
+        let vault = b"vault".to_vec();
+        let recipients = b"recipients".to_vec();
+
+        let signing_key = SigningKey::from_bytes(&[
+            0x9D, 0x61, 0xB1, 0x9D, 0xEF, 0xFD, 0x5A, 0x60, 0xBA, 0x84, 0x4A, 0xF4, 0x92, 0xEC,
+            0x2C, 0xC4, 0x44, 0x49, 0xC5, 0x69, 0x7B, 0x32, 0x69, 0x19, 0x70, 0x3B, 0xAC, 0x03,
+            0x1C, 0xAE, 0x7F, 0x60,
+        ]);
+        let mut signed_payload = Vec::new();
+        signed_payload.extend_from_slice(&vault);
+        signed_payload.extend_from_slice(&recipients);
+        let mut signature = signing_key.sign(&signed_payload).to_bytes();
+        signature[0] ^= 0xFF;
+
+        let frames = [
+            HostRequest::PushVault(PushVaultFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 1,
+                artifact: VaultArtifact::Vault,
+                total_size: vault.len() as u64,
+                remaining_bytes: 0,
+                data: vault.clone(),
+                checksum: accumulate_checksum(0, &vault),
+                is_last: true,
+            }),
+            HostRequest::PushVault(PushVaultFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                artifact: VaultArtifact::Recipients,
+                total_size: recipients.len() as u64,
+                remaining_bytes: 0,
+                data: recipients.clone(),
+                checksum: accumulate_checksum(0, &recipients),
+                is_last: true,
+            }),
+            HostRequest::PushVault(PushVaultFrame {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 3,
+                artifact: VaultArtifact::Signature,
+                total_size: SIGNATURE_BUFFER_CAPACITY as u64,
+                remaining_bytes: 0,
+                data: signature.to_vec(),
+                checksum: accumulate_checksum(0, &signature),
+                is_last: true,
+            }),
+        ];
+
+        for request in frames.into_iter() {
+            let encoded = encode_host_request(&request).expect("encode frame");
+            let (command, response_bytes) =
+                process_host_frame(CdcCommand::PushVault, &encoded, &mut ctx)
+                    .expect("process frame");
+
+            let response = decode_device_response(&response_bytes).expect("decode response");
+            match request {
+                HostRequest::PushVault(ref push)
+                    if matches!(push.artifact, VaultArtifact::Signature) =>
+                {
+                    assert_eq!(command, CdcCommand::Nack);
+                    match response {
+                        DeviceResponse::Nack(nack) => {
+                            assert!(nack.message.contains("vault signature verification failed"));
+                        }
+                        other => panic!("unexpected response: {other:?}"),
+                    }
+                }
+                _ => {
+                    assert_eq!(command, CdcCommand::Ack);
+                    assert!(matches!(response, DeviceResponse::Ack(_)));
+                }
+            }
+        }
+
+        assert!(ctx.vault_image.is_empty());
+        assert!(ctx.recipients_manifest.is_empty());
+        assert!(ctx.signature.is_empty());
+        assert!(ctx.expected_signature.is_none());
+        assert_eq!(ctx.vault_generation, 0);
+        assert!(ctx.incoming_vault.is_empty());
+        assert!(ctx.incoming_recipients.is_empty());
+        assert!(ctx.incoming_signature.is_empty());
     }
 
     #[test]

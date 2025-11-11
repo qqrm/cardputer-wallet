@@ -59,6 +59,9 @@ Running `cardputer pull` after these steps now persists three artifacts inside t
 - `recips.json` – the recipients manifest.
 - `vault.sig` – the detached Ed25519 signature covering the vault and manifest.
 
+During a push the firmware verifies the detached signature against its built-in Ed25519 public key before accepting the new
+vault or recipients manifest.
+
 ## Reproducing the CI workflow locally
 
 The CI pipeline now validates the firmware crate with both the Espressif Xtensa toolchain and the host toolchain. To mirror the job locally, run the steps below in the specified order after installing `espup`:
