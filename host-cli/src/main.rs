@@ -22,11 +22,9 @@ use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::error::SharedError;
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
-    PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
     HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, SetTimeRequest,
-    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
+    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
+    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
     decode_journal_operations, encode_journal_operations,
 };
 use shared::vault::{
@@ -50,7 +48,6 @@ const VAULT_FILE: &str = "vault.enc";
 const RECIPIENTS_FILE: &str = "recips.json";
 const SIGNATURE_FILE: &str = "vault.sig";
 const CONFIG_FILE: &str = "config.json";
-const SIGNATURE_SIZE: usize = 64;
 const SIGNATURE_DOMAIN: &[u8] = b"cardputer.vault.signature.v1";
 const VAULT_AAD: &[u8] = b"cardputer.vault.snapshot.v1";
 const VAULT_NONCE_SIZE: usize = 12;
@@ -289,15 +286,15 @@ where
     P: Read + Write + ?Sized,
 {
     let descriptors = [
-        (VaultArtifact::Vault, repo.join("vault.enc"), "vault image"),
+        (VaultArtifact::Vault, repo.join(VAULT_FILE), "vault image"),
         (
             VaultArtifact::Recipients,
-            repo.join("recips.json"),
+            repo.join(RECIPIENTS_FILE),
             "recipients manifest",
         ),
         (
             VaultArtifact::Signature,
-            repo.join("vault.sig"),
+            repo.join(SIGNATURE_FILE),
             "vault signature",
         ),
     ];
@@ -2971,12 +2968,19 @@ mod tests {
             message: String::from("acknowledged"),
         }));
 
-        let mut port = MockPort::new(ack_response);
+        let mut port = MockPort::new(ack_response.repeat(3));
         execute_push(&mut port, &args).expect("push succeeds");
 
         let mut reader = Cursor::new(port.writes);
-        let (command, payload) = read_framed_message(&mut reader).expect("decode push frame");
-        assert_eq!(command, CdcCommand::PushOps);
+        let payload = loop {
+            let (command, payload) =
+                read_framed_message(&mut reader).expect("decode written frame");
+            if command == CdcCommand::PushOps {
+                break payload;
+            }
+
+            assert_eq!(command, CdcCommand::PushVault);
+        };
         let decoded = decode_host_request(&payload).expect("decode push request");
 
         match decoded {
@@ -2996,11 +3000,7 @@ mod tests {
             other => panic!("unexpected request written: {:?}", other),
         }
 
-        assert_eq!(
-            reader.position(),
-            reader.get_ref().len() as u64,
-            "expected exactly one push frame",
-        );
+        assert_eq!(reader.position(), reader.get_ref().len() as u64);
 
         assert!(
             !operations_log_path(&args.repo).exists(),
