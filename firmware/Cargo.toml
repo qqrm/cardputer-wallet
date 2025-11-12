@@ -17,7 +17,7 @@ sequential-storage = { version = "5.0.1", default-features = false, features = [
 embedded-storage-async = { version = "0.4", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
-scrypt = { version = "0.12.0-rc.2", default-features = false }
+scrypt = { version = "0.12.0-rc.3", default-features = false }
 rand_core = { version = "0.6", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 embassy-sync = { version = "0.7.2", default-features = false }

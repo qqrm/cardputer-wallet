@@ -9,7 +9,7 @@ std = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 crc32fast = { version = "1", default-features = false }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 postcard-schema = { version = "0.2", default-features = false, features = ["derive", "alloc"] }
