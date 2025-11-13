@@ -1430,11 +1430,20 @@ impl SyncContext {
                 artifact,
             };
 
-            let encoded_len =
-                match encode_device_response(&DeviceResponse::VaultChunk(chunk.clone())) {
-                    Ok(bytes) => bytes.len(),
-                    Err(_) => return Ok(chunk),
-                };
+            let response = DeviceResponse::VaultChunk(chunk);
+            let encoded_len = match encode_device_response(&response) {
+                Ok(bytes) => bytes.len(),
+                Err(_) => {
+                    if let DeviceResponse::VaultChunk(chunk) = response {
+                        return Ok(chunk);
+                    }
+                    unreachable!("response must be a vault chunk");
+                }
+            };
+            let chunk = match response {
+                DeviceResponse::VaultChunk(chunk) => chunk,
+                _ => unreachable!("response must be a vault chunk"),
+            };
 
             if encoded_len <= frame_budget {
                 if chunk_size == 0 && available > 0 {
@@ -1702,11 +1711,11 @@ fn handle_pull(
         .unwrap_or(false);
 
     if host_in_sync && ctx.journal_ops.is_empty() && ctx.pending_sequence.is_none() {
-        let chunk = ctx.next_transfer_chunk(
+        let response = DeviceResponse::VaultChunk(ctx.next_transfer_chunk(
             request.max_chunk_size as usize,
             request.host_buffer_size as usize,
-        )?;
-        let encoded_len = encode_response(&DeviceResponse::VaultChunk(chunk.clone()))?.len();
+        )?);
+        let encoded_len = encode_response(&response)?.len();
         let frame_size = encoded_len + FRAME_HEADER_SIZE;
         if frame_size > request.host_buffer_size as usize {
             return Err(ProtocolError::HostBufferTooSmall {
@@ -1714,12 +1723,14 @@ fn handle_pull(
                 provided: request.host_buffer_size as usize,
             });
         }
-        let checksum = chunk.checksum;
-        let sequence = chunk.sequence;
+        let (checksum, sequence) = match &response {
+            DeviceResponse::VaultChunk(chunk) => (chunk.checksum, chunk.sequence),
+            _ => unreachable!("response must be a vault chunk"),
+        };
         ctx.pending_sequence = Some((sequence, checksum));
         ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
 
-        return Ok(DeviceResponse::VaultChunk(chunk));
+        return Ok(response);
     }
 
     if !ctx.journal_ops.is_empty() {
@@ -1737,11 +1748,11 @@ fn handle_pull(
             checksum,
         }))
     } else {
-        let chunk = ctx.next_transfer_chunk(
+        let response = DeviceResponse::VaultChunk(ctx.next_transfer_chunk(
             request.max_chunk_size as usize,
             request.host_buffer_size as usize,
-        )?;
-        let encoded_len = encode_response(&DeviceResponse::VaultChunk(chunk.clone()))?.len();
+        )?);
+        let encoded_len = encode_response(&response)?.len();
         let frame_size = encoded_len + FRAME_HEADER_SIZE;
         if frame_size > request.host_buffer_size as usize {
             return Err(ProtocolError::HostBufferTooSmall {
@@ -1749,12 +1760,14 @@ fn handle_pull(
                 provided: request.host_buffer_size as usize,
             });
         }
-        let checksum = chunk.checksum;
-        let sequence = chunk.sequence;
+        let (checksum, sequence) = match &response {
+            DeviceResponse::VaultChunk(chunk) => (chunk.checksum, chunk.sequence),
+            _ => unreachable!("response must be a vault chunk"),
+        };
         ctx.pending_sequence = Some((sequence, checksum));
         ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
 
-        Ok(DeviceResponse::VaultChunk(chunk))
+        Ok(response)
     }
 }
 

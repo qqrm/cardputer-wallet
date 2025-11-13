@@ -335,6 +335,7 @@ where
             let chunk = data[offset..end].to_vec();
             let remaining = total_size.saturating_sub(end as u64);
             offset = end;
+            let checksum = accumulate_checksum(0, &chunk);
 
             let frame = PushVaultFrame {
                 protocol_version: PROTOCOL_VERSION,
@@ -342,8 +343,8 @@ where
                 artifact,
                 total_size,
                 remaining_bytes: remaining,
-                data: chunk.clone(),
-                checksum: accumulate_checksum(0, &chunk),
+                data: chunk,
+                checksum,
                 is_last: remaining == 0,
             };
             sequence = sequence.saturating_add(1);
