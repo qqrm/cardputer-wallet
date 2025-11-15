@@ -5,87 +5,25 @@ use std::path::{Path, PathBuf};
 use shared::error::SharedError;
 use shared::journal::FrameState;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
+use shared::transfer::ArtifactCollector;
 
 use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, SYNC_STATE_FILE, VAULT_FILE};
 
 #[derive(Default)]
 pub struct PullArtifacts {
-    pub(crate) vault: ArtifactBuffer,
-    pub(crate) recipients: ArtifactBuffer,
-    pub(crate) recipients_manifest: Option<Vec<u8>>,
-    pub(crate) recipients_expected: bool,
-    pub(crate) recipients_seen: bool,
-    pub(crate) signature: ArtifactBuffer,
-    pub(crate) signature_bytes: Option<Vec<u8>>,
-    pub(crate) signature_expected: bool,
-    pub(crate) signature_seen: bool,
+    collector: ArtifactCollector,
     pub(crate) log_context: Vec<String>,
 }
 
 impl PullArtifacts {
-    pub fn set_recipients_expected(&mut self, expected: bool) {
-        self.recipients_expected = expected;
+    pub fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
+        self.collector.set_expected_hash(artifact, hash);
     }
 
-    pub fn set_signature_expected(&mut self, expected: bool) {
-        self.signature_expected = expected;
-    }
-
-    pub fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
-        match chunk.artifact {
-            VaultArtifact::Vault => {
-                self.vault.bytes.extend_from_slice(&chunk.data);
-                self.vault
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    if self.recipients_expected && !self.recipients_seen {
-                        return true;
-                    }
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
-                }
-                true
-            }
-            VaultArtifact::Recipients => {
-                if !self.recipients_seen || chunk.sequence == 1 {
-                    self.recipients.bytes.clear();
-                    self.recipients.metadata.clear();
-                }
-                self.recipients_seen = true;
-                self.recipients.bytes.extend_from_slice(&chunk.data);
-                self.recipients
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    let data = self.recipients.bytes.clone();
-                    self.record_recipients_manifest(&data);
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
-                }
-                true
-            }
-            VaultArtifact::Signature => {
-                if !self.signature_seen || chunk.sequence == 1 {
-                    self.signature.bytes.clear();
-                    self.signature.metadata.clear();
-                }
-                self.signature_seen = true;
-                self.signature.bytes.extend_from_slice(&chunk.data);
-                self.signature
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    self.signature_bytes = Some(self.signature.bytes.clone());
-                    return false;
-                }
-                true
-            }
-        }
+    pub fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
+        self.collector
+            .record_chunk(chunk)
+            .map_err(|err| SharedError::Transport(err.to_string()))
     }
 
     pub fn record_journal_frame(&mut self, frame: &JournalFrame) {
@@ -102,31 +40,27 @@ impl PullArtifacts {
         self.log_context.push(context.into());
     }
 
-    #[allow(dead_code)]
-    pub fn record_recipients_manifest(&mut self, data: &[u8]) {
-        self.recipients_manifest = Some(data.to_vec());
-    }
-
     pub fn persist(&self, repo: &Path) -> Result<(), SharedError> {
-        if self.vault.bytes.is_empty() && self.recipients_manifest.is_none() {
+        if self.collector.vault_bytes().is_empty() && self.collector.recipients_bytes().is_none() {
             return Ok(());
         }
 
         fs::create_dir_all(repo)
             .map_err(|err| io_error("create repository directory", repo, err))?;
 
-        if !self.vault.bytes.is_empty() {
+        let vault_bytes = self.collector.vault_bytes();
+        if !vault_bytes.is_empty() {
             let vault_path = repo.join(VAULT_FILE);
             if let Some(parent) = vault_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| io_error("prepare vault directory", parent, err))?;
             }
-            fs::write(&vault_path, &self.vault.bytes)
+            fs::write(&vault_path, vault_bytes)
                 .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
             println!("Saved vault artifact to '{}'.", vault_path.display());
         }
 
-        if let Some(recipients) = &self.recipients_manifest {
+        if let Some(recipients) = self.collector.recipients_bytes() {
             let recipients_path = repo.join(RECIPIENTS_FILE);
             if let Some(parent) = recipients_path.parent() {
                 fs::create_dir_all(parent)
@@ -140,7 +74,7 @@ impl PullArtifacts {
             );
         }
 
-        if let Some(signature) = &self.signature_bytes {
+        if let Some(signature) = self.collector.signature_bytes() {
             let signature_path = repo.join(SIGNATURE_FILE);
             if let Some(parent) = signature_path.parent() {
                 fs::create_dir_all(parent)
@@ -153,36 +87,21 @@ impl PullArtifacts {
 
         Ok(())
     }
-}
 
-#[derive(Default)]
-pub(crate) struct ArtifactBuffer {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) metadata: Vec<VaultChunkMetadata>,
-}
+    pub fn vault_bytes(&self) -> &[u8] {
+        self.collector.vault_bytes()
+    }
 
-#[allow(dead_code)]
-pub(crate) struct VaultChunkMetadata {
-    protocol_version: u16,
-    sequence: u32,
-    total_size: u64,
-    remaining_bytes: u64,
-    device_chunk_size: u32,
-    checksum: u32,
-    is_last: bool,
-}
+    pub fn recipients_manifest(&self) -> Option<&[u8]> {
+        self.collector.recipients_bytes()
+    }
 
-impl VaultChunkMetadata {
-    fn from_chunk(chunk: &VaultChunk) -> Self {
-        Self {
-            protocol_version: chunk.protocol_version,
-            sequence: chunk.sequence,
-            total_size: chunk.total_size,
-            remaining_bytes: chunk.remaining_bytes,
-            device_chunk_size: chunk.device_chunk_size,
-            checksum: chunk.checksum,
-            is_last: chunk.is_last,
-        }
+    pub fn signature_bytes(&self) -> Option<&[u8]> {
+        self.collector.signature_bytes()
+    }
+
+    pub fn signature_expected(&self) -> bool {
+        self.collector.signature_expected()
     }
 }
 

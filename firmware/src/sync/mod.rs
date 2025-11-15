@@ -28,6 +28,7 @@ use shared::schema::{
     SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
     decode_host_request, decode_journal_operations, encode_device_response,
 };
+use shared::transfer::{ArtifactLengths, ArtifactStream};
 use zeroize::Zeroizing;
 
 /// Maximum payload size (in bytes) that a single postcard frame is allowed to occupy on the wire.
@@ -146,14 +147,6 @@ impl From<FrameTransportError> for ProtocolError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransferStage {
-    Vault,
-    Recipients,
-    Signature,
-    Complete,
-}
-
 /// Runtime state required to service synchronization requests from the host.
 #[derive(Debug)]
 pub struct SyncContext {
@@ -161,10 +154,7 @@ pub struct SyncContext {
     frame_tracker: FrameTracker,
     next_sequence: u32,
     vault_image: Zeroizing<Vec<u8>>,
-    vault_offset: usize,
-    recipients_offset: usize,
     recipients_manifest: Zeroizing<Vec<u8>>,
-    signature_offset: usize,
     signature: Zeroizing<Vec<u8>>,
     expected_signature: Option<[u8; SIGNATURE_BUFFER_CAPACITY]>,
     incoming_vault: Zeroizing<Vec<u8>>,
@@ -173,8 +163,7 @@ pub struct SyncContext {
     incoming_vault_complete: bool,
     incoming_recipients_complete: bool,
     incoming_signature_complete: bool,
-    transfer_stage: TransferStage,
-    last_artifact: VaultArtifact,
+    transfer: ArtifactStream,
     crypto: CryptoMaterial,
     pin_lock: PinLockState,
     session_id: u32,
@@ -198,10 +187,7 @@ impl SyncContext {
             frame_tracker: FrameTracker::new(),
             next_sequence: 1,
             vault_image: Zeroizing::new(Vec::with_capacity(VAULT_BUFFER_CAPACITY)),
-            vault_offset: 0,
-            recipients_offset: 0,
             recipients_manifest: Zeroizing::new(Vec::with_capacity(RECIPIENTS_BUFFER_CAPACITY)),
-            signature_offset: 0,
             signature: Zeroizing::new(Vec::with_capacity(SIGNATURE_BUFFER_CAPACITY)),
             expected_signature: None,
             incoming_vault: Zeroizing::new(Vec::with_capacity(VAULT_BUFFER_CAPACITY)),
@@ -210,8 +196,7 @@ impl SyncContext {
             incoming_vault_complete: false,
             incoming_recipients_complete: false,
             incoming_signature_complete: false,
-            transfer_stage: TransferStage::Vault,
-            last_artifact: VaultArtifact::Vault,
+            transfer: ArtifactStream::new(),
             crypto: CryptoMaterial::default(),
             pin_lock: PinLockState::new(),
             session_id: 0,
@@ -346,7 +331,6 @@ impl SyncContext {
 
     fn reset_vault_buffers(&mut self) {
         self.vault_image = Zeroizing::new(Vec::new());
-        self.vault_offset = 0;
     }
 
     fn reset_vault_on_error<E>(&mut self, err: StorageError<E>) -> StorageError<E> {
@@ -489,32 +473,12 @@ impl SyncContext {
     }
 
     fn reset_transfer_state(&mut self) {
-        self.vault_offset = 0;
-        self.recipients_offset = 0;
-        self.signature_offset = 0;
-        self.transfer_stage = if !self.vault_image.is_empty() {
-            TransferStage::Vault
-        } else if !self.recipients_manifest.is_empty() {
-            TransferStage::Recipients
-        } else if !self.signature.is_empty() {
-            TransferStage::Signature
-        } else {
-            TransferStage::Complete
+        let lengths = ArtifactLengths {
+            vault: self.vault_image.len(),
+            recipients: self.recipients_manifest.len(),
+            signature: self.signature.len(),
         };
-        self.last_artifact = match self.transfer_stage {
-            TransferStage::Vault => VaultArtifact::Vault,
-            TransferStage::Recipients => VaultArtifact::Recipients,
-            TransferStage::Signature => VaultArtifact::Signature,
-            TransferStage::Complete => {
-                if !self.signature.is_empty() {
-                    VaultArtifact::Signature
-                } else if !self.recipients_manifest.is_empty() {
-                    VaultArtifact::Recipients
-                } else {
-                    VaultArtifact::Vault
-                }
-            }
-        };
+        self.transfer.reset(lengths);
     }
 
     fn reset_incoming_state(&mut self) {
@@ -630,52 +594,24 @@ impl SyncContext {
             });
         }
 
-        let artifact = match self.transfer_stage {
-            TransferStage::Vault => VaultArtifact::Vault,
-            TransferStage::Recipients => VaultArtifact::Recipients,
-            TransferStage::Signature => VaultArtifact::Signature,
-            TransferStage::Complete => self.last_artifact,
-        };
-
-        let (buffer, offset) = match artifact {
-            VaultArtifact::Vault => (self.vault_image.as_slice(), &mut self.vault_offset),
-            VaultArtifact::Recipients => (
-                self.recipients_manifest.as_slice(),
-                &mut self.recipients_offset,
-            ),
-            VaultArtifact::Signature => (self.signature.as_slice(), &mut self.signature_offset),
-        };
-
-        let available = buffer.len().saturating_sub(*offset);
         let frame_budget = cmp::min(host_buffer_size - FRAME_HEADER_SIZE, FRAME_MAX_SIZE);
         let max_payload = cmp::min(max_chunk, frame_budget);
-        let mut chunk_size = cmp::min(max_payload, available);
         let device_chunk_size = cmp::max(1, max_payload) as u32;
+        let mut chunk_size = max_payload;
 
         loop {
-            let slice_end = *offset + chunk_size;
-            let payload = if chunk_size == 0 {
-                Vec::new()
-            } else {
-                buffer[*offset..slice_end].to_vec()
-            };
-
-            let remaining = buffer.len().saturating_sub(slice_end) as u64;
-            let checksum = accumulate_checksum(0, &payload);
-
-            let chunk = VaultChunk {
-                protocol_version: PROTOCOL_VERSION,
-                sequence: self.next_sequence,
-                total_size: buffer.len() as u64,
-                remaining_bytes: remaining,
+            let pending = self.transfer.prepare_chunk(
+                self.next_sequence,
+                chunk_size,
                 device_chunk_size,
-                data: payload,
-                checksum,
-                is_last: remaining == 0,
-                artifact,
-            };
-
-            let response = DeviceResponse::VaultChunk(chunk);
+                |artifact| match artifact {
+                    VaultArtifact::Vault => self.vault_image.as_slice(),
+                    VaultArtifact::Recipients => self.recipients_manifest.as_slice(),
+                    VaultArtifact::Signature => self.signature.as_slice(),
+                },
+            );
+            let chunk = pending.chunk().clone();
+            let response = DeviceResponse::VaultChunk(chunk.clone());
             let encoded_len = match encode_device_response(&response) {
                 Ok(bytes) => bytes.len(),
                 Err(_) => {
@@ -685,67 +621,26 @@ impl SyncContext {
                     unreachable!("response must be a vault chunk");
                 }
             };
-            let chunk = match response {
-                DeviceResponse::VaultChunk(chunk) => chunk,
-                _ => unreachable!("response must be a vault chunk"),
-            };
 
             if encoded_len <= frame_budget {
-                if chunk_size == 0 && available > 0 {
+                if chunk_size == 0 && chunk.remaining_bytes > 0 {
                     return Err(ProtocolError::HostBufferTooSmall {
                         required: encoded_len + FRAME_HEADER_SIZE,
                         provided: host_buffer_size,
                     });
                 }
-
-                *offset = slice_end;
-                self.last_artifact = artifact;
-
-                if chunk.is_last {
-                    match artifact {
-                        VaultArtifact::Vault => {
-                            if !self.recipients_manifest.is_empty() {
-                                self.transfer_stage = TransferStage::Recipients;
-                                self.recipients_offset = 0;
-                            } else if !self.signature.is_empty() {
-                                self.transfer_stage = TransferStage::Signature;
-                                self.signature_offset = 0;
-                            } else {
-                                self.transfer_stage = TransferStage::Complete;
-                            }
-                        }
-                        VaultArtifact::Recipients => {
-                            if !self.signature.is_empty() {
-                                self.transfer_stage = TransferStage::Signature;
-                                self.signature_offset = 0;
-                            } else {
-                                self.transfer_stage = TransferStage::Complete;
-                            }
-                        }
-                        VaultArtifact::Signature => {
-                            self.transfer_stage = TransferStage::Complete;
-                        }
-                    }
-                } else {
-                    self.transfer_stage = match artifact {
-                        VaultArtifact::Vault => TransferStage::Vault,
-                        VaultArtifact::Recipients => TransferStage::Recipients,
-                        VaultArtifact::Signature => TransferStage::Signature,
-                    };
-                }
-
-                return Ok(chunk);
+                return Ok(self.transfer.commit_chunk(pending));
             }
 
             if chunk_size == 0 {
-                if available > 0 || frame_budget < encoded_len {
+                if chunk.remaining_bytes > 0 || frame_budget < encoded_len {
                     return Err(ProtocolError::HostBufferTooSmall {
                         required: encoded_len + FRAME_HEADER_SIZE,
                         provided: host_buffer_size,
                     });
                 }
 
-                return Ok(chunk);
+                return Ok(self.transfer.commit_chunk(pending));
             }
 
             let overhead = encoded_len.saturating_sub(chunk.data.len());
@@ -755,8 +650,11 @@ impl SyncContext {
             }
 
             let target_size = frame_budget - overhead;
-            let max_allowed = cmp::min(max_payload, available);
-            let new_size = cmp::min(target_size, max_allowed);
+            let available = chunk
+                .data
+                .len()
+                .saturating_add(chunk.remaining_bytes as usize);
+            let new_size = cmp::min(target_size, available);
 
             if new_size >= chunk_size {
                 chunk_size = chunk_size.saturating_sub(1);
@@ -1968,10 +1866,6 @@ mod tests {
         assert_eq!(ctx.signature.as_slice(), &[0xAB; SIGNATURE_BUFFER_CAPACITY]);
         assert_eq!(ctx.vault_generation, 7);
         assert_eq!(ctx.journal_ops.len(), 1);
-        assert_eq!(ctx.vault_offset, 0);
-        assert_eq!(ctx.recipients_offset, 0);
-        assert_eq!(ctx.transfer_stage, TransferStage::Vault);
-        assert_eq!(ctx.last_artifact, VaultArtifact::Vault);
 
         ctx.crypto.unlock_vault_key(pin).unwrap();
         let payload = b"record-data".to_vec();

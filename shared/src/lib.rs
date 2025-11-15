@@ -9,4 +9,5 @@ pub mod error;
 pub mod journal;
 pub mod schema;
 pub mod totp;
+pub mod transfer;
 pub mod vault;
