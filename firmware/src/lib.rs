@@ -11,11 +11,11 @@ use core::{
     ops::Range,
 };
 
-pub mod totp;
 pub mod crypto;
 pub mod hid;
 pub mod storage;
 pub mod sync;
+pub mod totp;
 pub mod ui;
 
 pub use crypto::{

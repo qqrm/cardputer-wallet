@@ -492,24 +492,23 @@ impl UiRuntime {
 
     fn enter_edit(&mut self, entry_id: String) -> UiEffect {
         let fields = self
-            .recents
-            .iter()
-            .find(|entry| entry.id == entry_id)
+            .vault
+            .entry(&entry_id)
             .map(|entry| {
                 vec![
                     FormField {
                         label: String::from("Title"),
-                        value: entry.title.clone(),
+                        value: entry.title,
                         secure: false,
                     },
                     FormField {
                         label: String::from("Username"),
-                        value: entry.username.clone(),
+                        value: entry.username,
                         secure: false,
                     },
                     FormField {
                         label: String::from("Note"),
-                        value: entry.note.clone().unwrap_or_default(),
+                        value: entry.note.unwrap_or_default(),
                         secure: false,
                     },
                 ]
