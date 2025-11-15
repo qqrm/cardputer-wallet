@@ -29,7 +29,8 @@ use shared::schema::{
     decode_journal_operations, encode_journal_operations,
 };
 use shared::vault::{
-    EntryUpdate, JournalOperation as VaultJournalOperation, PageCipher, VaultEntry, VaultMetadata,
+    EntryUpdate, JournalOperation as VaultJournalOperation, LegacyField, PageCipher, VaultEntry,
+    VaultMetadata,
 };
 use uuid::Uuid;
 
@@ -592,7 +593,9 @@ fn convert_device_operations(
                 let id = parse_legacy_uuid(&entry_id)?;
                 let entry = find_entry(&snapshot, &id)?;
                 let update = get_or_insert_update(&mut pending_updates, &id);
-                apply_field_update_from_entry(&id, entry, &field, value_checksum, update)?;
+                let field = LegacyField::try_from(field.as_str())
+                    .map_err(|err| SharedError::Transport(err.to_string()))?;
+                apply_field_update_from_entry(&id, entry, field, value_checksum, update)?;
                 if !sequence.iter().any(
                     |item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id),
                 ) {
@@ -726,84 +729,84 @@ fn entry_update_is_empty(update: &EntryUpdate) -> bool {
 fn apply_field_update_from_entry(
     id: &Uuid,
     entry: &VaultEntry,
-    field: &str,
+    field: LegacyField,
     expected_checksum: u32,
     update: &mut EntryUpdate,
 ) -> Result<(), SharedError> {
     match field {
-        "title" => {
+        LegacyField::Title => {
             verify_checksum(id, field, expected_checksum, entry.title.as_bytes())?;
             update.title = Some(entry.title.clone());
         }
-        "service" => {
+        LegacyField::Service => {
             verify_checksum(id, field, expected_checksum, entry.service.as_bytes())?;
             update.service = Some(entry.service.clone());
         }
-        "domains" => {
+        LegacyField::Domains => {
             let encoded = cbor_to_vec(&entry.domains).map_err(|err| {
                 SharedError::Transport(format!("failed to encode domains for entry {id}: {err}"))
             })?;
             verify_checksum(id, field, expected_checksum, &encoded)?;
             update.domains = Some(entry.domains.clone());
         }
-        "username" => {
+        LegacyField::Username => {
             verify_checksum(id, field, expected_checksum, entry.username.as_bytes())?;
             update.username = Some(entry.username.clone());
         }
-        "password" => {
+        LegacyField::Password => {
             verify_checksum(id, field, expected_checksum, entry.password.as_bytes())?;
             update.password = Some(entry.password.clone());
         }
-        "totp" => {
-            let totp = entry.totp.as_ref().ok_or_else(|| {
-                SharedError::Transport(format!(
+        LegacyField::Totp => {
+            let Some(totp) = entry.totp.as_ref() else {
+                return Err(SharedError::Transport(format!(
                     "legacy operations reference missing TOTP configuration for entry {id}"
-                ))
-            })?;
+                )));
+            };
             let encoded = cbor_to_vec(totp).map_err(|err| {
                 SharedError::Transport(format!("failed to encode TOTP for entry {id}: {err}"))
             })?;
             verify_checksum(id, field, expected_checksum, &encoded)?;
             update.totp = Some(totp.clone());
         }
-        "tags" => {
+        LegacyField::Tags => {
             let encoded = cbor_to_vec(&entry.tags).map_err(|err| {
                 SharedError::Transport(format!("failed to encode tags for entry {id}: {err}"))
             })?;
             verify_checksum(id, field, expected_checksum, &encoded)?;
             update.tags = Some(entry.tags.clone());
         }
-        "macro" => {
-            let value = entry.r#macro.as_ref().ok_or_else(|| {
-                SharedError::Transport(format!(
+        LegacyField::Macro => {
+            let Some(value) = entry.r#macro.as_ref() else {
+                return Err(SharedError::Transport(format!(
                     "legacy operations reference missing macro for entry {id}"
-                ))
-            })?;
+                )));
+            };
             verify_checksum(id, field, expected_checksum, value.as_bytes())?;
             update.r#macro = Some(value.clone());
         }
-        "updated_at" => {
+        LegacyField::UpdatedAt => {
             verify_checksum(id, field, expected_checksum, entry.updated_at.as_bytes())?;
             update.updated_at = Some(entry.updated_at.clone());
         }
-        "used_at" => {
+        LegacyField::UsedAt => {
             let encoded = cbor_to_vec(&entry.used_at).map_err(|err| {
                 SharedError::Transport(format!("failed to encode used_at for entry {id}: {err}"))
             })?;
             verify_checksum(id, field, expected_checksum, &encoded)?;
             update.used_at = Some(entry.used_at.clone());
         }
-        other => {
-            return Err(SharedError::Transport(format!(
-                "unsupported legacy journal field '{other}' for entry {id}"
-            )));
-        }
     }
 
     Ok(())
 }
 
-fn verify_checksum(id: &Uuid, field: &str, expected: u32, bytes: &[u8]) -> Result<(), SharedError> {
+fn verify_checksum(
+    id: &Uuid,
+    field: LegacyField,
+    expected: u32,
+    bytes: &[u8],
+) -> Result<(), SharedError> {
     let actual = compute_crc32(bytes);
     if actual != expected {
         return Err(SharedError::Transport(format!(
@@ -891,55 +894,85 @@ fn build_update_operations(
     let mut operations = Vec::new();
 
     if let Some(value) = &changes.title {
-        push_update_bytes(&mut operations, &entry_id, "title", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::Title,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.service {
-        push_update_bytes(&mut operations, &entry_id, "service", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::Service,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.domains {
         let encoded = cbor_to_vec(value).map_err(|err| {
             SharedError::Transport(format!("failed to encode domains update: {err}"))
         })?;
-        push_update_bytes(&mut operations, &entry_id, "domains", &encoded);
+        push_update_bytes(&mut operations, &entry_id, LegacyField::Domains, &encoded);
     }
 
     if let Some(value) = &changes.username {
-        push_update_bytes(&mut operations, &entry_id, "username", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::Username,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.password {
-        push_update_bytes(&mut operations, &entry_id, "password", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::Password,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.totp {
         let encoded = cbor_to_vec(value).map_err(|err| {
             SharedError::Transport(format!("failed to encode TOTP update: {err}"))
         })?;
-        push_update_bytes(&mut operations, &entry_id, "totp", &encoded);
+        push_update_bytes(&mut operations, &entry_id, LegacyField::Totp, &encoded);
     }
 
     if let Some(value) = &changes.tags {
         let encoded = cbor_to_vec(value).map_err(|err| {
             SharedError::Transport(format!("failed to encode tags update: {err}"))
         })?;
-        push_update_bytes(&mut operations, &entry_id, "tags", &encoded);
+        push_update_bytes(&mut operations, &entry_id, LegacyField::Tags, &encoded);
     }
 
     if let Some(value) = &changes.r#macro {
-        push_update_bytes(&mut operations, &entry_id, "macro", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::Macro,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.updated_at {
-        push_update_bytes(&mut operations, &entry_id, "updated_at", value.as_bytes());
+        push_update_bytes(
+            &mut operations,
+            &entry_id,
+            LegacyField::UpdatedAt,
+            value.as_bytes(),
+        );
     }
 
     if let Some(value) = &changes.used_at {
         let encoded = cbor_to_vec(value).map_err(|err| {
             SharedError::Transport(format!("failed to encode used_at update: {err}"))
         })?;
-        push_update_bytes(&mut operations, &entry_id, "used_at", &encoded);
+        push_update_bytes(&mut operations, &entry_id, LegacyField::UsedAt, &encoded);
     }
 
     Ok(operations)
@@ -948,13 +981,13 @@ fn build_update_operations(
 fn push_update_bytes(
     operations: &mut Vec<DeviceJournalOperation>,
     entry_id: &str,
-    field: &'static str,
+    field: LegacyField,
     bytes: &[u8],
 ) {
     let checksum = compute_crc32(bytes);
     operations.push(DeviceJournalOperation::UpdateField {
         entry_id: entry_id.to_owned(),
-        field: field.to_owned(),
+        field: field.to_string(),
         value_checksum: checksum,
     });
 }
