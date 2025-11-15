@@ -1,5 +1,6 @@
 use crate::vault::{
-    cipher::{EnvelopeAlgorithm, PageCipher},
+    errors::JournalError,
+    journal::VaultJournal,
     model::{EncryptedJournalPage, JOURNAL_AAD, JOURNAL_PAGE_VERSION, JournalPage, JournalRecord},
 };
 use alloc::{vec, vec::Vec};
@@ -8,22 +9,142 @@ use embedded_storage_async::nor_flash::NorFlash;
 use sequential_storage::{Error as SequentialStorageError, cache::CacheImpl, erase_all, queue};
 use zeroize::Zeroizing;
 
-/// Errors raised while persisting encrypted journal pages.
-#[derive(Debug, thiserror::Error)]
-pub enum VaultStorageError<SE>
+/// Firmware helpers for streaming encrypted journal pages to NOR flash.
+///
+/// The host CLI intentionally avoids this module so it can compile without `embedded-storage`
+/// or a NOR flash mock, while firmware links it to talk to real hardware.
+pub type VaultStorageError<SE> = JournalError<SequentialStorageError<SE>>;
+
+impl<SE> From<SequentialStorageError<SE>> for VaultStorageError<SE>
 where
     SE: core::fmt::Debug,
 {
-    #[error("storage error: {0:?}")]
-    Storage(SequentialStorageError<SE>),
-    #[error("serialization error: {0}")]
-    Codec(#[from] postcard::Error),
-    #[error("authentication failed")]
-    Authentication,
-    #[error("unsupported journal version {0}")]
-    UnsupportedVersion(u16),
-    #[error("nonce counter exhausted")]
-    NonceExhausted,
+    fn from(value: SequentialStorageError<SE>) -> Self {
+        JournalError::Storage(value)
+    }
+}
+
+impl VaultJournal {
+    /// Load and decrypt every record currently stored in flash.
+    ///
+    /// The call updates the nonce counter so future writes remain monotonic.
+    pub async fn load_records<S, CI, SE>(
+        &mut self,
+        flash: &mut S,
+        flash_range: Range<u32>,
+        cache: &mut CI,
+    ) -> Result<Vec<JournalRecord>, VaultStorageError<SE>>
+    where
+        S: NorFlash<Error = SE>,
+        CI: CacheImpl,
+        SE: core::fmt::Debug,
+    {
+        let mut buffer = vec![0u8; S::ERASE_SIZE];
+        let mut records = Vec::new();
+        let mut last_counter = None;
+
+        let mut iter = queue::iter(flash, flash_range.clone(), cache).await?;
+        while let Some(entry) = iter.next(&mut buffer).await? {
+            let slice = entry.into_buf();
+            let envelope: EncryptedJournalPage = postcard::from_bytes(slice)?;
+            let plaintext = Zeroizing::new(
+                self.cipher
+                    .decrypt(&envelope.nonce, JOURNAL_AAD, &envelope.ciphertext)
+                    .map_err(|_| JournalError::Authentication)?,
+            );
+            let page: JournalPage = postcard::from_bytes(plaintext.as_slice())?;
+            if page.version != JOURNAL_PAGE_VERSION {
+                return Err(JournalError::UnsupportedVersion(page.version));
+            }
+
+            last_counter =
+                Some(last_counter.map_or(page.counter, |prev: u64| prev.max(page.counter)));
+            records.extend(page.records.into_iter());
+        }
+
+        if let Some(counter) = last_counter {
+            self.observe_counter(counter)?;
+        }
+
+        Ok(records)
+    }
+
+    /// Append a batch of journal records. Returns without touching flash when the batch is empty.
+    pub async fn append_records<S, CI, SE>(
+        &mut self,
+        flash: &mut S,
+        flash_range: Range<u32>,
+        cache: &mut CI,
+        records: impl IntoIterator<Item = JournalRecord>,
+    ) -> Result<(), VaultStorageError<SE>>
+    where
+        S: NorFlash<Error = SE>,
+        CI: CacheImpl,
+        SE: core::fmt::Debug,
+    {
+        let records: Vec<JournalRecord> = records.into_iter().collect();
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let (counter, nonce) = self.reserve_nonce()?;
+
+        let page = JournalPage {
+            version: JOURNAL_PAGE_VERSION,
+            counter,
+            records,
+        };
+        let plaintext = Zeroizing::new(postcard::to_allocvec(&page)?);
+        let ciphertext = self
+            .cipher
+            .encrypt(&nonce, JOURNAL_AAD, plaintext.as_slice())
+            .map_err(|_| JournalError::Authentication)?;
+        let envelope = EncryptedJournalPage {
+            counter,
+            nonce,
+            ciphertext,
+        };
+        let encoded = postcard::to_allocvec(&envelope)?;
+
+        queue::push(flash, flash_range, cache, &encoded, false).await?;
+        Ok(())
+    }
+
+    /// Append a single record to the journal.
+    pub async fn append_record<S, CI, SE>(
+        &mut self,
+        flash: &mut S,
+        flash_range: Range<u32>,
+        cache: &mut CI,
+        record: JournalRecord,
+    ) -> Result<(), VaultStorageError<SE>>
+    where
+        S: NorFlash<Error = SE>,
+        CI: CacheImpl,
+        SE: core::fmt::Debug,
+    {
+        self.append_records(flash, flash_range, cache, core::iter::once(record))
+            .await
+    }
+
+    /// Remove every stored record by erasing the configured range.
+    ///
+    /// The nonce counter remains monotonic so future appends continue to use
+    /// fresh nonces for the configured cipher key.
+    pub async fn clear<S, CI, SE>(
+        &mut self,
+        flash: &mut S,
+        flash_range: Range<u32>,
+        _cache: &mut CI,
+    ) -> Result<(), VaultStorageError<SE>>
+    where
+        S: NorFlash<Error = SE>,
+        CI: CacheImpl,
+        SE: core::fmt::Debug,
+    {
+        erase_all(flash, flash_range.clone()).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -31,6 +152,7 @@ mod tests {
     use super::*;
     use crate::vault::{
         EntryUpdate, JournalOperation, JournalRecord, TotpAlgorithm, TotpConfig, VaultEntry,
+        cipher::PageCipher,
     };
     use futures::executor::block_on;
     use sequential_storage::{
@@ -235,178 +357,5 @@ mod tests {
 
             assert_eq!(journal.next_counter, counter_after_append);
         });
-    }
-}
-
-impl<SE> From<SequentialStorageError<SE>> for VaultStorageError<SE>
-where
-    SE: core::fmt::Debug,
-{
-    fn from(value: SequentialStorageError<SE>) -> Self {
-        Self::Storage(value)
-    }
-}
-
-/// Wrapper around `sequential-storage` that encrypts every page using an AEAD envelope.
-#[derive(Debug, Clone)]
-pub struct VaultJournal {
-    cipher: PageCipher,
-    next_counter: u64,
-}
-
-impl VaultJournal {
-    const NONCE_DOMAIN: [u8; 4] = *b"JNL1";
-
-    /// Create a new journal for the provided cipher.
-    pub const fn new(cipher: PageCipher) -> Self {
-        Self {
-            cipher,
-            next_counter: 0,
-        }
-    }
-
-    /// Return the configured envelope algorithm.
-    pub const fn algorithm(&self) -> EnvelopeAlgorithm {
-        self.cipher.algorithm()
-    }
-
-    /// Load and decrypt every record currently stored in flash.
-    ///
-    /// The call updates the nonce counter so future writes remain monotonic.
-    pub async fn load_records<S, CI, SE>(
-        &mut self,
-        flash: &mut S,
-        flash_range: Range<u32>,
-        cache: &mut CI,
-    ) -> Result<Vec<JournalRecord>, VaultStorageError<SE>>
-    where
-        S: NorFlash<Error = SE>,
-        CI: CacheImpl,
-        SE: core::fmt::Debug,
-    {
-        let mut buffer = vec![0u8; S::ERASE_SIZE];
-        let mut records = Vec::new();
-        let mut last_counter = None;
-
-        let mut iter = queue::iter(flash, flash_range.clone(), cache).await?;
-        while let Some(entry) = iter.next(&mut buffer).await? {
-            let slice = entry.into_buf();
-            let envelope: EncryptedJournalPage = postcard::from_bytes(slice)?;
-            let plaintext = Zeroizing::new(
-                self.cipher
-                    .decrypt(&envelope.nonce, JOURNAL_AAD, &envelope.ciphertext)
-                    .map_err(|_| VaultStorageError::Authentication)?,
-            );
-            let page: JournalPage = postcard::from_bytes(plaintext.as_slice())?;
-            if page.version != JOURNAL_PAGE_VERSION {
-                return Err(VaultStorageError::UnsupportedVersion(page.version));
-            }
-
-            last_counter =
-                Some(last_counter.map_or(page.counter, |prev: u64| prev.max(page.counter)));
-            records.extend(page.records.into_iter());
-        }
-
-        if let Some(counter) = last_counter {
-            self.next_counter = self.next_counter.max(
-                counter
-                    .checked_add(1)
-                    .ok_or(VaultStorageError::NonceExhausted)?,
-            );
-        }
-
-        Ok(records)
-    }
-
-    /// Append a batch of journal records. Returns without touching flash when the batch is empty.
-    pub async fn append_records<S, CI, SE>(
-        &mut self,
-        flash: &mut S,
-        flash_range: Range<u32>,
-        cache: &mut CI,
-        records: impl IntoIterator<Item = JournalRecord>,
-    ) -> Result<(), VaultStorageError<SE>>
-    where
-        S: NorFlash<Error = SE>,
-        CI: CacheImpl,
-        SE: core::fmt::Debug,
-    {
-        let records: Vec<JournalRecord> = records.into_iter().collect();
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let counter = self.next_counter;
-        let nonce = Self::build_nonce(counter)?;
-        self.next_counter = self
-            .next_counter
-            .checked_add(1)
-            .ok_or(VaultStorageError::NonceExhausted)?;
-
-        let page = JournalPage {
-            version: JOURNAL_PAGE_VERSION,
-            counter,
-            records,
-        };
-        let plaintext = Zeroizing::new(postcard::to_allocvec(&page)?);
-        let ciphertext = self
-            .cipher
-            .encrypt(&nonce, JOURNAL_AAD, plaintext.as_slice())
-            .map_err(|_| VaultStorageError::Authentication)?;
-        let envelope = EncryptedJournalPage {
-            counter,
-            nonce,
-            ciphertext,
-        };
-        let encoded = postcard::to_allocvec(&envelope)?;
-
-        queue::push(flash, flash_range, cache, &encoded, false).await?;
-        Ok(())
-    }
-
-    /// Append a single record to the journal.
-    pub async fn append_record<S, CI, SE>(
-        &mut self,
-        flash: &mut S,
-        flash_range: Range<u32>,
-        cache: &mut CI,
-        record: JournalRecord,
-    ) -> Result<(), VaultStorageError<SE>>
-    where
-        S: NorFlash<Error = SE>,
-        CI: CacheImpl,
-        SE: core::fmt::Debug,
-    {
-        self.append_records(flash, flash_range, cache, core::iter::once(record))
-            .await
-    }
-
-    /// Remove every stored record by erasing the configured range.
-    ///
-    /// The nonce counter remains monotonic so future appends continue to use
-    /// fresh nonces for the configured cipher key.
-    pub async fn clear<S, CI, SE>(
-        &mut self,
-        flash: &mut S,
-        flash_range: Range<u32>,
-        _cache: &mut CI,
-    ) -> Result<(), VaultStorageError<SE>>
-    where
-        S: NorFlash<Error = SE>,
-        CI: CacheImpl,
-        SE: core::fmt::Debug,
-    {
-        erase_all(flash, flash_range.clone()).await?;
-        Ok(())
-    }
-
-    fn build_nonce<SE>(counter: u64) -> Result<[u8; 12], VaultStorageError<SE>>
-    where
-        SE: core::fmt::Debug,
-    {
-        let mut nonce = [0u8; 12];
-        nonce[..4].copy_from_slice(&Self::NONCE_DOMAIN);
-        nonce[4..].copy_from_slice(&counter.to_be_bytes());
-        Ok(nonce)
     }
 }
