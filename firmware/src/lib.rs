@@ -4,6 +4,14 @@
 
 extern crate alloc;
 
+use alloc::{format, string::String, string::ToString, vec, vec::Vec};
+use core::{
+    cmp,
+    convert::{TryFrom, TryInto},
+    ops::Range,
+};
+
+pub mod totp;
 pub mod crypto;
 pub mod hid;
 pub mod storage;

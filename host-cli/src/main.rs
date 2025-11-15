@@ -388,7 +388,7 @@ where
         args.credentials.display()
     );
 
-    let (sequence, checksum) = load_sync_state(&args.repo)?.ok_or_else(|| {
+    let state = load_sync_state(&args.repo)?.ok_or_else(|| {
         eprintln!(
             "Missing journal state in '{}'. Run pull before confirming a push.",
             args.repo.display()

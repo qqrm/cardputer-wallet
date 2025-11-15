@@ -1,7 +1,8 @@
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, vec, vec::Vec};
 use core::cmp;
 
 use super::{
+    JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel,
     input::{KeyEvent, Keymap, UiCommand},
     render::{
         EditView, EntryDetails, EntryView, FormField, FormWidget, Frame, HintBar, HintItem,
@@ -50,6 +51,9 @@ pub struct EntrySummary {
     pub note: Option<String>,
 }
 
+const MIN_SEARCH_LEN: usize = 2;
+const DEFAULT_TOTP_PERIOD: u8 = 30;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HomeState {
     search_query: String,
@@ -87,43 +91,6 @@ struct LockState {
     remaining_attempts: Option<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TotpState {
-    code: Option<String>,
-    period: u8,
-    remaining_ms: u32,
-}
-
-impl TotpState {
-    fn new(period: u8) -> Self {
-        Self {
-            code: None,
-            period,
-            remaining_ms: period as u32 * 1_000,
-        }
-    }
-
-    fn seconds_remaining(&self) -> u8 {
-        cmp::min(self.remaining_ms / 1_000, self.period as u32) as u8
-    }
-
-    fn tick(&mut self, elapsed_ms: u32) {
-        if elapsed_ms >= self.remaining_ms {
-            self.remaining_ms = self.period as u32 * 1_000;
-        } else {
-            self.remaining_ms -= elapsed_ms;
-        }
-    }
-
-    fn widget(&self) -> TotpWidget {
-        TotpWidget {
-            code: self.code.clone(),
-            seconds_remaining: self.seconds_remaining(),
-            period: self.period,
-        }
-    }
-}
-
 /// Aggregate runtime for UI navigation and rendering.
 pub struct UiRuntime {
     screen: UiScreen,
@@ -134,14 +101,16 @@ pub struct UiRuntime {
     edit: Option<EditState>,
     settings: SettingsState,
     sync: SyncState,
-    recents: Vec<EntrySummary>,
-    totp: TotpState,
+    vault: Box<dyn VaultViewModel>,
+    totp: Box<dyn TotpProvider>,
     show_hints: bool,
 }
 
 impl UiRuntime {
-    /// Construct a new UI runtime seeded with the provided recent entries.
-    pub fn new(recents: Vec<EntrySummary>) -> Self {
+    /// Construct a new UI runtime backed by the provided data sources.
+    pub fn new(vault: Box<dyn VaultViewModel>, mut totp: Box<dyn TotpProvider>) -> Self {
+        totp.select_entry(None);
+
         Self {
             screen: UiScreen::Lock,
             keymap: Keymap::default(),
@@ -163,8 +132,8 @@ impl UiRuntime {
                 stage: String::from("Idle"),
                 progress_percent: 0,
             },
-            recents,
-            totp: TotpState::new(30),
+            vault,
+            totp,
             show_hints: true,
         }
     }
@@ -177,6 +146,11 @@ impl UiRuntime {
     /// Access the mutable keymap for custom bindings.
     pub fn keymap_mut(&mut self) -> &mut Keymap {
         &mut self.keymap
+    }
+
+    fn set_screen(&mut self, screen: UiScreen) {
+        self.screen = screen;
+        self.sync_totp_selection();
     }
 
     /// Handle a raw keyboard event.
@@ -196,7 +170,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             other => self.route_command(other),
@@ -217,16 +191,16 @@ impl UiRuntime {
     fn handle_lock(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::Activate => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
             UiCommand::Back => UiEffect::None,
             UiCommand::GoHome => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
             UiCommand::FocusSearch => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 self.home.search_focus = true;
                 UiEffect::None
             }
@@ -251,11 +225,11 @@ impl UiRuntime {
                 }
             }
             UiCommand::OpenSettings => {
-                self.screen = UiScreen::Settings;
+                self.set_screen(UiScreen::Settings);
                 UiEffect::None
             }
             UiCommand::StartSync => {
-                self.screen = UiScreen::Sync;
+                self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
             }
             UiCommand::MoveSelectionUp | UiCommand::MoveSelectionLeft => {
@@ -284,19 +258,25 @@ impl UiRuntime {
                         self.home.search_focus = true;
                     }
                     self.home.search_query.push(c);
+                    self.home.selected_recent = 0;
+                    self.sync_totp_selection();
                 }
                 UiEffect::None
             }
             UiCommand::DeleteChar => {
                 self.home.search_query.pop();
+                self.home.selected_recent = 0;
+                self.sync_totp_selection();
                 UiEffect::None
             }
             UiCommand::ClearSearch => {
                 self.home.search_query.clear();
+                self.home.selected_recent = 0;
+                self.sync_totp_selection();
                 UiEffect::None
             }
             UiCommand::Back | UiCommand::CancelEdit => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             _ => UiEffect::None,
@@ -306,15 +286,15 @@ impl UiRuntime {
     fn handle_entry(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::Back | UiCommand::GoHome => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             UiCommand::StartSync => {
-                self.screen = UiScreen::Sync;
+                self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
             }
             UiCommand::EditEntry | UiCommand::Activate => {
@@ -325,7 +305,7 @@ impl UiRuntime {
                 }
             }
             UiCommand::FocusSearch => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 self.home.search_focus = true;
                 UiEffect::None
             }
@@ -375,7 +355,7 @@ impl UiRuntime {
                         entry_id: entry_id.clone(),
                         hint: Some(String::from("Entry saved")),
                     });
-                    self.screen = UiScreen::Entry;
+                    self.set_screen(UiScreen::Entry);
                     UiEffect::SaveEdit { entry_id }
                 } else {
                     UiEffect::None
@@ -388,19 +368,19 @@ impl UiRuntime {
                         entry_id: entry_id.clone(),
                         hint: Some(String::from("Edit cancelled")),
                     });
-                    self.screen = UiScreen::Entry;
+                    self.set_screen(UiScreen::Entry);
                     UiEffect::CancelEdit { entry_id }
                 } else {
-                    self.screen = UiScreen::Entry;
+                    self.set_screen(UiScreen::Entry);
                     UiEffect::None
                 }
             }
             UiCommand::Lock => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             UiCommand::StartSync => {
-                self.screen = UiScreen::Sync;
+                self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
             }
             _ => UiEffect::None,
@@ -410,11 +390,11 @@ impl UiRuntime {
     fn handle_settings(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::Back | UiCommand::GoHome => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             UiCommand::MoveSelectionUp => {
@@ -430,7 +410,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::StartSync => {
-                self.screen = UiScreen::Sync;
+                self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
             }
             _ => UiEffect::None,
@@ -440,11 +420,11 @@ impl UiRuntime {
     fn handle_sync(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::Back | UiCommand::GoHome => {
-                self.screen = UiScreen::Home;
+                self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.screen = UiScreen::Lock;
+                self.set_screen(UiScreen::Lock);
                 UiEffect::None
             }
             _ => UiEffect::None,
@@ -452,7 +432,7 @@ impl UiRuntime {
     }
 
     fn selected_entry_id(&self) -> Option<String> {
-        self.recents
+        self.visible_entries()
             .get(self.home.selected_recent)
             .map(|entry| entry.id.clone())
     }
@@ -464,12 +444,49 @@ impl UiRuntime {
             .or_else(|| self.selected_entry_id())
     }
 
+    fn sync_totp_selection(&mut self) {
+        let target = match self.screen {
+            UiScreen::Entry => self.entry.as_ref().and_then(|state| {
+                self.vault
+                    .entry(&state.entry_id)
+                    .filter(|entry| entry.totp.is_some())
+                    .map(|entry| entry.id)
+            }),
+            UiScreen::Home => self
+                .visible_entries()
+                .get(self.home.selected_recent)
+                .filter(|entry| entry.totp.is_some())
+                .map(|entry| entry.id.clone()),
+            _ => None,
+        };
+
+        self.totp.select_entry(target.as_deref());
+    }
+
+    fn normalized_query(&self) -> Option<String> {
+        let trimmed = self.home.search_query.trim();
+        if trimmed.len() >= MIN_SEARCH_LEN {
+            Some(trimmed.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn visible_entries(&self) -> Vec<EntrySummary> {
+        let entries = self.vault.entries();
+        if let Some(query) = self.normalized_query() {
+            filter_entries(entries, &query)
+        } else {
+            sort_by_last_used(entries)
+        }
+    }
+
     fn open_entry(&mut self, entry_id: String) -> UiEffect {
         self.entry = Some(EntryState {
             entry_id: entry_id.clone(),
             hint: None,
         });
-        self.screen = UiScreen::Entry;
+        self.set_screen(UiScreen::Entry);
         UiEffect::None
     }
 
@@ -510,26 +527,25 @@ impl UiRuntime {
             fields,
             active_index: 0,
         });
-        self.screen = UiScreen::Edit;
+        self.set_screen(UiScreen::Edit);
         UiEffect::BeginEdit { entry_id }
     }
 
     fn move_recent_selection(&mut self, delta: isize) {
-        if self.recents.is_empty() {
+        let entries = self.visible_entries();
+        if entries.is_empty() {
             self.home.selected_recent = 0;
+            self.totp.select_entry(None);
             return;
         }
 
         let current = self.home.selected_recent as isize;
-        let max = (self.recents.len() - 1) as isize;
-        let mut next = current + delta;
-        if next < 0 {
-            next = 0;
+        let max = (entries.len() - 1) as isize;
+        let next = (current + delta).clamp(0, max) as usize;
+        if next != self.home.selected_recent {
+            self.home.selected_recent = next;
+            self.sync_totp_selection();
         }
-        if next > max {
-            next = max;
-        }
-        self.home.selected_recent = next as usize;
     }
 
     /// Update sync progress that will be reflected in the next render.
@@ -538,35 +554,30 @@ impl UiRuntime {
         self.sync.stage = stage.into();
     }
 
-    /// Update the cached TOTP code and reset the countdown window.
-    pub fn update_totp(&mut self, code: Option<String>, remaining_ms: u32) {
-        self.totp.code = code;
-        self.totp.remaining_ms = cmp::min(remaining_ms, self.totp.period as u32 * 1_000);
-    }
-
     /// Advance time for the TOTP countdown.
     pub fn tick(&mut self, elapsed_ms: u32) {
         self.totp.tick(elapsed_ms);
     }
 
-    fn current_entry(&self) -> Option<&EntrySummary> {
-        let Some(entry_state) = &self.entry else {
-            return None;
-        };
-        self.recents
-            .iter()
-            .find(|entry| entry.id == entry_state.entry_id)
+    fn current_entry(&self) -> Option<EntrySummary> {
+        let entry_state = self.entry.as_ref()?;
+        self.vault.entry(&entry_state.entry_id)
     }
 
     fn render_entry(&self) -> EntryView {
         let entry = self.current_entry();
-        let totp_widget =
-            entry.and_then(|summary| summary.totp.as_ref().map(|_| self.totp.widget()));
+        let totp_snapshot = self.totp.snapshot();
+        let totp_widget = entry
+            .as_ref()
+            .and_then(|summary| summary.totp.as_ref().map(|_| totp_snapshot.to_widget()));
 
         EntryView {
             entry: EntryDetails {
-                title: entry.map(|e| e.title.clone()).unwrap_or_default(),
-                username: entry.map(|e| e.username.clone()).unwrap_or_default(),
+                title: entry.as_ref().map(|e| e.title.clone()).unwrap_or_default(),
+                username: entry
+                    .as_ref()
+                    .map(|e| e.username.clone())
+                    .unwrap_or_default(),
                 note: entry.and_then(|e| e.note.clone()),
                 totp: totp_widget,
             },
@@ -594,28 +605,30 @@ impl UiRuntime {
     }
 
     fn render_home(&self) -> HomeView {
-        let entries = self
-            .recents
+        let visible = self.visible_entries();
+        let list_entries = visible
             .iter()
             .map(|entry| RecentListItem {
                 title: entry.title.clone(),
                 subtitle: Some(entry.username.clone()),
             })
             .collect();
+        let totp_widget = self.totp.snapshot().to_widget();
+        let selected = if visible.is_empty() || self.home.selected_recent >= visible.len() {
+            None
+        } else {
+            Some(self.home.selected_recent)
+        };
         HomeView {
             search: SearchWidget {
                 query: self.home.search_query.clone(),
                 has_focus: self.home.search_focus,
             },
             recent: RecentList {
-                entries,
-                selected: if self.recents.is_empty() {
-                    None
-                } else {
-                    Some(self.home.selected_recent)
-                },
+                entries: list_entries,
+                selected,
             },
-            totp: self.totp.widget(),
+            totp: totp_widget,
         }
     }
 
@@ -627,10 +640,22 @@ impl UiRuntime {
     }
 
     fn render_sync(&self) -> SyncView {
+        let journal = self.vault.journal();
+        let stage = if journal.is_empty() {
+            format!("{} (up to date)", self.sync.stage)
+        } else {
+            format!("{} ({} pending)", self.sync.stage, journal.len())
+        };
+        let hint = if journal.is_empty() {
+            Some(String::from("Journal empty"))
+        } else {
+            Some(describe_journal_entry(&journal[0]))
+        };
+
         SyncView {
-            stage: self.sync.stage.clone(),
+            stage,
             progress_percent: self.sync.progress_percent,
-            hint: Some(String::from("Keep device awake during sync")),
+            hint,
         }
     }
 
@@ -715,10 +740,173 @@ fn default_settings_options() -> Vec<SettingsItem> {
     ]
 }
 
+fn describe_journal_entry(entry: &JournalEntryView) -> String {
+    let mut text = format!("{} {}", journal_action_label(entry.action), entry.entry_id);
+    if let Some(description) = &entry.description {
+        text.push_str(" – ");
+        text.push_str(description);
+    }
+    if let Some(timestamp) = &entry.timestamp {
+        text.push_str(" @ ");
+        text.push_str(timestamp);
+    }
+    text
+}
+
+fn journal_action_label(action: JournalAction) -> &'static str {
+    match action {
+        JournalAction::Add => "Add",
+        JournalAction::Update => "Update",
+        JournalAction::Delete => "Delete",
+    }
+}
+
+fn sort_by_last_used(mut entries: Vec<EntrySummary>) -> Vec<EntrySummary> {
+    entries.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+    entries
+}
+
+fn filter_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
+    let mut prefix: Vec<EntrySummary> = Vec::new();
+    let mut fuzzy: Vec<(EntrySummary, usize)> = Vec::new();
+    let mut fallback: Vec<EntrySummary> = Vec::new();
+
+    for entry in entries {
+        let title = entry.title.to_ascii_lowercase();
+        let username = entry.username.to_ascii_lowercase();
+        if title.starts_with(query) || username.starts_with(query) {
+            prefix.push(entry);
+            continue;
+        }
+
+        let distance = cmp::min(levenshtein(&title, query), levenshtein(&username, query));
+        if distance <= 1 {
+            fuzzy.push((entry, distance));
+        } else {
+            fallback.push(entry);
+        }
+    }
+
+    prefix.sort_by(|a, b| {
+        let title_cmp = a
+            .title
+            .to_ascii_lowercase()
+            .cmp(&b.title.to_ascii_lowercase());
+        if title_cmp == cmp::Ordering::Equal {
+            a.username
+                .to_ascii_lowercase()
+                .cmp(&b.username.to_ascii_lowercase())
+        } else {
+            title_cmp
+        }
+    });
+
+    fuzzy.sort_by(|(entry_a, dist_a), (entry_b, dist_b)| {
+        dist_a
+            .cmp(dist_b)
+            .then_with(|| {
+                entry_a
+                    .title
+                    .to_ascii_lowercase()
+                    .cmp(&entry_b.title.to_ascii_lowercase())
+            })
+            .then_with(|| {
+                entry_a
+                    .username
+                    .to_ascii_lowercase()
+                    .cmp(&entry_b.username.to_ascii_lowercase())
+            })
+    });
+
+    fallback.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+
+    prefix
+        .into_iter()
+        .chain(fuzzy.into_iter().map(|(entry, _)| entry))
+        .chain(fallback.into_iter())
+        .collect()
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a.is_empty() {
+        return b.chars().count();
+    }
+    if b.is_empty() {
+        return a.chars().count();
+    }
+
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut current = vec![0usize; b_chars.len() + 1];
+
+    for (i, a_ch) in a_chars.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, b_ch) in b_chars.iter().enumerate() {
+            let cost = if a_ch == b_ch { 0 } else { 1 };
+            current[j + 1] = cmp::min(
+                cmp::min(current[j] + 1, previous[j + 1] + 1),
+                previous[j] + cost,
+            );
+        }
+        previous.copy_from_slice(&current);
+    }
+
+    previous[b_chars.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::input::PhysicalKey;
+    use crate::ui::{
+        JournalAction, JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel,
+        input::PhysicalKey,
+    };
+
+    struct MemoryVault {
+        entries: Vec<EntrySummary>,
+        journal: Vec<JournalEntryView>,
+    }
+
+    impl MemoryVault {
+        fn new(entries: Vec<EntrySummary>) -> Self {
+            Self {
+                entries,
+                journal: Vec::new(),
+            }
+        }
+
+        fn with_journal(entries: Vec<EntrySummary>, journal: Vec<JournalEntryView>) -> Self {
+            Self { entries, journal }
+        }
+    }
+
+    impl VaultViewModel for MemoryVault {
+        fn entries(&self) -> Vec<EntrySummary> {
+            self.entries.clone()
+        }
+
+        fn entry(&self, id: &str) -> Option<EntrySummary> {
+            self.entries.iter().find(|entry| entry.id == id).cloned()
+        }
+
+        fn journal(&self) -> Vec<JournalEntryView> {
+            self.journal.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct NullTotpProvider;
+
+    impl TotpProvider for NullTotpProvider {
+        fn select_entry(&mut self, _entry_id: Option<&str>) {}
+
+        fn snapshot(&self) -> TotpSnapshot {
+            TotpSnapshot::empty(DEFAULT_TOTP_PERIOD)
+        }
+
+        fn tick(&mut self, _elapsed_ms: u32) {}
+    }
 
     fn sample_entries() -> Vec<EntrySummary> {
         vec![
@@ -726,8 +914,8 @@ mod tests {
                 id: String::from("alpha"),
                 title: String::from("Alpha Account"),
                 username: String::from("alpha@example.com"),
-                last_used: String::from("2024-01-01"),
-                totp: Some(String::from("123456")),
+                last_used: String::from("2024-01-03"),
+                totp: Some(String::from("has-totp")),
                 note: Some(String::from("primary account")),
             },
             EntrySummary {
@@ -741,10 +929,14 @@ mod tests {
         ]
     }
 
+    fn build_runtime(vault: MemoryVault) -> UiRuntime {
+        UiRuntime::new(Box::new(vault), Box::new(NullTotpProvider))
+    }
+
     #[test]
     fn state_machine_transitions_follow_expected_flow() {
         transport::reset();
-        let mut ui = UiRuntime::new(sample_entries());
+        let mut ui = build_runtime(MemoryVault::new(sample_entries()));
         assert_eq!(ui.screen(), UiScreen::Lock);
 
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
@@ -759,6 +951,9 @@ mod tests {
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
         assert_eq!(ui.screen(), UiScreen::Entry);
 
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Settings));
+        assert_eq!(ui.screen(), UiScreen::Settings);
+
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Sync));
         assert_eq!(ui.screen(), UiScreen::Sync);
 
@@ -772,41 +967,37 @@ mod tests {
     #[test]
     fn hint_bar_reflects_active_screen() {
         transport::reset();
-        let mut ui = UiRuntime::new(sample_entries());
-        let mut frame = ui.render();
-        assert!(
-            frame
-                .hint_bar
-                .hints
-                .iter()
-                .any(|hint| hint.action.contains("Unlock"))
-        );
+        let mut ui = build_runtime(MemoryVault::new(sample_entries()));
 
-        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
-        frame = ui.render();
-        assert!(
-            frame
-                .hint_bar
-                .hints
-                .iter()
-                .any(|hint| hint.action.contains("Open"))
-        );
+        let mut assert_hint = |expected: &str| {
+            let frame = ui.render();
+            assert!(
+                frame
+                    .hint_bar
+                    .hints
+                    .iter()
+                    .any(|hint| hint.action.contains(expected)),
+                "missing {expected} hint"
+            );
+        };
 
+        assert_hint("Unlock");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
-        frame = ui.render();
-        assert!(
-            frame
-                .hint_bar
-                .hints
-                .iter()
-                .any(|hint| hint.action.contains("Edit"))
-        );
+        assert_hint("Open");
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
+        assert_hint("Edit");
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Edit));
+        assert_hint("Save");
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Settings));
+        assert_hint("Select");
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Sync));
+        assert_hint("Lock");
     }
 
     #[test]
     fn recent_selection_moves_with_arrows() {
         transport::reset();
-        let mut ui = UiRuntime::new(sample_entries());
+        let mut ui = build_runtime(MemoryVault::new(sample_entries()));
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::ArrowDown));
         let frame = ui.render();
@@ -815,6 +1006,86 @@ mod tests {
                 assert_eq!(home.recent.selected, Some(1));
             }
             _ => panic!("expected home view"),
+        }
+    }
+
+    #[test]
+    fn search_results_follow_spec_sorting() {
+        transport::reset();
+        let mut entries = vec![
+            EntrySummary {
+                id: String::from("alpha"),
+                title: String::from("Alpha"),
+                username: String::from("admin"),
+                last_used: String::from("2024-01-03"),
+                totp: None,
+                note: None,
+            },
+            EntrySummary {
+                id: String::from("alpine"),
+                title: String::from("Alpine"),
+                username: String::from("ops"),
+                last_used: String::from("2024-01-02"),
+                totp: None,
+                note: None,
+            },
+            EntrySummary {
+                id: String::from("gamma"),
+                title: String::from("Gamma"),
+                username: String::from("alx"),
+                last_used: String::from("2024-01-10"),
+                totp: None,
+                note: None,
+            },
+            EntrySummary {
+                id: String::from("omega"),
+                title: String::from("Omega"),
+                username: String::from("user"),
+                last_used: String::from("2024-02-01"),
+                totp: None,
+                note: None,
+            },
+        ];
+        entries.extend(sample_entries());
+        let mut ui = build_runtime(MemoryVault::new(entries));
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
+        ui.home.search_query = String::from("al");
+        let frame = ui.render();
+        match frame.content {
+            ViewContent::Home(home) => {
+                let titles: Vec<_> = home
+                    .recent
+                    .entries
+                    .iter()
+                    .map(|item| item.title.clone())
+                    .collect();
+                assert_eq!(titles[0], "Alpha");
+                assert_eq!(titles[1], "Alpine");
+                assert_eq!(titles[2], "Gamma");
+            }
+            _ => panic!("expected home view"),
+        }
+    }
+
+    #[test]
+    fn sync_view_reflects_journal() {
+        transport::reset();
+        let journal = vec![JournalEntryView::new(
+            "alpha",
+            JournalAction::Update,
+            Some(String::from("username")),
+            Some(String::from("2024-01-10T00:00:00Z")),
+        )];
+        let mut ui = build_runtime(MemoryVault::with_journal(sample_entries(), journal));
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
+        ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Sync));
+        let frame = ui.render();
+        match frame.content {
+            ViewContent::Sync(sync) => {
+                assert!(sync.stage.contains("pending"));
+                assert!(sync.hint.unwrap().contains("Update"));
+            }
+            _ => panic!("expected sync view"),
         }
     }
 }
