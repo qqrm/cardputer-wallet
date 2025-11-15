@@ -139,7 +139,7 @@ mod tests {
                     &mut flash,
                     flash_range.clone(),
                     &mut NoCache::new(),
-                    &[update_record.clone(), delete_record.clone()],
+                    vec![update_record.clone(), delete_record.clone()],
                 )
                 .await
                 .unwrap();
@@ -324,13 +324,14 @@ impl VaultJournal {
         flash: &mut S,
         flash_range: Range<u32>,
         cache: &mut CI,
-        records: &[JournalRecord],
+        records: impl IntoIterator<Item = JournalRecord>,
     ) -> Result<(), VaultStorageError<SE>>
     where
         S: NorFlash<Error = SE>,
         CI: CacheImpl,
         SE: core::fmt::Debug,
     {
+        let records: Vec<JournalRecord> = records.into_iter().collect();
         if records.is_empty() {
             return Ok(());
         }
@@ -345,7 +346,7 @@ impl VaultJournal {
         let page = JournalPage {
             version: JOURNAL_PAGE_VERSION,
             counter,
-            records: records.to_vec(),
+            records,
         };
         let plaintext = Zeroizing::new(postcard::to_allocvec(&page)?);
         let ciphertext = self
@@ -376,7 +377,7 @@ impl VaultJournal {
         CI: CacheImpl,
         SE: core::fmt::Debug,
     {
-        self.append_records(flash, flash_range, cache, core::slice::from_ref(&record))
+        self.append_records(flash, flash_range, cache, core::iter::once(record))
             .await
     }
 
