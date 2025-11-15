@@ -1,6 +1,15 @@
-use shared::error::SharedError;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use crate::transport::{detect_first_serial_port, open_serial_port};
+use shared::error::SharedError;
+use shared::schema::{DeviceResponse, HostRequest, VaultArtifact};
+
+use crate::artifacts::io_error;
+use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, VAULT_FILE};
+use crate::transport::{
+    detect_first_serial_port, open_serial_port, read_device_response, send_host_request,
+};
 use crate::{Cli, Command, RepoArgs};
 
 pub mod confirm;
@@ -29,8 +38,14 @@ pub fn run(cli: Cli) -> Result<(), SharedError> {
         Command::SetTime(args) => set_time::run(&mut *port, &args),
         Command::GetTime => get_time::run(&mut *port),
         Command::PullHead => pull_head::run(&mut *port),
-        Command::Pull(args) => pull::run(&mut *port, &args),
-        Command::Push(args) => push::run(&mut *port, &args),
+        Command::Pull(args) => {
+            let mut store = FilesystemArtifactStore::new(&args.repo);
+            pull::run(&mut *port, &mut store, &args)
+        }
+        Command::Push(args) => {
+            let mut store = FilesystemArtifactStore::new(&args.repo);
+            push::run(&mut *port, &mut store, &args)
+        }
         Command::Confirm(args) => confirm::run(&mut *port, &args),
     }
 }
@@ -41,4 +56,73 @@ pub(crate) fn print_repo_banner(args: &RepoArgs) {
         args.repo.display(),
         args.credentials.display()
     );
+}
+
+pub trait DeviceTransport {
+    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError>;
+    fn receive(&mut self) -> Result<DeviceResponse, SharedError>;
+}
+
+impl<T> DeviceTransport for T
+where
+    T: io::Read + io::Write + ?Sized,
+{
+    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError> {
+        send_host_request(self, request)
+    }
+
+    fn receive(&mut self) -> Result<DeviceResponse, SharedError> {
+        read_device_response(self)
+    }
+}
+
+pub trait ArtifactStore {
+    fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError>;
+    fn persist(&mut self, artifact: VaultArtifact, data: &[u8]) -> Result<(), SharedError>;
+}
+
+pub struct FilesystemArtifactStore {
+    repo: PathBuf,
+}
+
+impl FilesystemArtifactStore {
+    pub fn new(repo: impl AsRef<Path>) -> Self {
+        Self {
+            repo: repo.as_ref().to_path_buf(),
+        }
+    }
+
+    fn artifact_path(&self, artifact: VaultArtifact) -> (PathBuf, &'static str) {
+        match artifact {
+            VaultArtifact::Vault => (self.repo.join(VAULT_FILE), "vault artifact"),
+            VaultArtifact::Recipients => (self.repo.join(RECIPIENTS_FILE), "recipients manifest"),
+            VaultArtifact::Signature => (self.repo.join(SIGNATURE_FILE), "vault signature"),
+        }
+    }
+}
+
+impl ArtifactStore for FilesystemArtifactStore {
+    fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError> {
+        let (path, _) = self.artifact_path(artifact);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(io_error("read artifact", &path, err)),
+        }
+    }
+
+    fn persist(&mut self, artifact: VaultArtifact, data: &[u8]) -> Result<(), SharedError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let (path, label) = self.artifact_path(artifact);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| io_error("prepare artifact directory", parent, err))?;
+        }
+        fs::write(&path, data).map_err(|err| io_error("write artifact", &path, err))?;
+        println!("Saved {label} to '{}'.", path.display());
+        Ok(())
+    }
 }

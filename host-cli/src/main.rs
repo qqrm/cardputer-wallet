@@ -3,6 +3,9 @@ mod commands;
 mod constants;
 mod transport;
 
+#[cfg(not(feature = "transport-usb"))]
+compile_error!("Enable at least one host transport feature (currently only `transport-usb`).");
+
 #[cfg(test)]
 mod tests;
 

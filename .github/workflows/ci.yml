@@ -39,7 +39,7 @@ jobs:
         run: cargo install espup
 
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3 -y
+        run: espup install --targets esp32s3
 
       - name: Select ESP toolchain
         run: rustup default esp
