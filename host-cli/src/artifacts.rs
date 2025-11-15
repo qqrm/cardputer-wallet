@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use shared::error::SharedError;
 use shared::journal::FrameState;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
+use shared::transfer::ArtifactCollector;
 
 use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, SYNC_STATE_FILE, VAULT_FILE};
 
@@ -51,15 +52,7 @@ pub trait ArtifactStore {
 
 #[derive(Default)]
 pub struct PullArtifacts {
-    pub(crate) vault: ArtifactBuffer,
-    pub(crate) recipients: ArtifactBuffer,
-    pub(crate) recipients_manifest: Option<Vec<u8>>,
-    pub(crate) recipients_expected: bool,
-    pub(crate) recipients_seen: bool,
-    pub(crate) signature: ArtifactBuffer,
-    pub(crate) signature_bytes: Option<Vec<u8>>,
-    pub(crate) signature_expected: bool,
-    pub(crate) signature_seen: bool,
+    collector: ArtifactCollector,
     pub(crate) log_context: Vec<String>,
 }
 
@@ -157,18 +150,19 @@ impl ArtifactStore for PullArtifacts {
         fs::create_dir_all(repo)
             .map_err(|err| io_error("create repository directory", repo, err))?;
 
-        if !self.vault.bytes.is_empty() {
+        let vault_bytes = self.collector.vault_bytes();
+        if !vault_bytes.is_empty() {
             let vault_path = repo.join(VAULT_FILE);
             if let Some(parent) = vault_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|err| io_error("prepare vault directory", parent, err))?;
             }
-            fs::write(&vault_path, &self.vault.bytes)
+            fs::write(&vault_path, vault_bytes)
                 .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
             println!("Saved vault artifact to '{}'.", vault_path.display());
         }
 
-        if let Some(recipients) = &self.recipients_manifest {
+        if let Some(recipients) = self.collector.recipients_bytes() {
             let recipients_path = repo.join(RECIPIENTS_FILE);
             if let Some(parent) = recipients_path.parent() {
                 fs::create_dir_all(parent)
@@ -182,7 +176,7 @@ impl ArtifactStore for PullArtifacts {
             );
         }
 
-        if let Some(signature) = &self.signature_bytes {
+        if let Some(signature) = self.collector.signature_bytes() {
             let signature_path = repo.join(SIGNATURE_FILE);
             if let Some(parent) = signature_path.parent() {
                 fs::create_dir_all(parent)
@@ -226,34 +220,20 @@ impl ArtifactStore for PullArtifacts {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct ArtifactBuffer {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) metadata: Vec<VaultChunkMetadata>,
-}
+    pub fn vault_bytes(&self) -> &[u8] {
+        self.collector.vault_bytes()
+    }
 
-#[allow(dead_code)]
-pub(crate) struct VaultChunkMetadata {
-    protocol_version: u16,
-    sequence: u32,
-    total_size: u64,
-    remaining_bytes: u64,
-    device_chunk_size: u32,
-    checksum: u32,
-    is_last: bool,
-}
+    pub fn recipients_manifest(&self) -> Option<&[u8]> {
+        self.collector.recipients_bytes()
+    }
 
-impl VaultChunkMetadata {
-    fn from_chunk(chunk: &VaultChunk) -> Self {
-        Self {
-            protocol_version: chunk.protocol_version,
-            sequence: chunk.sequence,
-            total_size: chunk.total_size,
-            remaining_bytes: chunk.remaining_bytes,
-            device_chunk_size: chunk.device_chunk_size,
-            checksum: chunk.checksum,
-            is_last: chunk.is_last,
-        }
+    pub fn signature_bytes(&self) -> Option<&[u8]> {
+        self.collector.signature_bytes()
+    }
+
+    pub fn signature_expected(&self) -> bool {
+        self.collector.signature_expected()
     }
 }
 

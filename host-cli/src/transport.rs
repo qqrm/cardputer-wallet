@@ -182,7 +182,7 @@ pub fn handle_device_response(
                 state.record(chunk.sequence, chunk.checksum);
             }
             let should_continue = if let Some(storage) = artifacts {
-                storage.record_vault_chunk(&chunk)
+                storage.record_vault_chunk(&chunk)?
             } else {
                 !chunk.is_last
             };

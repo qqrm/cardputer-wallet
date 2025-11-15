@@ -161,6 +161,17 @@ fn encode_response(response: DeviceResponse) -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn chunk_checksum(data: &[u8]) -> u32 {
+    accumulate_checksum(0, data)
+}
+
+fn hash_with_crc(fill: u8, data: &[u8]) -> [u8; 32] {
+    let mut hash = [fill; 32];
+    let checksum = compute_crc32(data);
+    hash[..4].copy_from_slice(&checksum.to_le_bytes());
+    hash
+}
+
 #[test]
 fn detect_cardputer_by_vid_pid() {
     let ports = vec![
@@ -438,22 +449,22 @@ fn pull_reissues_request_until_completion() {
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
             sequence: 1,
-            total_size: 1024,
-            remaining_bytes: 512,
+            total_size: 16,
+            remaining_bytes: 8,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vec![0; 8],
-            checksum: 0x1234ABCD,
+            checksum: chunk_checksum(&[0u8; 8]),
             is_last: false,
             artifact: VaultArtifact::Vault,
         })),
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
             sequence: 2,
-            total_size: 1024,
+            total_size: 16,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vec![0; 8],
-            checksum: 0xCAFEBABE,
+            checksum: chunk_checksum(&[0u8; 8]),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -502,11 +513,12 @@ fn pull_reissues_request_until_completion() {
 
 #[test]
 fn pull_persists_vault_chunks_to_file() {
+    let vault_payload = vec![1, 2, 3, 4, 5];
     let responses = [
         encode_response(DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 3,
-            vault_hash: [0xAA; 32],
+            vault_hash: hash_with_crc(0xAA, &vault_payload),
             recipients_hash: [0u8; 32],
             signature_hash: [0u8; 32],
         })),
@@ -516,8 +528,8 @@ fn pull_persists_vault_chunks_to_file() {
             total_size: 5,
             remaining_bytes: 2,
             device_chunk_size: MAX_CHUNK_SIZE,
-            data: vec![1, 2, 3],
-            checksum: 0xDEAD_BEEF,
+            data: vault_payload[..3].to_vec(),
+            checksum: chunk_checksum(&vault_payload[..3]),
             is_last: false,
             artifact: VaultArtifact::Vault,
         })),
@@ -527,8 +539,8 @@ fn pull_persists_vault_chunks_to_file() {
             total_size: 5,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
-            data: vec![4, 5],
-            checksum: 0xC0FF_EE00,
+            data: vault_payload[3..].to_vec(),
+            checksum: chunk_checksum(&vault_payload[3..]),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -549,7 +561,7 @@ fn pull_persists_vault_chunks_to_file() {
 
     let vault_path = args.repo.join("vault.enc");
     let content = fs::read(&vault_path).expect("vault file");
-    assert_eq!(content, vec![1, 2, 3, 4, 5]);
+    assert_eq!(content, vault_payload);
 
     let recipients_path = args.repo.join("recips.json");
     assert!(!recipients_path.exists(), "unexpected recipients manifest");
@@ -575,9 +587,9 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
         encode_response(DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 7,
-            vault_hash: [0x11; 32],
-            recipients_hash: [0x22; 32],
-            signature_hash: [0x33; 32],
+            vault_hash: hash_with_crc(0x11, &vault_payload),
+            recipients_hash: hash_with_crc(0x22, &recipients_payload),
+            signature_hash: hash_with_crc(0x33, &signature),
         })),
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
@@ -586,7 +598,7 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vault_payload.clone(),
-            checksum: 0x0BAD_F00D,
+            checksum: chunk_checksum(&vault_payload),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -597,7 +609,7 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: recipients_payload.clone(),
-            checksum: 0x0D15_EA5E,
+            checksum: chunk_checksum(&recipients_payload),
             is_last: true,
             artifact: VaultArtifact::Recipients,
         })),
@@ -608,7 +620,7 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: signature.clone(),
-            checksum: 0x1234_5678,
+            checksum: chunk_checksum(&signature),
             is_last: true,
             artifact: VaultArtifact::Signature,
         })),
@@ -726,9 +738,9 @@ fn pull_errors_when_signature_expected_without_verifying_key() {
         encode_response(DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 4,
-            vault_hash: [0x55; 32],
+            vault_hash: hash_with_crc(0x55, &vault_payload),
             recipients_hash: [0u8; 32],
-            signature_hash: [0x77; 32],
+            signature_hash: hash_with_crc(0x77, &signature),
         })),
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
@@ -737,7 +749,7 @@ fn pull_errors_when_signature_expected_without_verifying_key() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vault_payload.clone(),
-            checksum: 0x0BAD_F00D,
+            checksum: chunk_checksum(&vault_payload),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -747,8 +759,8 @@ fn pull_errors_when_signature_expected_without_verifying_key() {
             total_size: SIGNATURE_SIZE as u64,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
-            data: signature,
-            checksum: 0x1234_5678,
+            data: signature.clone(),
+            checksum: chunk_checksum(&signature),
             is_last: true,
             artifact: VaultArtifact::Signature,
         })),
@@ -790,9 +802,9 @@ fn pull_errors_when_signature_verification_fails() {
         encode_response(DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 9,
-            vault_hash: [0x66; 32],
+            vault_hash: hash_with_crc(0x66, &vault_payload),
             recipients_hash: [0u8; 32],
-            signature_hash: [0x88; 32],
+            signature_hash: hash_with_crc(0x88, &signature),
         })),
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
@@ -801,7 +813,7 @@ fn pull_errors_when_signature_verification_fails() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vault_payload.clone(),
-            checksum: 0xFACE_CAFE,
+            checksum: chunk_checksum(&vault_payload),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -811,8 +823,8 @@ fn pull_errors_when_signature_verification_fails() {
             total_size: SIGNATURE_SIZE as u64,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
-            data: signature,
-            checksum: 0x1357_9BDF,
+            data: signature.clone(),
+            checksum: chunk_checksum(&signature),
             is_last: true,
             artifact: VaultArtifact::Signature,
         })),
@@ -840,22 +852,24 @@ fn pull_errors_when_signature_verification_fails() {
 fn pull_persists_multi_chunk_recipients_manifest() {
     let first_fragment = br#"{"recipients":[{"#.to_vec();
     let second_fragment = br#"address":"deadbeef"}]}"#.to_vec();
+    let mut recipients_payload = first_fragment.clone();
+    recipients_payload.extend_from_slice(&second_fragment);
     let responses = [
         encode_response(DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 11,
-            vault_hash: [0x33; 32],
-            recipients_hash: [0x44; 32],
+            vault_hash: hash_with_crc(0x33, &[1, 3, 3, 7]),
+            recipients_hash: hash_with_crc(0x44, &recipients_payload),
             signature_hash: [0u8; 32],
         })),
         encode_response(DeviceResponse::VaultChunk(VaultChunk {
             protocol_version: PROTOCOL_VERSION,
             sequence: 1,
-            total_size: 4096,
+            total_size: 4,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vec![1, 3, 3, 7],
-            checksum: 0x0123_4567,
+            checksum: chunk_checksum(&[1, 3, 3, 7]),
             is_last: true,
             artifact: VaultArtifact::Vault,
         })),
@@ -866,7 +880,7 @@ fn pull_persists_multi_chunk_recipients_manifest() {
             remaining_bytes: second_fragment.len() as u64,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: first_fragment.clone(),
-            checksum: 0x89AB_CDEF,
+            checksum: chunk_checksum(&first_fragment),
             is_last: false,
             artifact: VaultArtifact::Recipients,
         })),
@@ -877,7 +891,7 @@ fn pull_persists_multi_chunk_recipients_manifest() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: second_fragment.clone(),
-            checksum: 0x7654_3210,
+            checksum: chunk_checksum(&second_fragment),
             is_last: true,
             artifact: VaultArtifact::Recipients,
         })),
@@ -924,9 +938,7 @@ fn pull_persists_multi_chunk_recipients_manifest() {
 
     let recipients_path = args.repo.join("recips.json");
     let recipients_content = fs::read(&recipients_path).expect("recipients file");
-    let mut expected = first_fragment;
-    expected.extend_from_slice(&second_fragment);
-    assert_eq!(recipients_content, expected);
+    assert_eq!(recipients_content, recipients_payload);
     let signature_path = args.repo.join("vault.sig");
     assert!(!signature_path.exists(), "unexpected signature artifact");
 }
