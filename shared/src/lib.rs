@@ -8,4 +8,5 @@ pub mod checksum;
 pub mod error;
 pub mod journal;
 pub mod schema;
+pub mod totp;
 pub mod vault;

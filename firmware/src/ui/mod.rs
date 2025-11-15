@@ -6,11 +6,13 @@
 //! and view rendering so the code can be exercised in tests without hardware
 //! dependencies.
 
+mod data;
 mod input;
 mod render;
 mod state;
 pub mod transport;
 
+pub use data::{JournalAction, JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel};
 pub use input::{KeyEvent, KeyModifiers, Keymap, PhysicalKey, UiCommand};
 pub use render::{
     EditView, EntryView, Frame, HintBar, HintItem, HomeView, LockView, RecentList, SearchWidget,

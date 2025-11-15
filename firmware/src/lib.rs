@@ -10,6 +10,7 @@ use core::{
     ops::Range,
 };
 
+pub mod totp;
 pub mod ui;
 
 use chacha20poly1305::{
