@@ -28,6 +28,7 @@ use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, compute_crc32};
 use shared::cdc::FrameHeader;
 use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
+use shared::journal::{FrameState, FrameTracker, JournalHasher};
 use shared::schema::{
     AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
     HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
@@ -203,7 +204,7 @@ where
     send_host_request(port, &request)?;
     println!("Request sent. Waiting for device responses…");
 
-    let mut state_tracker = SyncStateTracker::default();
+    let mut state_tracker = FrameTracker::default();
     let mut should_continue = true;
 
     while should_continue {
@@ -217,7 +218,7 @@ where
 
     verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
     artifacts.persist(&args.repo)?;
-    persist_sync_state(&args.repo, state_tracker.last_pair())
+    persist_sync_state(&args.repo, state_tracker.state())
 }
 
 fn execute_push<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
@@ -397,8 +398,8 @@ where
 
     let request = HostRequest::Ack(AckRequest {
         protocol_version: PROTOCOL_VERSION,
-        last_frame_sequence: sequence,
-        journal_checksum: checksum,
+        last_frame_sequence: state.sequence,
+        journal_checksum: state.checksum,
     });
 
     send_host_request(port, &request)?;
@@ -996,25 +997,7 @@ fn legacy_operations_log_path(repo_path: &Path) -> PathBuf {
 }
 
 fn compute_local_journal_checksum(operations: &[DeviceJournalOperation]) -> u32 {
-    operations
-        .iter()
-        .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
-            DeviceJournalOperation::Add { entry_id } => {
-                accumulate_checksum(acc, entry_id.as_bytes())
-            }
-            DeviceJournalOperation::UpdateField {
-                entry_id,
-                field,
-                value_checksum,
-            } => {
-                let updated = accumulate_checksum(acc, entry_id.as_bytes());
-                let updated = accumulate_checksum(updated, field.as_bytes());
-                updated ^ value_checksum
-            }
-            DeviceJournalOperation::Delete { entry_id } => {
-                accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
-            }
-        })
+    JournalHasher::digest(operations)
 }
 
 fn execute_hello<P>(port: &mut P) -> Result<(), SharedError>
@@ -1107,7 +1090,7 @@ where
 
 fn handle_device_response(
     response: DeviceResponse,
-    tracker: Option<&mut SyncStateTracker>,
+    tracker: Option<&mut FrameTracker>,
     artifacts: Option<&mut PullArtifacts>,
 ) -> Result<bool, SharedError> {
     match response {
@@ -1362,26 +1345,11 @@ fn io_error(context: &str, path: &Path, err: io::Error) -> SharedError {
     SharedError::Transport(format!("{context} at '{}': {err}", path.display()))
 }
 
-#[derive(Default)]
-struct SyncStateTracker {
-    last_pair: Option<(u32, u32)>,
-}
-
-impl SyncStateTracker {
-    fn record(&mut self, sequence: u32, checksum: u32) {
-        self.last_pair = Some((sequence, checksum));
-    }
-
-    fn last_pair(&self) -> Option<(u32, u32)> {
-        self.last_pair
-    }
-}
-
-fn persist_sync_state(repo_path: &Path, state: Option<(u32, u32)>) -> Result<(), SharedError> {
+fn persist_sync_state(repo_path: &Path, state: Option<FrameState>) -> Result<(), SharedError> {
     let path = sync_state_path(repo_path);
     match state {
-        Some((sequence, checksum)) => {
-            let content = format!("{sequence}:{checksum}\n");
+        Some(state) => {
+            let content = format!("{}\n", state);
             fs::write(&path, content).map_err(|err| {
                 SharedError::Transport(format!(
                     "failed to write sync state to '{}': {err}",
@@ -1404,7 +1372,7 @@ fn persist_sync_state(repo_path: &Path, state: Option<(u32, u32)>) -> Result<(),
     Ok(())
 }
 
-fn load_sync_state(repo_path: &Path) -> Result<Option<(u32, u32)>, SharedError> {
+fn load_sync_state(repo_path: &Path) -> Result<Option<FrameState>, SharedError> {
     let path = sync_state_path(repo_path);
     let content = match fs::read_to_string(&path) {
         Ok(data) => data,
@@ -1418,27 +1386,18 @@ fn load_sync_state(repo_path: &Path) -> Result<Option<(u32, u32)>, SharedError> 
     };
 
     let trimmed = content.trim();
-    let (sequence_str, checksum_str) = trimmed.split_once(':').ok_or_else(|| {
-        SharedError::Transport(format!(
-            "invalid sync state format in '{}': expected 'sequence:checksum'",
+    if trimmed.is_empty() {
+        return Err(SharedError::Transport(format!(
+            "invalid sync state in '{}': empty content",
             path.display()
-        ))
+        )));
+    }
+
+    let state = trimmed.parse::<FrameState>().map_err(|err| {
+        SharedError::Transport(format!("invalid sync state in '{}': {err}", path.display()))
     })?;
 
-    let sequence = sequence_str.trim().parse::<u32>().map_err(|err| {
-        SharedError::Transport(format!(
-            "invalid sequence in sync state '{}': {err}",
-            path.display()
-        ))
-    })?;
-    let checksum = checksum_str.trim().parse::<u32>().map_err(|err| {
-        SharedError::Transport(format!(
-            "invalid checksum in sync state '{}': {err}",
-            path.display()
-        ))
-    })?;
-
-    Ok(Some((sequence, checksum)))
+    Ok(Some(state))
 }
 
 fn sync_state_path(repo_path: &Path) -> PathBuf {

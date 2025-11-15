@@ -93,6 +93,7 @@ use shared::cdc::transport::{
 };
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::checksum::accumulate_checksum;
+use shared::journal::{FrameTracker, JournalHasher};
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
     HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
@@ -905,7 +906,7 @@ enum TransferStage {
 /// Runtime state required to service synchronization requests from the host.
 pub struct SyncContext {
     journal_ops: Vec<JournalOperation>,
-    pending_sequence: Option<(u32, u32)>,
+    frame_tracker: FrameTracker,
     next_sequence: u32,
     vault_image: Zeroizing<Vec<u8>>,
     vault_offset: usize,
@@ -942,7 +943,7 @@ impl SyncContext {
     pub fn new() -> Self {
         Self {
             journal_ops: Vec::new(),
-            pending_sequence: None,
+            frame_tracker: FrameTracker::new(),
             next_sequence: 1,
             vault_image: Zeroizing::new(Vec::with_capacity(VAULT_BUFFER_CAPACITY)),
             vault_offset: 0,
@@ -1085,7 +1086,7 @@ impl SyncContext {
         }
 
         self.reset_transfer_state();
-        self.pending_sequence = None;
+        self.frame_tracker.clear();
         self.next_sequence = 1;
 
         Ok(())
@@ -1232,28 +1233,7 @@ impl SyncContext {
 
         self.crypto.wipe();
         self.reset_transfer_state();
-        self.pending_sequence = None;
-    }
-
-    fn compute_journal_checksum(&self, operations: &[JournalOperation]) -> u32 {
-        operations
-            .iter()
-            .fold(0xA5A5_5A5Au32, |acc, operation| match operation {
-                JournalOperation::Add { entry_id } => accumulate_checksum(acc, entry_id.as_bytes()),
-                JournalOperation::UpdateField {
-                    entry_id,
-                    field,
-                    value_checksum,
-                } => {
-                    accumulate_checksum(
-                        accumulate_checksum(acc, entry_id.as_bytes()),
-                        field.as_bytes(),
-                    ) ^ value_checksum
-                }
-                JournalOperation::Delete { entry_id } => {
-                    accumulate_checksum(acc, entry_id.as_bytes()) ^ 0xFFFF_FFFF
-                }
-            })
+        self.frame_tracker.clear();
     }
 
     fn reset_transfer_state(&mut self) {
@@ -1589,7 +1569,7 @@ fn handle_hello(
     if ctx.session_id == 0 {
         ctx.session_id = 1;
     }
-    ctx.pending_sequence = None;
+    ctx.frame_tracker.clear();
     ctx.next_sequence = 1;
     ctx.reset_transfer_state();
 
@@ -1686,7 +1666,7 @@ fn handle_pull(
         .map(|generation| generation == ctx.vault_generation)
         .unwrap_or(false);
 
-    if host_in_sync && ctx.journal_ops.is_empty() && ctx.pending_sequence.is_none() {
+    if host_in_sync && ctx.journal_ops.is_empty() && !ctx.frame_tracker.is_pending() {
         let response = DeviceResponse::VaultChunk(ctx.next_transfer_chunk(
             request.max_chunk_size as usize,
             request.host_buffer_size as usize,
@@ -1703,7 +1683,7 @@ fn handle_pull(
             DeviceResponse::VaultChunk(chunk) => (chunk.checksum, chunk.sequence),
             _ => unreachable!("response must be a vault chunk"),
         };
-        ctx.pending_sequence = Some((sequence, checksum));
+        ctx.frame_tracker.record(sequence, checksum);
         ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
 
         return Ok(response);
@@ -1711,10 +1691,10 @@ fn handle_pull(
 
     if !ctx.journal_ops.is_empty() {
         let operations = core::mem::take(&mut ctx.journal_ops);
-        let checksum = ctx.compute_journal_checksum(&operations);
+        let checksum = JournalHasher::digest(&operations);
         let sequence = ctx.next_sequence;
         ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
-        ctx.pending_sequence = Some((sequence, checksum));
+        ctx.frame_tracker.record(sequence, checksum);
 
         Ok(DeviceResponse::JournalFrame(JournalFrame {
             protocol_version: PROTOCOL_VERSION,
@@ -1740,7 +1720,7 @@ fn handle_pull(
             DeviceResponse::VaultChunk(chunk) => (chunk.checksum, chunk.sequence),
             _ => unreachable!("response must be a vault chunk"),
         };
-        ctx.pending_sequence = Some((sequence, checksum));
+        ctx.frame_tracker.record(sequence, checksum);
         ctx.next_sequence = ctx.next_sequence.wrapping_add(1);
 
         Ok(response)
@@ -1755,14 +1735,14 @@ fn handle_push_ops(
         return Err(ProtocolError::UnsupportedProtocol(push.protocol_version));
     }
 
-    let calculated = ctx.compute_journal_checksum(&push.operations);
+    let calculated = JournalHasher::digest(&push.operations);
     if calculated != push.checksum {
         return Err(ProtocolError::ChecksumMismatch);
     }
 
     if push.is_last {
         ctx.vault_generation = ctx.vault_generation.saturating_add(1);
-        ctx.pending_sequence = None;
+        ctx.frame_tracker.clear();
     }
 
     Ok(DeviceResponse::Ack(AckResponse {
@@ -1782,24 +1762,24 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
         return Err(ProtocolError::UnsupportedProtocol(ack.protocol_version));
     }
 
-    match ctx.pending_sequence {
-        Some((sequence, checksum))
-            if ack.last_frame_sequence == sequence && ack.journal_checksum == checksum =>
-        {
-            ctx.pending_sequence = None;
-            ctx.wipe_sensitive();
+    if ctx
+        .frame_tracker
+        .confirm(ack.last_frame_sequence, ack.journal_checksum)
+    {
+        ctx.wipe_sensitive();
 
-            #[cfg(any(test, target_arch = "xtensa"))]
-            crate::actions::publish(DeviceAction::EndSession);
+        #[cfg(any(test, target_arch = "xtensa"))]
+        crate::actions::publish(DeviceAction::EndSession);
 
-            Ok(DeviceResponse::Ack(AckResponse {
-                protocol_version: PROTOCOL_VERSION,
-                message: format!(
-                    "acknowledged journal frame #{sequence} (checksum 0x{checksum:08X})"
-                ),
-            }))
-        }
-        _ => Err(ProtocolError::InvalidAcknowledgement),
+        Ok(DeviceResponse::Ack(AckResponse {
+            protocol_version: PROTOCOL_VERSION,
+            message: format!(
+                "acknowledged journal frame #{} (checksum 0x{:08X})",
+                ack.last_frame_sequence, ack.journal_checksum
+            ),
+        }))
+    } else {
+        Err(ProtocolError::InvalidAcknowledgement)
     }
 }
 
@@ -2164,6 +2144,7 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
     use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
+    use shared::journal::FrameState;
     use shared::schema::{decode_device_response, encode_host_request, encode_journal_operations};
 
     fn fresh_context() -> SyncContext {
@@ -2192,7 +2173,13 @@ mod tests {
                 assert_eq!(chunk.total_size, 0);
                 assert_eq!(chunk.remaining_bytes, 0);
                 assert!(chunk.is_last);
-                assert_eq!(ctx.pending_sequence, Some((chunk.sequence, chunk.checksum)));
+                assert_eq!(
+                    ctx.frame_tracker.state(),
+                    Some(FrameState {
+                        sequence: chunk.sequence,
+                        checksum: chunk.checksum,
+                    })
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2226,7 +2213,13 @@ mod tests {
                 assert_eq!(frame.protocol_version, PROTOCOL_VERSION);
                 assert_eq!(frame.sequence, 1);
                 assert_eq!(frame.operations.len(), 1);
-                assert_eq!(ctx.pending_sequence, Some((frame.sequence, frame.checksum)));
+                assert_eq!(
+                    ctx.frame_tracker.state(),
+                    Some(FrameState {
+                        sequence: frame.sequence,
+                        checksum: frame.checksum,
+                    })
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2276,7 +2269,13 @@ mod tests {
         assert_eq!(last.artifact, VaultArtifact::Recipients);
         assert!(last.is_last);
         assert_eq!(last.data, b"rec");
-        assert_eq!(ctx.pending_sequence, Some((last.sequence, last.checksum)));
+        assert_eq!(
+            ctx.frame_tracker.state(),
+            Some(FrameState {
+                sequence: last.sequence,
+                checksum: last.checksum,
+            })
+        );
     }
 
     #[test]
@@ -2369,6 +2368,8 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        assert!(!ctx.frame_tracker.is_pending());
     }
 
     #[test]
@@ -2437,13 +2438,16 @@ mod tests {
         let mut ctx = fresh_context();
         ctx.vault_generation = 7;
         let expected_generation = ctx.vault_generation;
-        let pending = (12, 0xABCD_1234);
-        ctx.pending_sequence = Some(pending);
+        let pending = FrameState {
+            sequence: 12,
+            checksum: 0xABCD_1234,
+        };
+        ctx.frame_tracker.record_state(pending);
 
         let ack = AckRequest {
             protocol_version: PROTOCOL_VERSION,
-            last_frame_sequence: pending.0,
-            journal_checksum: pending.1,
+            last_frame_sequence: pending.sequence,
+            journal_checksum: pending.checksum,
         };
 
         let response = handle_ack(&ack, &mut ctx).expect("ack should succeed");
@@ -2451,12 +2455,12 @@ mod tests {
         match response {
             DeviceResponse::Ack(message) => {
                 assert_eq!(message.protocol_version, PROTOCOL_VERSION);
-                assert!(message.message.contains(&pending.0.to_string()));
+                assert!(message.message.contains(&pending.sequence.to_string()));
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
-        assert!(ctx.pending_sequence.is_none());
+        assert!(!ctx.frame_tracker.is_pending());
         assert_eq!(ctx.vault_generation, expected_generation);
     }
 
@@ -2466,7 +2470,7 @@ mod tests {
         let operations = vec![JournalOperation::Add {
             entry_id: String::from("pushed"),
         }];
-        let checksum = ctx.compute_journal_checksum(&operations);
+        let checksum = JournalHasher::digest(&operations);
 
         let request = HostRequest::PushOps(PushOperationsFrame {
             protocol_version: PROTOCOL_VERSION,
