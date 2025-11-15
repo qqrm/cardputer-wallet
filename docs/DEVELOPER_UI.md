@@ -61,6 +61,36 @@ hardware or host-driven UI simulation:
 Transport status comes from `ui::transport::snapshot()` which surfaces BLE/USB
 connectivity flags updated by the USB CDC and BLE profile tasks.
 
+## Transport Indicators
+
+`UiRuntime::render()` now embeds a `TransportIndicators` struct in every
+`Frame`. The struct exposes two booleans, `usb_connected` and `ble_connected`,
+mirroring the atomic flags owned by `ui::transport`:
+
+* `transport::set_usb_connected(true)` is invoked inside the CDC server task as
+  soon as bytes are exchanged with the host over USB. Transport errors such as
+  `sync::ProtocolError::Transport` flip the flag back to `false`, ensuring the
+  status row warns the user whenever the physical cable is unplugged or the
+  host tool crashes.
+* `transport::set_ble_connected(true)` is triggered by the HID action queue.
+  When `handle_hello()` publishes `DeviceAction::StartSession`, the BLE profile
+  dequeues the action, the `BleHid` backend emits `HidResponse::Connected`, and
+  the handler sets the indicator. Completing the sync (or dropping the link)
+  generates `HidResponse::Acknowledged`/`Disconnected`, which clears the flag.
+
+The indicator row therefore reflects the transport queue state instead of UI
+heuristics. The `Sync` screen reads the same snapshot, so when the CLI issues an
+`ACK` and `DeviceAction::EndSession` drains, the BLE icon immediately dims,
+letting testers correlate queue drains with UI feedback.
+
+| Indicator         | Data source                                      | UI effect                                  |
+|-------------------|--------------------------------------------------|--------------------------------------------|
+| USB connected     | `transport::set_usb_connected` updates from CDC  | Home and Sync screens show a solid USB icon |
+| BLE connected     | `handle_response(HidResponse::*)` updates        | BLE glyph pulses on connect and clears on ACK |
+
+This linkage keeps the UI consistent with the shared HID command queue and the
+transport tasks defined under `firmware::hid`.
+
 ## Default Key Bindings
 
 The default `Keymap` translates keyboard events into high level commands. The
