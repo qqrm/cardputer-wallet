@@ -38,16 +38,11 @@ pub trait HidBackend {
     fn process_action(&mut self, action: DeviceAction) -> Result<HidResponse, HidError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum BleSessionState {
+    #[default]
     Idle,
     Connected(u32),
-}
-
-impl Default for BleSessionState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 /// Lightweight BLE HID implementation built on top of `trouble-host`.

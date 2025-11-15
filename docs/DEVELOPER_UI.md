@@ -59,7 +59,10 @@ hardware or host-driven UI simulation:
 * `SyncView` – Carries the sync stage description and progress percentage.
 
 Transport status comes from `ui::transport::snapshot()` which surfaces BLE/USB
-connectivity flags updated by the USB CDC and BLE profile tasks.
+status metadata (icon name plus textual label) across the Offline/Waiting/
+Connecting/Connected/Error states. The USB CDC loop and BLE profile tasks push
+state transitions directly into this cache so the UI can reflect live link
+health without blocking on hardware APIs.
 
 ## Default Key Bindings
 
