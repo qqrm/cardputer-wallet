@@ -6,5 +6,6 @@ pub mod cdc;
 pub mod checksum;
 #[cfg(feature = "std")]
 pub mod error;
+pub mod journal;
 pub mod schema;
 pub mod vault;
