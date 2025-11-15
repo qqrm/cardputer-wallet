@@ -1707,28 +1707,20 @@ fn select_serial_port(
             .find(|info| matches!(info.port_type, SerialPortType::UsbPort(_)));
     }
 
-    let matches: Vec<&serialport::SerialPortInfo> = ports
+    let mut matches = ports
         .iter()
         .filter(|info| matches_cardputer_vid_pid(info))
-        .collect();
+        .peekable();
 
-    if matches.is_empty() {
-        return None;
+    let first = matches.next()?;
+    if matches.peek().is_none() {
+        return Some(first);
     }
 
-    if matches.len() == 1 {
-        return matches.into_iter().next();
-    }
-
-    if let Some(preferred) = matches
-        .iter()
-        .copied()
+    std::iter::once(first)
+        .chain(matches)
         .find(|info| matches_cardputer_identity(info))
-    {
-        return Some(preferred);
-    }
-
-    matches.into_iter().next()
+        .or(Some(first))
 }
 
 fn matches_cardputer_vid_pid(info: &serialport::SerialPortInfo) -> bool {
