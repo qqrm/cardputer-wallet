@@ -19,7 +19,13 @@ use serde_cbor::{from_slice as cbor_from_slice, to_vec as cbor_to_vec};
 use serde_json::from_str as json_from_str;
 use serialport::{SerialPort, SerialPortType};
 
-use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
+use shared::cdc::transport::{
+    FrameTransportError, command_for_request, command_for_response, decode_frame,
+    decode_frame_header, encode_frame,
+};
+use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, compute_crc32};
+#[cfg(test)]
+use shared::cdc::FrameHeader;
 use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
 use shared::schema::{
@@ -1543,17 +1549,10 @@ fn write_framed_message<W>(
 where
     W: Write + ?Sized,
 {
-    let length = payload.len();
-    if length > u32::MAX as usize {
-        return Err(SharedError::Transport(format!(
-            "payload too large: {length} bytes"
-        )));
-    }
-
-    let checksum = compute_crc32(payload);
-    let header = FrameHeader::new(PROTOCOL_VERSION, command, length as u32, checksum);
+    let header = encode_frame(PROTOCOL_VERSION, command, payload, usize::MAX)
+        .map_err(|err| map_transport_error("encode frame", err))?;
     writer
-        .write_all(&header.to_bytes())
+        .write_all(&header)
         .map_err(map_io_error("write frame header"))?;
     writer
         .write_all(payload)
@@ -1571,66 +1570,18 @@ where
     reader
         .read_exact(&mut header_bytes)
         .map_err(map_io_error("read frame header"))?;
-    let header = FrameHeader::from_bytes(header_bytes)
-        .map_err(|err| SharedError::Transport(format!("failed to decode header: {err}")))?;
+    let header = decode_frame_header(PROTOCOL_VERSION, HOST_BUFFER_SIZE as usize, header_bytes)
+        .map_err(|err| map_transport_error("decode frame header", err))?;
 
-    if header.version != PROTOCOL_VERSION {
-        return Err(SharedError::Transport(format!(
-            "unsupported protocol version: {}",
-            header.version
-        )));
-    }
-
-    let length = header.length;
-    if length > HOST_BUFFER_SIZE {
-        return Err(SharedError::Transport(format!(
-            "frame payload length {} exceeds host buffer limit {}",
-            length, HOST_BUFFER_SIZE
-        )));
-    }
-
-    let length = length as usize;
-    let mut payload = vec![0u8; length];
+    let mut payload = vec![0u8; header.length as usize];
     reader
         .read_exact(&mut payload)
         .map_err(map_io_error("read frame payload"))?;
 
-    let expected = header.checksum;
-    let actual = compute_crc32(&payload);
-    if expected != actual {
-        return Err(SharedError::Transport(format!(
-            "checksum mismatch (expected 0x{expected:08X}, calculated 0x{actual:08X})"
-        )));
-    }
+    decode_frame(&header, &payload)
+        .map_err(|err| map_transport_error("validate frame payload", err))?;
 
     Ok((header.command, payload))
-}
-
-fn command_for_request(request: &HostRequest) -> CdcCommand {
-    match request {
-        HostRequest::Hello(_) => CdcCommand::Hello,
-        HostRequest::Status(_) => CdcCommand::Status,
-        HostRequest::SetTime(_) => CdcCommand::SetTime,
-        HostRequest::GetTime(_) => CdcCommand::GetTime,
-        HostRequest::PullHead(_) => CdcCommand::PullHead,
-        HostRequest::PullVault(_) => CdcCommand::PullVault,
-        HostRequest::PushVault(_) => CdcCommand::PushVault,
-        HostRequest::PushOps(_) => CdcCommand::PushOps,
-        HostRequest::Ack(_) => CdcCommand::Ack,
-    }
-}
-
-fn command_for_response(response: &DeviceResponse) -> CdcCommand {
-    match response {
-        DeviceResponse::Hello(_) => CdcCommand::Hello,
-        DeviceResponse::Status(_) => CdcCommand::Status,
-        DeviceResponse::Time(_) => CdcCommand::GetTime,
-        DeviceResponse::Head(_) => CdcCommand::PullHead,
-        DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
-        DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
-        DeviceResponse::Ack(_) => CdcCommand::Ack,
-        DeviceResponse::Nack(_) => CdcCommand::Nack,
-    }
 }
 
 fn validate_response_command(
@@ -2135,6 +2086,10 @@ fn map_io_error(context: &'static str) -> impl Fn(io::Error) -> SharedError {
     }
 }
 
+fn map_transport_error(context: &'static str, error: FrameTransportError) -> SharedError {
+    SharedError::Transport(format!("{context} failed: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2386,6 +2341,23 @@ mod tests {
     }
 
     #[test]
+    fn cli_header_matches_shared_encoding() {
+        let request = HostRequest::Status(StatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+        });
+        let payload = encode_host_request(&request).expect("encode request");
+        let command = command_for_request(&request);
+
+        let mut writer = Cursor::new(Vec::new());
+        write_framed_message(&mut writer, command, &payload).expect("write frame");
+        let frame = writer.into_inner();
+
+        let expected =
+            encode_frame(PROTOCOL_VERSION, command, &payload, usize::MAX).expect("encode header");
+        assert_eq!(&frame[..FRAME_HEADER_SIZE], &expected);
+    }
+
+    #[test]
     fn framing_detects_checksum_mismatch() {
         let payload = vec![1u8, 2, 3, 4];
         let mut frame = Vec::new();
@@ -2423,7 +2395,7 @@ mod tests {
         let err = read_framed_message(&mut reader).expect_err("expected length error");
         match err {
             SharedError::Transport(message) => {
-                assert!(message.contains("frame payload length"));
+                assert!(message.contains("frame payload") && message.contains("exceeds limit"));
             }
             other => panic!("unexpected error variant: {:?}", other),
         }

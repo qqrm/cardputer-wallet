@@ -1,5 +1,7 @@
 use core::convert::TryFrom;
 
+pub mod transport;
+
 /// Magic number identifying CDC frames exchanged between the host and the device.
 pub const FRAME_MAGIC: [u8; 4] = *b"CDCF";
 

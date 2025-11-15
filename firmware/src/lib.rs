@@ -87,8 +87,11 @@ mod actions {
 #[cfg(any(test, target_arch = "xtensa"))]
 use actions::DeviceAction;
 
-use shared::cdc::FRAME_HEADER_SIZE;
-use shared::cdc::{CdcCommand, FrameHeader, compute_crc32};
+use shared::cdc::transport::{
+    FrameTransportError, command_for_request, command_for_response, decode_frame,
+    decode_frame_header, encode_frame,
+};
+use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::checksum::accumulate_checksum;
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
@@ -206,6 +209,22 @@ impl ProtocolError {
             protocol_version: PROTOCOL_VERSION,
             code,
             message,
+        }
+    }
+}
+
+impl From<FrameTransportError> for ProtocolError {
+    fn from(value: FrameTransportError) -> Self {
+        match value {
+            FrameTransportError::PayloadTooLarge { actual, .. } => {
+                ProtocolError::FrameTooLarge(actual)
+            }
+            FrameTransportError::UnsupportedVersion { found, .. } => {
+                ProtocolError::UnsupportedProtocol(found)
+            }
+            FrameTransportError::LengthMismatch { .. }
+            | FrameTransportError::ChecksumMismatch { .. } => ProtocolError::ChecksumMismatch,
+            FrameTransportError::Header(err) => ProtocolError::Decode(err.to_string()),
         }
     }
 }
@@ -1531,43 +1550,6 @@ fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> 
     encode_device_response(response).map_err(|err| ProtocolError::Encode(err.to_string()))
 }
 
-fn command_for_request(request: &HostRequest) -> CdcCommand {
-    match request {
-        HostRequest::Hello(_) => CdcCommand::Hello,
-        HostRequest::Status(_) => CdcCommand::Status,
-        HostRequest::SetTime(_) => CdcCommand::SetTime,
-        HostRequest::GetTime(_) => CdcCommand::GetTime,
-        HostRequest::PullHead(_) => CdcCommand::PullHead,
-        HostRequest::PullVault(_) => CdcCommand::PullVault,
-        HostRequest::PushVault(_) => CdcCommand::PushVault,
-        HostRequest::PushOps(_) => CdcCommand::PushOps,
-        HostRequest::Ack(_) => CdcCommand::Ack,
-    }
-}
-
-fn command_for_response(response: &DeviceResponse) -> CdcCommand {
-    match response {
-        DeviceResponse::Hello(_) => CdcCommand::Hello,
-        DeviceResponse::Status(_) => CdcCommand::Status,
-        DeviceResponse::Time(_) => CdcCommand::GetTime,
-        DeviceResponse::Head(_) => CdcCommand::PullHead,
-        DeviceResponse::JournalFrame(_) => CdcCommand::PushOps,
-        DeviceResponse::VaultChunk(_) => CdcCommand::PullVault,
-        DeviceResponse::Ack(_) => CdcCommand::Ack,
-        DeviceResponse::Nack(_) => CdcCommand::Nack,
-    }
-}
-
-#[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
-fn validate_checksum(header: &FrameHeader, payload: &[u8]) -> Result<(), ProtocolError> {
-    let checksum = compute_crc32(payload);
-    if checksum == header.checksum {
-        Ok(())
-    } else {
-        Err(ProtocolError::ChecksumMismatch)
-    }
-}
-
 /// Decode a host frame, dispatch to the appropriate handler and encode the response.
 pub fn process_host_frame(
     command: CdcCommand,
@@ -2115,23 +2097,14 @@ mod tasks {
             *byte = read_byte(serial).await?;
         }
 
-        let header = FrameHeader::from_bytes(header_bytes)
-            .map_err(|err| ProtocolError::Decode(err.to_string()))?;
-
-        if header.version != PROTOCOL_VERSION {
-            return Err(ProtocolError::UnsupportedProtocol(header.version));
-        }
-
-        if header.length as usize > FRAME_MAX_SIZE {
-            return Err(ProtocolError::FrameTooLarge(header.length as usize));
-        }
+        let header = decode_frame_header(PROTOCOL_VERSION, FRAME_MAX_SIZE, header_bytes)?;
 
         let mut buffer = Vec::with_capacity(header.length as usize);
         for _ in 0..header.length {
             buffer.push(read_byte(serial).await?);
         }
 
-        validate_checksum(&header, &buffer)?;
+        decode_frame(&header, &buffer)?;
 
         Ok((header.command, buffer))
     }
@@ -2151,13 +2124,7 @@ mod tasks {
         command: CdcCommand,
         payload: &[u8],
     ) -> Result<(), ProtocolError> {
-        if payload.len() > FRAME_MAX_SIZE {
-            return Err(ProtocolError::FrameTooLarge(payload.len()));
-        }
-
-        let length = payload.len() as u32;
-        let checksum = compute_crc32(payload);
-        let header = FrameHeader::new(PROTOCOL_VERSION, command, length, checksum).to_bytes();
+        let header = encode_frame(PROTOCOL_VERSION, command, payload, FRAME_MAX_SIZE)?;
 
         serial
             .write(&header)
@@ -2748,11 +2715,28 @@ mod tests {
         );
 
         // Good checksum passes validation.
-        validate_checksum(&header, &payload).expect("valid checksum");
+        decode_frame(&header, &payload).expect("valid checksum");
 
         header.checksum ^= 0xFFFF_FFFF;
-        let error = validate_checksum(&header, &payload).expect_err("expected checksum error");
-        assert_eq!(error, ProtocolError::ChecksumMismatch);
+        let error = decode_frame(&header, &payload).expect_err("expected checksum error");
+        assert_eq!(ProtocolError::from(error), ProtocolError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn transport_limit_matches_firmware_max_size() {
+        super::actions::clear();
+        let payload = vec![0u8; FRAME_MAX_SIZE + 1];
+        let err = encode_frame(
+            PROTOCOL_VERSION,
+            CdcCommand::Hello,
+            &payload,
+            FRAME_MAX_SIZE,
+        )
+        .expect_err("frame too large");
+        assert!(matches!(
+            ProtocolError::from(err),
+            ProtocolError::FrameTooLarge(_)
+        ));
     }
 
     #[test]
