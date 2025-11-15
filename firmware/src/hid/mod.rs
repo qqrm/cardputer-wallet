@@ -4,6 +4,7 @@
 pub mod ble;
 #[cfg(any(test, target_arch = "xtensa"))]
 pub mod actions {
+    use crate::ui::transport::{self, TransportState};
     use alloc::vec::Vec;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
@@ -32,6 +33,12 @@ pub mod actions {
     }
 
     pub fn publish(action: DeviceAction) {
+        match &action {
+            DeviceAction::StartSession { .. } => {
+                transport::set_ble_state(TransportState::Connecting);
+            }
+            DeviceAction::EndSession => transport::set_ble_state(TransportState::Waiting),
+        }
         let sender = action_sender();
         let _ = sender.try_send(action);
     }
@@ -117,7 +124,7 @@ mod tasks {
     use super::ble::{BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse};
     use crate::storage::{self, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
-    use crate::ui::transport;
+    use crate::ui::transport::{self, TransportState};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
     use embassy_time::{Duration, Timer};
@@ -144,18 +151,18 @@ mod tasks {
             log_boot_failure(error);
         }
 
-        transport::set_usb_connected(true);
+        transport::set_usb_state(TransportState::Waiting);
         loop {
             match read_frame(&mut serial).await {
                 Ok((command, frame)) => {
-                    transport::set_usb_connected(true);
+                    transport::set_usb_state(TransportState::Connected);
                     if let Some(error) = boot_error.take() {
                         let payload = boot_failure_payload(&error);
                         if let Err(err) =
                             write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
                         {
                             if matches!(err, sync::ProtocolError::Transport) {
-                                transport::set_usb_connected(false);
+                                transport::set_usb_state(TransportState::Error);
                             }
                         }
                         continue;
@@ -166,7 +173,7 @@ mod tasks {
                             if let Err(err) = write_frame(&mut serial, response_command, &response)
                             {
                                 if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_connected(false);
+                                    transport::set_usb_state(TransportState::Error);
                                 }
                             }
                         }
@@ -187,7 +194,7 @@ mod tasks {
                                 write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
                             {
                                 if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_connected(false);
+                                    transport::set_usb_state(TransportState::Error);
                                 }
                             }
                         }
@@ -205,13 +212,13 @@ mod tasks {
                         }
                     };
                     if matches!(err, sync::ProtocolError::Transport) {
-                        transport::set_usb_connected(false);
+                        transport::set_usb_state(TransportState::Error);
                     }
                     if let Err(err) =
                         write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
                     {
                         if matches!(err, sync::ProtocolError::Transport) {
-                            transport::set_usb_connected(false);
+                            transport::set_usb_state(TransportState::Error);
                         }
                     }
                 }
@@ -317,6 +324,7 @@ mod tasks {
     pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
         let mut backend = BleHid::new(IoCapabilities::KeyboardDisplay);
         let mut queue = HidCommandQueue::<HID_COMMAND_QUEUE_DEPTH>::new();
+        transport::set_ble_state(TransportState::Waiting);
 
         loop {
             let action = receiver.receive().await;
@@ -331,18 +339,20 @@ mod tasks {
 
     fn handle_response(response: HidResponse) {
         match response {
-            HidResponse::Connected { .. } => transport::set_ble_connected(true),
+            HidResponse::Connected { .. } => transport::set_ble_state(TransportState::Connected),
             HidResponse::Acknowledged { .. } | HidResponse::Disconnected => {
-                transport::set_ble_connected(false);
+                transport::set_ble_state(TransportState::Waiting);
             }
         }
     }
 
     fn handle_error(error: HidError) {
         match error {
-            HidError::AlreadyConnected { .. } => {}
-            HidError::NoActiveSession => transport::set_ble_connected(false),
-            HidError::CommandQueueFull(_) => {}
+            HidError::AlreadyConnected { .. } => {
+                transport::set_ble_state(TransportState::Connected);
+            }
+            HidError::NoActiveSession => transport::set_ble_state(TransportState::Waiting),
+            HidError::CommandQueueFull(_) => transport::set_ble_state(TransportState::Error),
         }
     }
 }
