@@ -1,6 +1,8 @@
 //! Human-interface side of the firmware runtime, including session action queues and the Xtensa
 //! runtime entry point.
 #[cfg(any(test, target_arch = "xtensa"))]
+pub mod ble;
+#[cfg(any(test, target_arch = "xtensa"))]
 pub mod actions {
     use alloc::vec::Vec;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -111,7 +113,8 @@ pub mod runtime {
 
 #[cfg(target_arch = "xtensa")]
 mod tasks {
-    use super::actions::{self, DeviceAction};
+    use super::actions;
+    use super::ble::{BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse};
     use crate::storage::{self, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::ui::transport;
@@ -312,14 +315,34 @@ mod tasks {
 
     #[task]
     pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
-        let _capabilities = IoCapabilities::KeyboardDisplay;
-        while let Ok(action) = receiver.recv().await {
-            match action {
-                DeviceAction::StartSession { session_id } => {
-                    let _ = session_id;
-                }
-                DeviceAction::EndSession => {}
+        let mut backend = BleHid::new(IoCapabilities::KeyboardDisplay);
+        let mut queue = HidCommandQueue::<HID_COMMAND_QUEUE_DEPTH>::new();
+
+        loop {
+            let action = receiver.receive().await;
+            if let Err(returned) = queue.enqueue(action) {
+                handle_error(HidError::CommandQueueFull(returned));
+                continue;
             }
+
+            queue.process(&mut backend, handle_response, handle_error);
+        }
+    }
+
+    fn handle_response(response: HidResponse) {
+        match response {
+            HidResponse::Connected { .. } => transport::set_ble_connected(true),
+            HidResponse::Acknowledged { .. } | HidResponse::Disconnected => {
+                transport::set_ble_connected(false);
+            }
+        }
+    }
+
+    fn handle_error(error: HidError) {
+        match error {
+            HidError::AlreadyConnected { .. } => {}
+            HidError::NoActiveSession => transport::set_ble_connected(false),
+            HidError::CommandQueueFull(_) => {}
         }
     }
 }

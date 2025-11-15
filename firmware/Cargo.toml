@@ -22,11 +22,13 @@ rand_core = { version = "0.6", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 embassy-sync = { version = "0.7.2", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["alloc", "static_secrets", "zeroize"] }
+heapless = { version = "0.8", default-features = false }
 
 [dev-dependencies]
 rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
 critical-section = { version = "1.2", default-features = false, features = ["std"] }
 shared = { path = "../shared", default-features = false, features = ["std"] }
+trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive"] }
 
 [[bin]]
 name = "cardputer-firmware"
