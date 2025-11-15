@@ -3,7 +3,7 @@ use core::cmp;
 
 use crate::ui::{TotpProvider, TotpSnapshot};
 use shared::totp::{TotpCode, generate};
-use shared::vault::TotpConfig;
+use vault_core::TotpConfig;
 
 const FALLBACK_PERIOD: u8 = 30;
 
@@ -104,7 +104,7 @@ fn to_snapshot(config: &TotpConfig, code: &TotpCode) -> TotpSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::vault::{SecretString, TotpAlgorithm};
+    use vault_core::{SecretString, TotpAlgorithm};
 
     fn sample_config() -> TotpConfig {
         TotpConfig {

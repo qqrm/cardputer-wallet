@@ -3,6 +3,7 @@ members = [
     "firmware",
     "host-cli",
     "shared",
+    "vault-core",
 ]
-default-members = ["host-cli", "shared"]
+default-members = ["host-cli", "shared", "vault-core"]
 resolver = "2"

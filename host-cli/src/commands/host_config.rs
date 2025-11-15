@@ -5,6 +5,7 @@ use base64::Engine;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use shared::error::SharedError;
+use vault_core::{VaultEntry, VaultMetadata};
 
 use crate::constants::SIGNATURE_SIZE;
 
@@ -67,8 +68,8 @@ impl HostConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultSnapshot {
     pub version: u16,
-    pub metadata: shared::vault::VaultMetadata,
-    pub entries: Vec<shared::vault::VaultEntry>,
+    pub metadata: VaultMetadata,
+    pub entries: Vec<VaultEntry>,
 }
 
 pub(crate) fn decode_key_bytes<const N: usize>(input: &str) -> Result<[u8; N], SharedError> {

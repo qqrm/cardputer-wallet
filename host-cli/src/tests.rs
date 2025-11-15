@@ -23,14 +23,14 @@ use shared::schema::{
     VaultArtifact, VaultChunk, decode_host_request, encode_device_response, encode_host_request,
     encode_journal_operations,
 };
-use shared::vault::{
-    EntryUpdate, JournalOperation as VaultJournalOperation, SecretString, VaultEntry, VaultMetadata,
-};
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 use tempfile::tempdir;
 use uuid::Uuid;
+use vault_core::{
+    EntryUpdate, JournalOperation as VaultJournalOperation, SecretString, VaultEntry, VaultMetadata,
+};
 
 const SIGNATURE_SIZE: usize = 64;
 const TEST_SIGNING_SEED: [u8; 32] = [0x21; 32];

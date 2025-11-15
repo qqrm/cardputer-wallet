@@ -16,10 +16,10 @@ use shared::schema::{
     PushOperationsFrame, PushVaultFrame, VaultArtifact, decode_journal_operations,
     encode_journal_operations,
 };
-use shared::vault::{
+use uuid::Uuid;
+use vault_core::{
     EntryUpdate, JournalOperation as VaultJournalOperation, LegacyField, PageCipher, VaultEntry,
 };
-use uuid::Uuid;
 
 use crate::RepoArgs;
 use crate::artifacts::io_error;

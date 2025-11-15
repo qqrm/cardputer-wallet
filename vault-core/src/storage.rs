@@ -1,4 +1,4 @@
-use crate::vault::{
+use crate::{
     cipher::{EnvelopeAlgorithm, PageCipher},
     model::{EncryptedJournalPage, JOURNAL_AAD, JOURNAL_PAGE_VERSION, JournalPage, JournalRecord},
 };
@@ -29,7 +29,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{
+    use crate::{
         EntryUpdate, JournalOperation, JournalRecord, TotpAlgorithm, TotpConfig, VaultEntry,
     };
     use futures::executor::block_on;

@@ -1,16 +1,13 @@
 //! Cryptographic helpers for key derivation, PIN handling, and symmetric primitives used by the
 //! firmware sync protocol.
 use alloc::vec::Vec;
-use chacha20poly1305::{
-    ChaCha20Poly1305, Nonce,
-    aead::{Aead, KeyInit},
-};
 use rand_core::{CryptoRng, RngCore};
 use scrypt::{
     Params as ScryptParams,
     errors::{InvalidOutputLen, InvalidParams},
 };
 use serde::{Deserialize, Serialize};
+use vault_core::PageCipher;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -43,12 +40,6 @@ impl From<InvalidParams> for KeyError {
 impl From<InvalidOutputLen> for KeyError {
     fn from(_: InvalidOutputLen) -> Self {
         KeyError::InvalidOutput
-    }
-}
-
-impl From<chacha20poly1305::aead::Error> for KeyError {
-    fn from(_: chacha20poly1305::aead::Error) -> Self {
-        KeyError::CryptoFailure
     }
 }
 
@@ -287,9 +278,9 @@ impl CryptoMaterial {
         Ok(())
     }
 
-    fn cipher_from_kek(&self) -> Result<ChaCha20Poly1305, KeyError> {
+    fn cipher_from_kek(&self) -> Result<PageCipher, KeyError> {
         let kek = self.kek.as_ref().ok_or(KeyError::KekUnavailable)?;
-        ChaCha20Poly1305::new_from_slice(kek.as_ref()).map_err(|_| KeyError::CryptoFailure)
+        Ok(PageCipher::chacha20_poly1305(**kek))
     }
 
     fn ensure_vault_key(&self) -> Result<&Zeroizing<[u8; 32]>, KeyError> {
@@ -357,10 +348,12 @@ impl CryptoMaterial {
 
         self.derive_kek(pin)?;
         let cipher = self.cipher_from_kek()?;
-        let vault_nonce = Nonce::from(self.kek_nonce);
-        let vault_ciphertext = cipher.encrypt(&vault_nonce, fresh_vault_key.as_ref())?;
-        let device_nonce = Nonce::from(self.device_key_nonce);
-        let device_ciphertext = cipher.encrypt(&device_nonce, device_private_key.as_ref())?;
+        let vault_ciphertext = cipher
+            .encrypt(&self.kek_nonce, &[], fresh_vault_key.as_ref())
+            .map_err(|_| KeyError::CryptoFailure)?;
+        let device_ciphertext = cipher
+            .encrypt(&self.device_key_nonce, &[], device_private_key.as_ref())
+            .map_err(|_| KeyError::CryptoFailure)?;
 
         self.wrapped_vault_key = Zeroizing::new(vault_ciphertext);
         self.wrapped_device_private_key = Zeroizing::new(device_ciphertext);
@@ -381,9 +374,11 @@ impl CryptoMaterial {
 
         self.derive_kek(pin)?;
         let cipher = self.cipher_from_kek()?;
-        let vault_nonce = Nonce::from(self.kek_nonce);
-        let vault_plaintext =
-            Zeroizing::new(cipher.decrypt(&vault_nonce, self.wrapped_vault_key.as_slice())?);
+        let vault_plaintext = Zeroizing::new(
+            cipher
+                .decrypt(&self.kek_nonce, &[], self.wrapped_vault_key.as_slice())
+                .map_err(|_| KeyError::CryptoFailure)?,
+        );
 
         if vault_plaintext.len() != 32 {
             return Err(KeyError::VaultKeyLength);
@@ -391,9 +386,14 @@ impl CryptoMaterial {
 
         let mut vault_key = Zeroizing::new([0u8; 32]);
         vault_key.copy_from_slice(&vault_plaintext[..32]);
-        let device_nonce = Nonce::from(self.device_key_nonce);
         let device_plaintext = Zeroizing::new(
-            cipher.decrypt(&device_nonce, self.wrapped_device_private_key.as_slice())?,
+            cipher
+                .decrypt(
+                    &self.device_key_nonce,
+                    &[],
+                    self.wrapped_device_private_key.as_slice(),
+                )
+                .map_err(|_| KeyError::CryptoFailure)?,
         );
 
         if device_plaintext.len() != 32 {
@@ -413,12 +413,12 @@ impl CryptoMaterial {
         plaintext: &[u8],
     ) -> Result<(RecordNonce, Vec<u8>), KeyError> {
         let vault_key = self.ensure_vault_key()?;
-        let cipher = ChaCha20Poly1305::new_from_slice(vault_key.as_ref())
-            .map_err(|_| KeyError::CryptoFailure)?;
+        let cipher = PageCipher::chacha20_poly1305(**vault_key);
         let mut nonce_bytes = [0u8; 12];
         rng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from(nonce_bytes);
-        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(KeyError::from)?;
+        let ciphertext = cipher
+            .encrypt(&nonce_bytes, &[], plaintext)
+            .map_err(|_| KeyError::CryptoFailure)?;
         Ok((RecordNonce::new(nonce_bytes), ciphertext))
     }
 
@@ -428,10 +428,10 @@ impl CryptoMaterial {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, KeyError> {
         let vault_key = self.ensure_vault_key()?;
-        let cipher = ChaCha20Poly1305::new_from_slice(vault_key.as_ref())
-            .map_err(|_| KeyError::CryptoFailure)?;
-        let nonce = Nonce::from(*nonce.as_array());
-        cipher.decrypt(&nonce, ciphertext).map_err(KeyError::from)
+        let cipher = PageCipher::chacha20_poly1305(**vault_key);
+        cipher
+            .decrypt(nonce.as_array(), &[], ciphertext)
+            .map_err(|_| KeyError::CryptoFailure)
     }
 
     pub fn device_public_key(&self) -> Option<[u8; 32]> {

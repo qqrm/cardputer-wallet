@@ -5,7 +5,7 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 
-use crate::vault::{TotpAlgorithm, TotpConfig};
+use vault_core::{TotpAlgorithm, TotpConfig};
 
 /// Resulting TOTP code and metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,7 +100,7 @@ fn dynamic_truncate(hash: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{SecretString, TotpAlgorithm};
+    use vault_core::{SecretString, TotpAlgorithm};
 
     fn config(secret: &str, algorithm: TotpAlgorithm) -> TotpConfig {
         TotpConfig {
