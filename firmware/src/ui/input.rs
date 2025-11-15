@@ -52,7 +52,7 @@ impl KeyEvent {
 }
 
 /// High level user intention extracted from the keyboard layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiCommand {
     Activate,
     Back,
@@ -76,7 +76,7 @@ pub enum UiCommand {
     ToggleHints,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Binding {
     key: PhysicalKey,
     modifiers: KeyModifiers,
@@ -225,6 +225,6 @@ impl Keymap {
         self.bindings
             .iter()
             .find(|binding| binding.key == event.key && binding.modifiers == event.modifiers)
-            .map(|binding| binding.command.clone())
+            .map(|binding| binding.command)
     }
 }
