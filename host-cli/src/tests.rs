@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::signature::compute_signature_message;
+use crate::commands::{ArtifactStore, DeviceTransport};
 use crate::constants::{
     CARDPUTER_USB_PID, CARDPUTER_USB_VID, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_FILE,
     VAULT_FILE,
@@ -17,7 +18,7 @@ use serde_json::{Map, json};
 use serialport::SerialPortType;
 use shared::cdc::transport::{command_for_request, command_for_response, encode_frame};
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
-use shared::checksum::accumulate_checksum;
+use shared::error::SharedError;
 use shared::schema::{
     AckResponse, DeviceErrorCode, DeviceResponse, HostRequest, JournalFrame, NackResponse,
     PROTOCOL_VERSION, PullHeadResponse, PullVaultRequest, StatusRequest, StatusResponse,
@@ -27,6 +28,7 @@ use shared::schema::{
 use shared::vault::{
     EntryUpdate, JournalOperation as VaultJournalOperation, SecretString, VaultEntry, VaultMetadata,
 };
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
@@ -367,6 +369,73 @@ fn response_command_mismatch_is_reported() {
     }
 }
 
+struct InMemoryDeviceTransport {
+    requests: Vec<HostRequest>,
+    responses: VecDeque<DeviceResponse>,
+}
+
+impl InMemoryDeviceTransport {
+    fn new(responses: Vec<DeviceResponse>) -> Self {
+        Self {
+            requests: Vec::new(),
+            responses: VecDeque::from(responses),
+        }
+    }
+
+    fn requests(&self) -> &[HostRequest] {
+        &self.requests
+    }
+}
+
+impl DeviceTransport for InMemoryDeviceTransport {
+    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError> {
+        self.requests.push(request.clone());
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Result<DeviceResponse, SharedError> {
+        self.responses.pop_front().ok_or_else(|| {
+            SharedError::Transport("in-memory transport ran out of responses".into())
+        })
+    }
+}
+
+#[derive(Default)]
+struct InMemoryArtifactStore {
+    vault: Option<Vec<u8>>,
+    recipients: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+}
+
+impl InMemoryArtifactStore {
+    fn set(&mut self, artifact: VaultArtifact, data: Vec<u8>) {
+        match artifact {
+            VaultArtifact::Vault => self.vault = Some(data),
+            VaultArtifact::Recipients => self.recipients = Some(data),
+            VaultArtifact::Signature => self.signature = Some(data),
+        }
+    }
+
+    fn artifact_bytes(&self, artifact: VaultArtifact) -> Option<Vec<u8>> {
+        match artifact {
+            VaultArtifact::Vault => self.vault.clone(),
+            VaultArtifact::Recipients => self.recipients.clone(),
+            VaultArtifact::Signature => self.signature.clone(),
+        }
+    }
+}
+
+impl ArtifactStore for InMemoryArtifactStore {
+    fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError> {
+        Ok(self.artifact_bytes(artifact))
+    }
+
+    fn persist(&mut self, artifact: VaultArtifact, data: &[u8]) -> Result<(), SharedError> {
+        self.set(artifact, data.to_vec());
+        Ok(())
+    }
+}
+
 #[test]
 fn pull_reissues_request_until_completion() {
     let responses = [
@@ -411,7 +480,8 @@ fn pull_reissues_request_until_completion() {
     };
 
     write_empty_credentials(&args.credentials);
-    commands::pull::run(&mut port, &args).expect("pull succeeds");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    commands::pull::run(&mut port, &mut store, &args).expect("pull succeeds");
 
     let mut reader = Cursor::new(port.writes);
     let (command_one, payload_one) =
@@ -486,7 +556,8 @@ fn pull_persists_vault_chunks_to_file() {
     };
 
     write_empty_credentials(&args.credentials);
-    commands::pull::run(&mut port, &args).expect("pull succeeds");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    commands::pull::run(&mut port, &mut store, &args).expect("pull succeeds");
 
     let vault_path = args.repo.join("vault.enc");
     let content = fs::read(&vault_path).expect("vault file");
@@ -558,7 +629,8 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
 
     let mut port = MockPort::new(responses);
 
-    commands::pull::run(&mut port, &args).expect("pull succeeds");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    commands::pull::run(&mut port, &mut store, &args).expect("pull succeeds");
 
     let mut reader = Cursor::new(port.writes);
     let (first_command, first_payload) =
@@ -596,6 +668,56 @@ fn pull_persists_vault_and_recipients_chunks_to_files() {
     let signature_path = args.repo.join("vault.sig");
     let signature_content = fs::read(&signature_path).expect("signature file");
     assert_eq!(signature_content, signature);
+}
+
+#[test]
+fn pull_command_uses_in_memory_transport_and_store() {
+    let temp = tempdir().expect("tempdir");
+    let repo_path = temp.path().join("memory/repo");
+    fs::create_dir_all(&repo_path).expect("create repo");
+    let args = RepoArgs {
+        repo: repo_path,
+        credentials: temp.path().join("creds"),
+        signing_pubkey: None,
+    };
+
+    fs::write(&args.credentials, json!({}).to_string()).expect("write credentials");
+
+    let responses = vec![
+        DeviceResponse::Head(PullHeadResponse {
+            protocol_version: PROTOCOL_VERSION,
+            vault_generation: 1,
+            vault_hash: [0u8; 32],
+            recipients_hash: [0u8; 32],
+            signature_hash: [0u8; 32],
+        }),
+        DeviceResponse::VaultChunk(VaultChunk {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 1,
+            total_size: 4,
+            remaining_bytes: 0,
+            device_chunk_size: MAX_CHUNK_SIZE,
+            data: vec![1, 2, 3, 4],
+            checksum: 0x1234_ABCD,
+            is_last: true,
+            artifact: VaultArtifact::Vault,
+        }),
+    ];
+
+    let mut transport = InMemoryDeviceTransport::new(responses);
+    let mut store = InMemoryArtifactStore::default();
+
+    commands::pull::run(&mut transport, &mut store, &args).expect("pull succeeds");
+
+    let requests = transport.requests();
+    assert!(matches!(requests.first(), Some(HostRequest::PullHead(_))));
+    assert!(matches!(requests.get(1), Some(HostRequest::PullVault(_))));
+
+    assert_eq!(
+        store.artifact_bytes(VaultArtifact::Vault),
+        Some(vec![1, 2, 3, 4])
+    );
+    assert!(store.artifact_bytes(VaultArtifact::Recipients).is_none());
 }
 
 #[test]
@@ -646,7 +768,8 @@ fn pull_errors_when_signature_expected_without_verifying_key() {
     .concat();
 
     let mut port = MockPort::new(responses);
-    let err = commands::pull::run(&mut port, &args).expect_err("pull should fail");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    let err = commands::pull::run(&mut port, &mut store, &args).expect_err("pull should fail");
 
     match err {
         SharedError::Transport(message) => {
@@ -709,7 +832,8 @@ fn pull_errors_when_signature_verification_fails() {
     .concat();
 
     let mut port = MockPort::new(responses);
-    let err = commands::pull::run(&mut port, &args).expect_err("pull should fail");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    let err = commands::pull::run(&mut port, &mut store, &args).expect_err("pull should fail");
 
     match err {
         SharedError::Transport(message) => {
@@ -783,7 +907,8 @@ fn pull_persists_multi_chunk_recipients_manifest() {
     };
 
     write_empty_credentials(&args.credentials);
-    commands::pull::run(&mut port, &args).expect("pull succeeds");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    commands::pull::run(&mut port, &mut store, &args).expect("pull succeeds");
 
     let mut reader = Cursor::new(port.writes);
     let (first_command, first_payload) =
@@ -879,7 +1004,8 @@ fn push_serializes_local_operations() {
     }));
 
     let mut port = MockPort::new(ack_response.repeat(3));
-    commands::push::run(&mut port, &args).expect("push succeeds");
+    let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+    commands::push::run(&mut port, &mut store, &args).expect("push succeeds");
 
     let mut reader = Cursor::new(port.writes);
     let payload = loop {
@@ -950,6 +1076,58 @@ fn push_serializes_local_operations() {
         .verifying_key()
         .verify(&message, &signature)
         .expect("signature verifies");
+}
+
+#[test]
+fn push_command_uses_in_memory_transport_and_store() {
+    let temp = tempdir().expect("tempdir");
+    let repo_path = temp.path().join("memory/push");
+    fs::create_dir_all(&repo_path).expect("create repo");
+    let args = RepoArgs {
+        repo: repo_path,
+        credentials: temp.path().join("creds"),
+        signing_pubkey: None,
+    };
+
+    write_credentials_with_keys(&args.credentials, true, true);
+    let entry = sample_entry(Uuid::new_v4(), "demo");
+    let snapshot = sample_snapshot(vec![entry.clone()]);
+    write_encrypted_vault(&args.repo, &snapshot);
+
+    let operations = vec![VaultJournalOperation::Delete { id: entry.id }];
+    let encoded_ops = postcard_to_allocvec(&operations).expect("encode operations");
+    fs::write(
+        commands::push::operations_log_path(&args.repo),
+        &encoded_ops,
+    )
+    .expect("write operations");
+
+    let ack = DeviceResponse::Ack(AckResponse {
+        protocol_version: PROTOCOL_VERSION,
+        message: "ok".into(),
+    });
+    let responses = vec![ack.clone(), ack.clone(), ack];
+
+    let mut transport = InMemoryDeviceTransport::new(responses);
+    let mut store = InMemoryArtifactStore::default();
+    store.set(VaultArtifact::Vault, vec![0xAA, 0xBB, 0xCC]);
+
+    commands::push::run(&mut transport, &mut store, &args).expect("push succeeds");
+
+    let requests = transport.requests();
+    let vault_frame = requests
+        .iter()
+        .find_map(|request| match request {
+            HostRequest::PushVault(frame) => Some(frame.clone()),
+            _ => None,
+        })
+        .expect("vault frame sent");
+    assert_eq!(vault_frame.data, vec![0xAA, 0xBB, 0xCC]);
+    assert!(
+        requests
+            .iter()
+            .any(|request| matches!(request, HostRequest::PushOps(_)))
+    );
 }
 
 #[test]
@@ -1038,7 +1216,8 @@ fn confirm_sends_ack_request_with_saved_state() {
     write_empty_credentials(&args.credentials);
     {
         let mut port = MockPort::new(pull_responses);
-        commands::pull::run(&mut port, &args).expect("pull succeeds");
+        let mut store = commands::FilesystemArtifactStore::new(&args.repo);
+        commands::pull::run(&mut port, &mut store, &args).expect("pull succeeds");
     }
 
     let push_responses = encode_response(DeviceResponse::Ack(AckResponse {

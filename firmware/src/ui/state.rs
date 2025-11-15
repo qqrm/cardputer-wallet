@@ -1,13 +1,13 @@
-use alloc::{boxed::Box, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::cmp;
 
 use super::{
-    JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel,
+    JournalAction, JournalEntryView, TotpProvider, VaultViewModel,
     input::{KeyEvent, Keymap, UiCommand},
     render::{
         EditView, EntryDetails, EntryView, FormField, FormWidget, Frame, HintBar, HintItem,
         HomeView, LockView, RecentList, RecentListItem, SearchWidget, SettingsItem, SettingsView,
-        SyncView, TotpWidget, ViewContent,
+        SyncView, ViewContent,
     },
     transport,
 };
@@ -52,6 +52,7 @@ pub struct EntrySummary {
 }
 
 const MIN_SEARCH_LEN: usize = 2;
+#[cfg(test)]
 const DEFAULT_TOTP_PERIOD: u8 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,6 +298,10 @@ impl UiRuntime {
                 self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
             }
+            UiCommand::OpenSettings => {
+                self.set_screen(UiScreen::Settings);
+                UiEffect::None
+            }
             UiCommand::EditEntry | UiCommand::Activate => {
                 if let Some(entry) = self.active_entry_id() {
                     self.enter_edit(entry)
@@ -382,6 +387,11 @@ impl UiRuntime {
             UiCommand::StartSync => {
                 self.set_screen(UiScreen::Sync);
                 UiEffect::StartSync
+            }
+            UiCommand::OpenSettings => {
+                self.edit = None;
+                self.set_screen(UiScreen::Settings);
+                UiEffect::None
             }
             _ => UiEffect::None,
         }
@@ -766,11 +776,17 @@ fn sort_by_last_used(mut entries: Vec<EntrySummary>) -> Vec<EntrySummary> {
 }
 
 fn filter_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
+    let mut seen_ids: Vec<String> = Vec::new();
     let mut prefix: Vec<EntrySummary> = Vec::new();
     let mut fuzzy: Vec<(EntrySummary, usize)> = Vec::new();
     let mut fallback: Vec<EntrySummary> = Vec::new();
 
     for entry in entries {
+        if seen_ids.iter().any(|id| id == &entry.id) {
+            continue;
+        }
+        seen_ids.push(entry.id.clone());
+
         let title = entry.title.to_ascii_lowercase();
         let username = entry.username.to_ascii_lowercase();
         if title.starts_with(query) || username.starts_with(query) {
@@ -822,7 +838,7 @@ fn filter_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> 
     prefix
         .into_iter()
         .chain(fuzzy.into_iter().map(|(entry, _)| entry))
-        .chain(fallback.into_iter())
+        .chain(fallback)
         .collect()
 }
 
@@ -968,7 +984,7 @@ mod tests {
         transport::reset();
         let mut ui = build_runtime(MemoryVault::new(sample_entries()));
 
-        let mut assert_hint = |expected: &str| {
+        fn assert_hint(ui: &UiRuntime, expected: &str) {
             let frame = ui.render();
             assert!(
                 frame
@@ -978,19 +994,19 @@ mod tests {
                     .any(|hint| hint.action.contains(expected)),
                 "missing {expected} hint"
             );
-        };
+        }
 
-        assert_hint("Unlock");
+        assert_hint(&ui, "Unlock");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
-        assert_hint("Open");
+        assert_hint(&ui, "Open");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Enter));
-        assert_hint("Edit");
+        assert_hint(&ui, "Edit");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Edit));
-        assert_hint("Save");
+        assert_hint(&ui, "Save");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Settings));
-        assert_hint("Select");
+        assert_hint(&ui, "Select");
         ui.handle_key_event(KeyEvent::pressed(PhysicalKey::Sync));
-        assert_hint("Lock");
+        assert_hint(&ui, "Lock");
     }
 
     #[test]

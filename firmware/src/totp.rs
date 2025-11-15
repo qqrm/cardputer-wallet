@@ -1,4 +1,4 @@
-use alloc::{collections::BTreeMap, string::String};
+use alloc::{collections::BTreeMap, string::String, string::ToString};
 use core::cmp;
 
 use crate::ui::{TotpProvider, TotpSnapshot};
@@ -52,16 +52,21 @@ impl SharedTotp {
     }
 
     fn refresh_snapshot(&mut self) {
-        if let Some(active) = self.active_entry.clone() {
-            if let Some(config) = self.configs.get(&active) {
-                if let Ok(code) = generate(config, self.now_ms) {
-                    self.snapshot = to_snapshot(config, &code);
-                    return;
-                }
-            }
+        if let Some(active) = self.active_entry.clone()
+            && let Some(config) = self.configs.get(&active)
+            && let Ok(code) = generate(config, self.now_ms)
+        {
+            self.snapshot = to_snapshot(config, &code);
+            return;
         }
 
         self.snapshot = TotpSnapshot::empty(FALLBACK_PERIOD);
+    }
+}
+
+impl Default for SharedTotp {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

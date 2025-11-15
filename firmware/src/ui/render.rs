@@ -1,27 +1,13 @@
 use alloc::{string::String, vec::Vec};
 
+use super::transport::TransportIndicators;
+
 /// Aggregated render output for the active UI frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub transport: TransportIndicators,
     pub content: ViewContent,
     pub hint_bar: HintBar,
-}
-
-/// BLE and USB connectivity indicators displayed in the status row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TransportIndicators {
-    pub usb_connected: bool,
-    pub ble_connected: bool,
-}
-
-impl TransportIndicators {
-    pub fn new(usb_connected: bool, ble_connected: bool) -> Self {
-        Self {
-            usb_connected,
-            ble_connected,
-        }
-    }
 }
 
 /// Footer with per-screen keyboard hints.

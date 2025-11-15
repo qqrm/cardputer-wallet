@@ -9,6 +9,47 @@ use shared::transfer::ArtifactCollector;
 
 use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, SYNC_STATE_FILE, VAULT_FILE};
 
+pub mod memory;
+
+/// Trait describing storage backends used while pulling vault artifacts from the device.
+pub trait ArtifactStore {
+    /// Configure whether recipients data should be collected during the transfer.
+    fn set_recipients_expected(&mut self, expected: bool);
+
+    /// Configure whether a vault signature is expected as part of the transfer.
+    fn set_signature_expected(&mut self, expected: bool);
+
+    /// Record an incoming vault chunk. Returns `true` when additional chunks are required.
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool;
+
+    /// Record an incoming journal frame for later inspection.
+    fn record_journal_frame(&mut self, frame: &JournalFrame);
+
+    /// Record an informational log entry about the pull lifecycle.
+    fn record_log(&mut self, context: &str);
+
+    /// Persist artifacts to the on-disk repository.
+    fn persist(&self, repo: &Path) -> Result<(), SharedError>;
+
+    /// Access the collected vault bytes.
+    fn vault_bytes(&self) -> &[u8];
+
+    /// Access the collected recipients manifest if present.
+    fn recipients_bytes(&self) -> Option<&[u8]>;
+
+    /// Access the collected signature, if one was transferred.
+    fn signature_bytes(&self) -> Option<&[u8]>;
+
+    /// Track whether a recipients manifest should be present in the transfer.
+    fn recipients_expected(&self) -> bool;
+
+    /// Track whether a recipients manifest has been observed in the transfer.
+    fn recipients_seen(&self) -> bool;
+
+    /// Track whether a signature should be present in the transfer.
+    fn signature_expected(&self) -> bool;
+}
+
 #[derive(Default)]
 pub struct PullArtifacts {
     collector: ArtifactCollector,
@@ -16,17 +57,78 @@ pub struct PullArtifacts {
 }
 
 impl PullArtifacts {
-    pub fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
-        self.collector.set_expected_hash(artifact, hash);
+    fn record_recipients_manifest(&mut self, data: &[u8]) {
+        self.recipients_manifest = Some(data.to_vec());
+    }
+}
+
+impl ArtifactStore for PullArtifacts {
+    fn set_recipients_expected(&mut self, expected: bool) {
+        self.recipients_expected = expected;
     }
 
-    pub fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
-        self.collector
-            .record_chunk(chunk)
-            .map_err(|err| SharedError::Transport(err.to_string()))
+    fn set_signature_expected(&mut self, expected: bool) {
+        self.signature_expected = expected;
     }
 
-    pub fn record_journal_frame(&mut self, frame: &JournalFrame) {
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
+        match chunk.artifact {
+            VaultArtifact::Vault => {
+                self.vault.bytes.extend_from_slice(&chunk.data);
+                self.vault
+                    .metadata
+                    .push(VaultChunkMetadata::from_chunk(chunk));
+                if chunk.is_last {
+                    if self.recipients_expected && !self.recipients_seen {
+                        return true;
+                    }
+                    if self.signature_expected && !self.signature_seen {
+                        return true;
+                    }
+                    return false;
+                }
+                true
+            }
+            VaultArtifact::Recipients => {
+                if !self.recipients_seen || chunk.sequence == 1 {
+                    self.recipients.bytes.clear();
+                    self.recipients.metadata.clear();
+                }
+                self.recipients_seen = true;
+                self.recipients.bytes.extend_from_slice(&chunk.data);
+                self.recipients
+                    .metadata
+                    .push(VaultChunkMetadata::from_chunk(chunk));
+                if chunk.is_last {
+                    let data = self.recipients.bytes.clone();
+                    self.record_recipients_manifest(&data);
+                    if self.signature_expected && !self.signature_seen {
+                        return true;
+                    }
+                    return false;
+                }
+                true
+            }
+            VaultArtifact::Signature => {
+                if !self.signature_seen || chunk.sequence == 1 {
+                    self.signature.bytes.clear();
+                    self.signature.metadata.clear();
+                }
+                self.signature_seen = true;
+                self.signature.bytes.extend_from_slice(&chunk.data);
+                self.signature
+                    .metadata
+                    .push(VaultChunkMetadata::from_chunk(chunk));
+                if chunk.is_last {
+                    self.signature_bytes = Some(self.signature.bytes.clone());
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
+    fn record_journal_frame(&mut self, frame: &JournalFrame) {
         let summary = format!(
             "journal frame #{sequence} with {operations} operations and {remaining} pending",
             sequence = frame.sequence,
@@ -36,12 +138,12 @@ impl PullArtifacts {
         self.log_context.push(summary);
     }
 
-    pub fn record_log(&mut self, context: impl Into<String>) {
+    fn record_log(&mut self, context: &str) {
         self.log_context.push(context.into());
     }
 
-    pub fn persist(&self, repo: &Path) -> Result<(), SharedError> {
-        if self.collector.vault_bytes().is_empty() && self.collector.recipients_bytes().is_none() {
+    fn persist(&self, repo: &Path) -> Result<(), SharedError> {
+        if self.vault.bytes.is_empty() && self.recipients_manifest.is_none() {
             return Ok(());
         }
 
@@ -87,6 +189,36 @@ impl PullArtifacts {
 
         Ok(())
     }
+
+    fn vault_bytes(&self) -> &[u8] {
+        &self.vault.bytes
+    }
+
+    fn recipients_bytes(&self) -> Option<&[u8]> {
+        self.recipients_seen
+            .then_some(self.recipients.bytes.as_slice())
+            .or_else(|| self.recipients_manifest.as_deref())
+    }
+
+    fn signature_bytes(&self) -> Option<&[u8]> {
+        self.signature_bytes.as_deref().or_else(|| {
+            self.signature_seen
+                .then_some(self.signature.bytes.as_slice())
+        })
+    }
+
+    fn recipients_expected(&self) -> bool {
+        self.recipients_expected
+    }
+
+    fn recipients_seen(&self) -> bool {
+        self.recipients_seen
+    }
+
+    fn signature_expected(&self) -> bool {
+        self.signature_expected
+    }
+}
 
     pub fn vault_bytes(&self) -> &[u8] {
         self.collector.vault_bytes()
