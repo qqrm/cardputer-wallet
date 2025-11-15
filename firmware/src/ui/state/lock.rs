@@ -23,10 +23,11 @@ impl UiRuntime {
                 self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
-            UiCommand::Back | UiCommand::GoHome => {
+            UiCommand::GoHome => {
                 self.set_screen(UiScreen::Home);
                 UiEffect::None
             }
+            UiCommand::Back => UiEffect::None,
             UiCommand::FocusSearch => {
                 self.set_screen(UiScreen::Home);
                 self.home.search_focus = true;
@@ -58,5 +59,16 @@ mod tests {
         assert_eq!(ui.screen(), UiScreen::Lock);
         ui.apply_command(UiCommand::Activate);
         assert_eq!(ui.screen(), UiScreen::Home);
+    }
+
+    #[test]
+    fn back_does_not_exit_lock() {
+        let vault =
+            super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
+        let mut ui = super::super::fixtures::build_runtime(vault);
+
+        assert_eq!(ui.screen(), UiScreen::Lock);
+        ui.apply_command(UiCommand::Back);
+        assert_eq!(ui.screen(), UiScreen::Lock);
     }
 }
