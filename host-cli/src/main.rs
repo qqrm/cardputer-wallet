@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -568,17 +569,20 @@ fn convert_device_operations(
         ))
     })?;
     let snapshot = decrypt_vault(&encrypted, &vault_key)?;
+    let mut snapshot_entries: BTreeMap<Uuid, VaultEntry> = snapshot
+        .entries
+        .into_iter()
+        .map(|entry| (entry.id, entry))
+        .collect();
 
-    let mut pending_updates: Vec<(Uuid, EntryUpdate)> = Vec::new();
+    let mut pending_updates: BTreeMap<Uuid, EntryUpdate> = BTreeMap::new();
     let mut sequence: Vec<LegacyConvertedOp> = Vec::new();
 
     for operation in device_ops {
         match operation {
             DeviceJournalOperation::Add { entry_id } => {
                 let id = parse_legacy_uuid(&entry_id)?;
-                if pending_updates
-                    .iter()
-                    .any(|(existing, _)| existing == &id)
+                if pending_updates.contains_key(&id)
                     && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
                 {
                     sequence.push(LegacyConvertedOp::Update(id));
@@ -591,7 +595,7 @@ fn convert_device_operations(
                 value_checksum,
             } => {
                 let id = parse_legacy_uuid(&entry_id)?;
-                let entry = find_entry(&snapshot, &id)?;
+                let entry = find_entry(&snapshot_entries, &id)?;
                 let update = get_or_insert_update(&mut pending_updates, &id);
                 let field = LegacyField::try_from(field.as_str())
                     .map_err(|err| SharedError::Transport(err.to_string()))?;
@@ -604,9 +608,7 @@ fn convert_device_operations(
             }
             DeviceJournalOperation::Delete { entry_id } => {
                 let id = parse_legacy_uuid(&entry_id)?;
-                if pending_updates
-                    .iter()
-                    .any(|(existing, _)| existing == &id)
+                if pending_updates.contains_key(&id)
                     && !sequence.iter().any(|item| matches!(item, LegacyConvertedOp::Update(existing) if existing == &id))
                 {
                     sequence.push(LegacyConvertedOp::Update(id));
@@ -628,10 +630,13 @@ fn convert_device_operations(
                 }
             }
             LegacyConvertedOp::Add(id) => {
-                let entry = find_entry(&snapshot, &id)?;
-                host_ops.push(VaultJournalOperation::Add {
-                    entry: entry.clone(),
-                });
+                let entry = snapshot_entries.remove(&id).ok_or_else(|| {
+                    SharedError::Transport(format!(
+                        "legacy operations reference unknown entry {}",
+                        id
+                    ))
+                })?;
+                host_ops.push(VaultJournalOperation::Add { entry });
             }
             LegacyConvertedOp::Delete(id) => {
                 if let Some(update) = take_pending_update(&mut pending_updates, &id) {
@@ -675,42 +680,29 @@ fn parse_legacy_uuid(raw: &str) -> Result<Uuid, SharedError> {
     })
 }
 
-fn find_entry<'a>(snapshot: &'a VaultSnapshot, id: &Uuid) -> Result<&'a VaultEntry, SharedError> {
-    snapshot
-        .entries
-        .iter()
-        .find(|entry| &entry.id == id)
-        .ok_or_else(|| {
-            SharedError::Transport(format!("legacy operations reference unknown entry {id}"))
-        })
+fn find_entry<'a>(
+    entries: &'a BTreeMap<Uuid, VaultEntry>,
+    id: &Uuid,
+) -> Result<&'a VaultEntry, SharedError> {
+    entries.get(id).ok_or_else(|| {
+        SharedError::Transport(format!("legacy operations reference unknown entry {id}"))
+    })
 }
 
 fn get_or_insert_update<'a>(
-    updates: &'a mut Vec<(Uuid, EntryUpdate)>,
+    updates: &'a mut BTreeMap<Uuid, EntryUpdate>,
     id: &Uuid,
 ) -> &'a mut EntryUpdate {
-    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
-        return &mut updates[position].1;
-    }
-
-    updates.push((*id, EntryUpdate::default()));
-    let last = updates
-        .last_mut()
-        .expect("pending updates missing newly inserted entry");
-    &mut last.1
+    updates.entry(*id).or_default()
 }
 
-fn take_pending_update(updates: &mut Vec<(Uuid, EntryUpdate)>, id: &Uuid) -> Option<EntryUpdate> {
-    if let Some(position) = updates.iter().position(|(existing, _)| existing == id) {
-        let (_, update) = updates.remove(position);
-        if entry_update_is_empty(&update) {
-            None
-        } else {
-            Some(update)
-        }
-    } else {
-        None
-    }
+fn take_pending_update(
+    updates: &mut BTreeMap<Uuid, EntryUpdate>,
+    id: &Uuid,
+) -> Option<EntryUpdate> {
+    updates
+        .remove(id)
+        .filter(|update| !entry_update_is_empty(update))
 }
 
 fn entry_update_is_empty(update: &EntryUpdate) -> bool {
