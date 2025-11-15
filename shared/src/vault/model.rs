@@ -1,4 +1,5 @@
 use alloc::{string::String, vec::Vec};
+use core::fmt;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -122,6 +123,126 @@ pub struct EntryUpdate {
     pub r#macro: Option<String>,
     pub updated_at: Option<String>,
     pub used_at: Option<Option<String>>,
+}
+
+/// Legacy journal fields emitted by early firmware revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyField {
+    Title,
+    Service,
+    Domains,
+    Username,
+    Password,
+    Totp,
+    Tags,
+    Macro,
+    UpdatedAt,
+    UsedAt,
+}
+
+impl LegacyField {
+    /// Stable identifier matching on-device payloads.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LegacyField::Title => "title",
+            LegacyField::Service => "service",
+            LegacyField::Domains => "domains",
+            LegacyField::Username => "username",
+            LegacyField::Password => "password",
+            LegacyField::Totp => "totp",
+            LegacyField::Tags => "tags",
+            LegacyField::Macro => "macro",
+            LegacyField::UpdatedAt => "updated_at",
+            LegacyField::UsedAt => "used_at",
+        }
+    }
+}
+
+impl fmt::Display for LegacyField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when parsing an unknown legacy field name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyFieldParseError {
+    value: String,
+}
+
+impl LegacyFieldParseError {
+    /// Raw identifier extracted from the payload.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for LegacyFieldParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unsupported legacy journal field '{}'", self.value)
+    }
+}
+
+impl TryFrom<&str> for LegacyField {
+    type Error = LegacyFieldParseError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let field = match value {
+            "title" => LegacyField::Title,
+            "service" => LegacyField::Service,
+            "domains" => LegacyField::Domains,
+            "username" => LegacyField::Username,
+            "password" => LegacyField::Password,
+            "totp" => LegacyField::Totp,
+            "tags" => LegacyField::Tags,
+            "macro" => LegacyField::Macro,
+            "updated_at" => LegacyField::UpdatedAt,
+            "used_at" => LegacyField::UsedAt,
+            _ => {
+                return Err(LegacyFieldParseError {
+                    value: value.to_owned(),
+                });
+            }
+        };
+
+        Ok(field)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LegacyField;
+    use core::convert::TryFrom;
+
+    #[test]
+    fn legacy_field_round_trip() {
+        for (raw, expected) in [
+            ("title", LegacyField::Title),
+            ("service", LegacyField::Service),
+            ("domains", LegacyField::Domains),
+            ("username", LegacyField::Username),
+            ("password", LegacyField::Password),
+            ("totp", LegacyField::Totp),
+            ("tags", LegacyField::Tags),
+            ("macro", LegacyField::Macro),
+            ("updated_at", LegacyField::UpdatedAt),
+            ("used_at", LegacyField::UsedAt),
+        ] {
+            let parsed = LegacyField::try_from(raw).expect("field parsed");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.to_string(), raw);
+        }
+    }
+
+    #[test]
+    fn legacy_field_rejects_unknown_values() {
+        let err = LegacyField::try_from("unknown").expect_err("expected failure");
+        assert_eq!(
+            err.to_string(),
+            "unsupported legacy journal field 'unknown'"
+        );
+        assert_eq!(err.value(), "unknown");
+    }
 }
 
 /// Journal operations captured in the sequential log.

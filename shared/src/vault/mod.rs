@@ -15,6 +15,7 @@ pub mod storage;
 pub use cipher::{EnvelopeAlgorithm, PageCipher};
 pub use model::{
     EncryptedJournalPage, EntryUpdate, JOURNAL_AAD, JOURNAL_PAGE_VERSION, JournalOperation,
-    JournalPage, JournalRecord, SecretString, TotpAlgorithm, TotpConfig, VaultEntry, VaultMetadata,
+    JournalPage, JournalRecord, LegacyField, SecretString, TotpAlgorithm, TotpConfig, VaultEntry,
+    VaultMetadata,
 };
 pub use storage::{VaultJournal, VaultStorageError};
