@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::Signer;
@@ -22,22 +22,20 @@ use shared::vault::{
 use uuid::Uuid;
 
 use crate::RepoArgs;
-use crate::artifacts::io_error;
 use crate::commands::host_config::{HostConfig, VaultSnapshot};
-use crate::commands::print_repo_banner;
 use crate::commands::signature::compute_signature_message;
+use crate::commands::{ArtifactStore, DeviceTransport, print_repo_banner};
 use crate::constants::{
     CONFIG_FILE, LEGACY_LOCAL_OPERATIONS_FILE, LOCAL_OPERATIONS_FILE, MAX_CHUNK_SIZE,
     PUSH_FRAME_MAX_PAYLOAD, RECIPIENTS_FILE, SIGNATURE_FILE, SIGNATURE_SIZE, VAULT_AAD, VAULT_FILE,
     VAULT_NONCE_SIZE,
 };
-use crate::transport::{
-    handle_device_response, print_ack, read_device_response, send_host_request,
-};
+use crate::transport::{handle_device_response, print_ack};
 
-pub fn run<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    T: DeviceTransport + ?Sized,
+    S: ArtifactStore + ?Sized,
 {
     print_repo_banner(args);
 
@@ -60,7 +58,7 @@ where
         if plan.frames.len() == 1 { "" } else { "s" }
     );
 
-    push_vault_artifacts(port, &args.repo)?;
+    push_vault_artifacts(transport, store)?;
 
     for frame in plan.frames.into_iter() {
         let sequence = frame.sequence;
@@ -76,9 +74,9 @@ where
         );
 
         let request = HostRequest::PushOps(frame);
-        send_host_request(port, &request)?;
+        transport.send(&request)?;
 
-        let response = read_device_response(port)?;
+        let response = transport.receive()?;
         let DeviceResponse::Ack(message) = response else {
             let description = format!("{response:?}");
             handle_device_response(response, None, None)?;
@@ -94,37 +92,27 @@ where
     Ok(())
 }
 
-fn push_vault_artifacts<P>(port: &mut P, repo: &Path) -> Result<(), SharedError>
+fn push_vault_artifacts<T, S>(transport: &mut T, store: &S) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    T: DeviceTransport + ?Sized,
+    S: ArtifactStore + ?Sized,
 {
     let descriptors = [
-        (VaultArtifact::Vault, repo.join(VAULT_FILE), "vault image"),
-        (
-            VaultArtifact::Recipients,
-            repo.join(RECIPIENTS_FILE),
-            "recipients manifest",
-        ),
-        (
-            VaultArtifact::Signature,
-            repo.join(SIGNATURE_FILE),
-            "vault signature",
-        ),
+        (VaultArtifact::Vault, "vault image"),
+        (VaultArtifact::Recipients, "recipients manifest"),
+        (VaultArtifact::Signature, "vault signature"),
     ];
 
     let mut sequence = 1u32;
 
-    for (artifact, path, label) in descriptors.into_iter() {
-        if !path.exists() {
+    for (artifact, label) in descriptors.into_iter() {
+        let Some(data) = store.load(artifact)? else {
             continue;
-        }
-
-        let data = fs::read(&path).map_err(|err| io_error("read artifact", &path, err))?;
+        };
 
         if matches!(artifact, VaultArtifact::Signature) && data.len() != SIGNATURE_SIZE {
             return Err(SharedError::Transport(format!(
-                "signature artifact '{}' must be exactly {} bytes (found {})",
-                path.display(),
+                "signature artifact must be exactly {} bytes (found {})",
                 SIGNATURE_SIZE,
                 data.len()
             )));
@@ -162,8 +150,8 @@ where
             sequence = sequence.saturating_add(1);
 
             let request = HostRequest::PushVault(frame);
-            send_host_request(port, &request)?;
-            let response = read_device_response(port)?;
+            transport.send(&request)?;
+            let response = transport.receive()?;
             let DeviceResponse::Ack(message) = response else {
                 if let DeviceResponse::Nack(nack) = response {
                     return Err(SharedError::Transport(format!(

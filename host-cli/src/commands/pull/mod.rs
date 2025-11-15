@@ -1,27 +1,25 @@
 use std::fs;
-use std::io::{Read, Write};
 use std::path::Path;
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use shared::error::SharedError;
 use shared::journal::FrameTracker;
 use shared::schema::{
-    DeviceResponse, HostRequest, PROTOCOL_VERSION, PullHeadRequest, PullVaultRequest,
+    DeviceResponse, HostRequest, PROTOCOL_VERSION, PullHeadRequest, PullVaultRequest, VaultArtifact,
 };
 
 use crate::RepoArgs;
 use crate::artifacts::{PullArtifacts, persist_sync_state};
 use crate::commands::host_config::HostConfig;
-use crate::commands::print_repo_banner;
 use crate::commands::signature::compute_signature_message;
+use crate::commands::{ArtifactStore, DeviceTransport, print_repo_banner};
 use crate::constants::{CONFIG_FILE, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_SIZE};
-use crate::transport::{
-    handle_device_response, print_head, read_device_response, send_host_request,
-};
+use crate::transport::{handle_device_response, print_head};
 
-pub fn run<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
+pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    T: DeviceTransport + ?Sized,
+    S: ArtifactStore + ?Sized,
 {
     print_repo_banner(args);
 
@@ -32,11 +30,11 @@ where
         protocol_version: PROTOCOL_VERSION,
     });
 
-    send_host_request(port, &head_request)?;
+    transport.send(&head_request)?;
     println!("Requested head metadata. Awaiting response…");
 
     let mut artifacts = PullArtifacts::default();
-    let head_response = read_device_response(port)?;
+    let head_response = transport.receive()?;
     let DeviceResponse::Head(head) = head_response else {
         handle_device_response(head_response, None, Some(&mut artifacts))?;
         return Err(SharedError::Transport(
@@ -58,24 +56,43 @@ where
         known_generation: None,
     });
 
-    send_host_request(port, &request)?;
+    transport.send(&request)?;
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = FrameTracker::default();
     let mut should_continue = true;
 
     while should_continue {
-        let response = read_device_response(port)?;
+        let response = transport.receive()?;
         should_continue =
             handle_device_response(response, Some(&mut state_tracker), Some(&mut artifacts))?;
         if should_continue {
-            send_host_request(port, &request)?;
+            transport.send(&request)?;
         }
     }
 
     verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
-    artifacts.persist(&args.repo)?;
+    persist_artifacts(store, &artifacts)?;
     persist_sync_state(&args.repo, state_tracker.state())
+}
+
+fn persist_artifacts<S>(store: &mut S, artifacts: &PullArtifacts) -> Result<(), SharedError>
+where
+    S: ArtifactStore + ?Sized,
+{
+    if !artifacts.vault.bytes.is_empty() {
+        store.persist(VaultArtifact::Vault, &artifacts.vault.bytes)?;
+    }
+
+    if let Some(recipients) = &artifacts.recipients_manifest {
+        store.persist(VaultArtifact::Recipients, recipients)?;
+    }
+
+    if let Some(signature) = &artifacts.signature_bytes {
+        store.persist(VaultArtifact::Signature, signature)?;
+    }
+
+    Ok(())
 }
 fn load_verifying_key(
     config: &HostConfig,
