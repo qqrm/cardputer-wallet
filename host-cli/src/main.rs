@@ -1,84 +1,32 @@
-use std::collections::BTreeMap;
-use std::env;
-use std::fmt::Write as FmtWrite;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use anyhow::Result;
-use base64::{Engine, engine::general_purpose::STANDARD as Base64};
-use blake3::Hasher;
-use clap::{Args, Parser, Subcommand};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hex::decode as hex_decode;
-use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
-use rand_core::{CryptoRng, OsRng, RngCore};
-use serde::{Deserialize, Serialize};
-use serde_cbor::{from_slice as cbor_from_slice, to_vec as cbor_to_vec};
-use serde_json::from_str as json_from_str;
-use serialport::{SerialPort, SerialPortType};
+mod artifacts;
+mod commands;
+mod constants;
+mod transport;
 
 #[cfg(test)]
-use shared::cdc::FrameHeader;
-use shared::cdc::transport::{
-    FrameTransportError, command_for_request, command_for_response, decode_frame,
-    decode_frame_header, encode_frame,
-};
-use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, compute_crc32};
-use shared::checksum::accumulate_checksum;
-use shared::error::SharedError;
-use shared::journal::{FrameState, FrameTracker, JournalHasher};
-use shared::schema::{
-    AckRequest, AckResponse, DeviceResponse, GetTimeRequest, HelloRequest, HelloResponse,
-    HostRequest, JournalFrame, JournalOperation as DeviceJournalOperation, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
-    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
-    decode_journal_operations, encode_journal_operations,
-};
-use shared::vault::{
-    EntryUpdate, JournalOperation as VaultJournalOperation, LegacyField, PageCipher, VaultEntry,
-    VaultMetadata,
-};
-use uuid::Uuid;
+mod tests;
 
-const SERIAL_BAUD_RATE: u32 = 115_200;
-const DEFAULT_TIMEOUT_SECS: u64 = 2;
-const HOST_BUFFER_SIZE: u32 = 64 * 1024;
-const MAX_CHUNK_SIZE: u32 = 4 * 1024;
-const SIGNATURE_SIZE: usize = 64;
-const CARDPUTER_USB_VID: u16 = 0x303A;
-const CARDPUTER_USB_PID: u16 = 0x4001;
-const CARDPUTER_IDENTITY_KEYWORDS: &[&str] = &["cardputer", "m5stack"];
-const SYNC_STATE_FILE: &str = ".cardputer-sync-state";
-const LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.postcard";
-const LEGACY_LOCAL_OPERATIONS_FILE: &str = ".cardputer-journal.cbor";
-const PUSH_FRAME_MAX_PAYLOAD: usize = (HOST_BUFFER_SIZE as usize).saturating_sub(1024);
-const VAULT_FILE: &str = "vault.enc";
-const RECIPIENTS_FILE: &str = "recips.json";
-const SIGNATURE_FILE: &str = "vault.sig";
-const CONFIG_FILE: &str = "config.json";
-const SIGNATURE_DOMAIN: &[u8] = b"cardputer.vault.signature.v1";
-const VAULT_AAD: &[u8] = b"cardputer.vault.snapshot.v1";
-const VAULT_NONCE_SIZE: usize = 12;
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+use shared::error::SharedError;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
-struct Cli {
+pub struct Cli {
     /// Optional path to the serial device. Falls back to auto-detection when omitted.
     #[arg(short, long)]
-    port: Option<String>,
+    pub port: Option<String>,
 
     /// Skip Cardputer VID/PID filtering and accept the first USB serial device.
     #[arg(long)]
-    any_port: bool,
+    pub any_port: bool,
 
     #[command(subcommand)]
-    command: Command,
+    pub command: Command,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
+pub enum Command {
     /// Perform the HELLO handshake and print device metadata.
     Hello,
     /// Query the device for its current sync status.
@@ -98,31 +46,31 @@ enum Command {
 }
 
 #[derive(Args, Debug, Clone)]
-struct RepoArgs {
+pub struct RepoArgs {
     /// Path to the repository that should receive or provide data.
     #[arg(long, value_name = "PATH")]
-    repo: PathBuf,
+    pub repo: std::path::PathBuf,
     /// Path to the credentials file used during the operation.
     #[arg(long, value_name = "PATH")]
-    credentials: PathBuf,
+    pub credentials: std::path::PathBuf,
     /// Optional path to a file containing the Ed25519 verifying key in base64 or hex.
     #[arg(long, value_name = "PATH")]
-    signing_pubkey: Option<PathBuf>,
+    pub signing_pubkey: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
-struct SetTimeArgs {
+pub struct SetTimeArgs {
     /// Epoch milliseconds to send to the device.
     #[arg(long, value_name = "MILLIS", conflicts_with = "system")]
-    epoch_ms: Option<u64>,
+    pub epoch_ms: Option<u64>,
     /// Use the host system time instead of an explicit value.
     #[arg(long)]
-    system: bool,
+    pub system: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = run(cli) {
+    if let Err(err) = commands::run(cli) {
         match &err {
             SharedError::Transport(_) => {
                 eprintln!("Transport failure: {err}");
