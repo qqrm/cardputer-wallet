@@ -19,13 +19,13 @@ use serde_cbor::{from_slice as cbor_from_slice, to_vec as cbor_to_vec};
 use serde_json::from_str as json_from_str;
 use serialport::{SerialPort, SerialPortType};
 
+#[cfg(test)]
+use shared::cdc::FrameHeader;
 use shared::cdc::transport::{
     FrameTransportError, command_for_request, command_for_response, decode_frame,
     decode_frame_header, encode_frame,
 };
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, compute_crc32};
-#[cfg(test)]
-use shared::cdc::FrameHeader;
 use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
 use shared::journal::{FrameState, FrameTracker, JournalHasher};
