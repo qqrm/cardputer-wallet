@@ -88,7 +88,7 @@ impl ProtocolError {
             ),
             ProtocolError::Transport => (
                 DeviceErrorCode::InternalFailure,
-                "transport failure while using USB CDC".into(),
+                "transport failure while exchanging CDC frames".into(),
             ),
             ProtocolError::Decode(err) => (
                 DeviceErrorCode::InternalFailure,

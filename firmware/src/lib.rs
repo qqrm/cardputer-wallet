@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod hid;
 pub mod storage;
 pub mod sync;
+pub mod transport;
 pub mod ui;
 
 pub use crypto::{

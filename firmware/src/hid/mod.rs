@@ -57,6 +57,7 @@ pub mod runtime {
     use super::actions;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
+    use crate::transport::usb::UsbCdcLink;
     use embassy_executor::Executor;
     use esp_alloc::EspHeap;
     use esp_hal::{
@@ -99,11 +100,13 @@ pub mod runtime {
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
             let ble_actions = actions::action_receiver();
+            let backend = crate::ui::transport::hid_backend();
             spawner
-                .spawn(super::tasks::ble_profile(ble_actions))
+                .spawn(super::tasks::ble_profile(ble_actions, backend))
                 .expect("spawn BLE task");
+            let usb_link = UsbCdcLink::new(usb, backend);
             spawner
-                .spawn(super::tasks::cdc_server(usb, boot_context))
+                .spawn(super::tasks::cdc_server(usb_link, boot_context))
                 .expect("spawn CDC task");
         });
     }
@@ -113,13 +116,10 @@ pub mod runtime {
 mod tasks {
     use super::actions::{self, DeviceAction};
     use crate::storage::{self, StorageError};
-    use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
-    use crate::ui::transport;
+    use crate::sync::{self, SyncContext, process_host_frame};
+    use crate::transport::{HidBackend, LinkKind, TransportLink};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
-    use embassy_time::{Duration, Timer};
-    use esp_hal::{Blocking, usb_serial_jtag::UsbSerialJtag};
-    use nb::Error as NbError;
     use trouble_host::types::capabilities::IoCapabilities;
 
     use esp_storage::FlashStorageError;
@@ -132,7 +132,10 @@ mod tasks {
     type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     #[task]
-    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, ctx: BootContext) {
+    pub async fn cdc_server<L>(mut link: L, ctx: BootContext)
+    where
+        L: TransportLink + 'static,
+    {
         let (mut context, mut boot_error) = ctx
             .map(|ctx| (ctx, None))
             .unwrap_or_else(|error| (SyncContext::new(), Some(error)));
@@ -141,18 +144,19 @@ mod tasks {
             log_boot_failure(error);
         }
 
-        transport::set_usb_connected(true);
+        link.mark_connected();
         loop {
-            match read_frame(&mut serial).await {
+            match link.read_frame().await {
                 Ok((command, frame)) => {
-                    transport::set_usb_connected(true);
+                    link.mark_connected();
                     if let Some(error) = boot_error.take() {
                         let payload = boot_failure_payload(&error);
-                        if let Err(err) =
-                            write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
+                        if let Err(err) = link
+                            .write_frame(shared::cdc::CdcCommand::Nack, &payload)
+                            .await
                         {
                             if matches!(err, sync::ProtocolError::Transport) {
-                                transport::set_usb_connected(false);
+                                link.mark_disconnected();
                             }
                         }
                         continue;
@@ -160,10 +164,9 @@ mod tasks {
 
                     match process_host_frame(command, &frame, &mut context) {
                         Ok((response_command, response)) => {
-                            if let Err(err) = write_frame(&mut serial, response_command, &response)
-                            {
+                            if let Err(err) = link.write_frame(response_command, &response).await {
                                 if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_connected(false);
+                                    link.mark_disconnected();
                                 }
                             }
                         }
@@ -180,11 +183,12 @@ mod tasks {
                                     .unwrap_or_default()
                                 }
                             };
-                            if let Err(err) =
-                                write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
+                            if let Err(err) = link
+                                .write_frame(shared::cdc::CdcCommand::Nack, &payload)
+                                .await
                             {
                                 if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_connected(false);
+                                    link.mark_disconnected();
                                 }
                             }
                         }
@@ -202,13 +206,14 @@ mod tasks {
                         }
                     };
                     if matches!(err, sync::ProtocolError::Transport) {
-                        transport::set_usb_connected(false);
+                        link.mark_disconnected();
                     }
-                    if let Err(err) =
-                        write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
+                    if let Err(err) = link
+                        .write_frame(shared::cdc::CdcCommand::Nack, &payload)
+                        .await
                     {
                         if matches!(err, sync::ProtocolError::Transport) {
-                            transport::set_usb_connected(false);
+                            link.mark_disconnected();
                         }
                     }
                 }
@@ -245,80 +250,20 @@ mod tasks {
         }
     }
 
-    async fn read_frame(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<(shared::cdc::CdcCommand, alloc::vec::Vec<u8>), sync::ProtocolError> {
-        use shared::cdc::{FRAME_HEADER_SIZE, decode_frame, decode_frame_header};
-
-        let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
-        for byte in header_bytes.iter_mut() {
-            *byte = read_byte(serial).await?;
-        }
-
-        let header = decode_frame_header(
-            shared::schema::PROTOCOL_VERSION,
-            FRAME_MAX_SIZE,
-            header_bytes,
-        )?;
-
-        let mut buffer = alloc::vec::Vec::with_capacity(header.length as usize);
-        for _ in 0..header.length {
-            buffer.push(read_byte(serial).await?);
-        }
-
-        decode_frame(&header, &buffer)?;
-
-        Ok((header.command, buffer))
-    }
-
-    async fn read_byte(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<u8, sync::ProtocolError> {
-        loop {
-            match serial.read_byte() {
-                Ok(byte) => return Ok(byte),
-                Err(NbError::WouldBlock) => Timer::after(Duration::from_micros(250)).await,
-                Err(NbError::Other(_)) => return Err(sync::ProtocolError::Transport),
-            }
-        }
-    }
-
-    fn write_frame(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-        command: shared::cdc::CdcCommand,
-        payload: &[u8],
-    ) -> Result<(), sync::ProtocolError> {
-        use shared::cdc::encode_frame;
-
-        let header = encode_frame(
-            shared::schema::PROTOCOL_VERSION,
-            command,
-            payload,
-            FRAME_MAX_SIZE,
-        )?;
-
-        serial
-            .write(&header)
-            .map_err(|_| sync::ProtocolError::Transport)?;
-        if !payload.is_empty() {
-            serial
-                .write(payload)
-                .map_err(|_| sync::ProtocolError::Transport)?;
-        }
-        serial
-            .flush_tx()
-            .map_err(|_| sync::ProtocolError::Transport)
-    }
-
     #[task]
-    pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
+    pub async fn ble_profile(
+        mut receiver: actions::ActionReceiver,
+        backend: &'static dyn HidBackend,
+    ) {
         let _capabilities = IoCapabilities::KeyboardDisplay;
+        backend.mark_disconnected(LinkKind::Ble);
         while let Ok(action) = receiver.recv().await {
             match action {
                 DeviceAction::StartSession { session_id } => {
                     let _ = session_id;
+                    backend.mark_connected(LinkKind::Ble);
                 }
-                DeviceAction::EndSession => {}
+                DeviceAction::EndSession => backend.mark_disconnected(LinkKind::Ble),
             }
         }
     }
