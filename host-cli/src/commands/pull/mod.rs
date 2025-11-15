@@ -9,7 +9,7 @@ use shared::schema::{
 };
 
 use crate::RepoArgs;
-use crate::artifacts::{PullArtifacts, persist_sync_state};
+use crate::artifacts::{ArtifactStore, PullArtifacts, persist_sync_state};
 use crate::commands::host_config::HostConfig;
 use crate::commands::signature::compute_signature_message;
 use crate::commands::{ArtifactStore, DeviceTransport, print_repo_banner};
@@ -43,11 +43,11 @@ where
     };
 
     print_head(&head);
-    artifacts.record_log("head response");
+    ArtifactStore::record_log(&mut artifacts, "head response");
     let recipients_expected = head.recipients_hash != [0u8; 32];
-    artifacts.set_recipients_expected(recipients_expected);
+    ArtifactStore::set_recipients_expected(&mut artifacts, recipients_expected);
     let signature_expected = head.signature_hash != [0u8; 32];
-    artifacts.set_signature_expected(signature_expected);
+    ArtifactStore::set_signature_expected(&mut artifacts, signature_expected);
 
     let request = HostRequest::PullVault(PullVaultRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -72,7 +72,7 @@ where
     }
 
     verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
-    persist_artifacts(store, &artifacts)?;
+    ArtifactStore::persist(&artifacts, &args.repo)?;
     persist_sync_state(&args.repo, state_tracker.state())
 }
 
@@ -116,11 +116,11 @@ fn load_verifying_key(
 }
 
 fn verify_pulled_signature(
-    artifacts: &PullArtifacts,
+    artifacts: &impl ArtifactStore,
     repo: &Path,
     verifying_key: Option<&VerifyingKey>,
 ) -> Result<(), SharedError> {
-    if artifacts.vault.bytes.is_empty() || !artifacts.signature_expected {
+    if artifacts.vault_bytes().is_empty() || !artifacts.signature_expected() {
         return Ok(());
     }
 
@@ -131,21 +131,15 @@ fn verify_pulled_signature(
     })?;
 
     let signature_bytes = artifacts
-        .signature_bytes
-        .as_ref()
+        .signature_bytes()
         .ok_or_else(|| SharedError::Transport("vault signature missing from transfer".into()))?;
 
     let array: [u8; SIGNATURE_SIZE] = signature_bytes
-        .as_slice()
         .try_into()
         .map_err(|_| SharedError::Transport("invalid vault signature length".into()))?;
     let signature = Signature::from_bytes(&array);
 
-    let recipients = if artifacts.recipients_seen {
-        Some(artifacts.recipients.bytes.as_slice())
-    } else {
-        None
-    };
+    let recipients = artifacts.recipients_bytes();
 
     let config_path = repo.join(CONFIG_FILE);
     let config_bytes = if config_path.exists() {
@@ -159,7 +153,7 @@ fn verify_pulled_signature(
     };
 
     let message =
-        compute_signature_message(&artifacts.vault.bytes, recipients, config_bytes.as_deref());
+        compute_signature_message(artifacts.vault_bytes(), recipients, config_bytes.as_deref());
 
     key.verify(&message, &signature).map_err(|err| {
         SharedError::Transport(format!("vault signature verification failed: {err}"))

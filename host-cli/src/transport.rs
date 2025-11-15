@@ -1,5 +1,7 @@
 use std::fmt::Write as FmtWrite;
+use std::future::Future;
 use std::io::{self, Read, Write};
+use std::pin::Pin;
 use std::time::Duration;
 
 use serialport::{SerialPort, SerialPortType};
@@ -15,35 +17,125 @@ use shared::schema::{
     StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
 };
 
-use crate::artifacts::PullArtifacts;
+use crate::artifacts::ArtifactStore;
 use crate::constants::{
     CARDPUTER_IDENTITY_KEYWORDS, CARDPUTER_USB_PID, CARDPUTER_USB_VID, DEFAULT_TIMEOUT_SECS,
     HOST_BUFFER_SIZE, SERIAL_BAUD_RATE,
 };
 
-pub fn send_host_request<W>(writer: &mut W, request: &HostRequest) -> Result<(), SharedError>
-where
-    W: Write + ?Sized,
-{
-    let payload = postcard::to_allocvec(request).map_err(SharedError::from)?;
-    let command = command_for_request(request);
-    write_framed_message(writer, command, &payload)
+pub mod memory;
+
+/// Future returned by the asynchronous helpers implemented by [`DeviceTransport`].
+pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SharedError>> + 'a>>;
+
+/// Abstraction over bidirectional device transports capable of exchanging CDC frames.
+pub trait DeviceTransport {
+    /// Write a CDC frame to the transport.
+    fn write_frame(&mut self, command: CdcCommand, payload: &[u8]) -> Result<(), SharedError>;
+
+    /// Read the next CDC frame from the transport.
+    fn read_frame(&mut self) -> Result<(CdcCommand, Vec<u8>), SharedError>;
+
+    /// Serialize and dispatch a host request.
+    fn send_request(&mut self, request: &HostRequest) -> Result<(), SharedError> {
+        let payload = postcard::to_allocvec(request).map_err(SharedError::from)?;
+        let command = command_for_request(request);
+        self.write_frame(command, &payload)
+    }
+
+    /// Receive and decode a device response.
+    fn read_response(&mut self) -> Result<DeviceResponse, SharedError> {
+        let (command, payload) = self.read_frame()?;
+        let response = postcard::from_bytes(&payload).map_err(SharedError::from)?;
+        validate_response_command(command, &response)?;
+        Ok(response)
+    }
+
+    /// Send a request and wait for the matching response.
+    fn exchange(&mut self, request: &HostRequest) -> Result<DeviceResponse, SharedError> {
+        self.send_request(request)?;
+        self.read_response()
+    }
+
+    /// Asynchronous version of [`DeviceTransport::write_frame`].
+    fn write_frame_async<'a>(
+        &'a mut self,
+        command: CdcCommand,
+        payload: &'a [u8],
+    ) -> TransportFuture<'a, ()>
+    where
+        Self: Sized + 'a,
+    {
+        Box::pin(async move { self.write_frame(command, payload) })
+    }
+
+    /// Asynchronous version of [`DeviceTransport::read_frame`].
+    fn read_frame_async<'a>(&'a mut self) -> TransportFuture<'a, (CdcCommand, Vec<u8>)>
+    where
+        Self: Sized + 'a,
+    {
+        Box::pin(async move { self.read_frame() })
+    }
+
+    /// Asynchronous version of [`DeviceTransport::send_request`].
+    fn send_request_async<'a>(&'a mut self, request: &'a HostRequest) -> TransportFuture<'a, ()>
+    where
+        Self: Sized + 'a,
+    {
+        Box::pin(async move { self.send_request(request) })
+    }
+
+    /// Asynchronous version of [`DeviceTransport::read_response`].
+    fn read_response_async<'a>(&'a mut self) -> TransportFuture<'a, DeviceResponse>
+    where
+        Self: Sized + 'a,
+    {
+        Box::pin(async move { self.read_response() })
+    }
+
+    /// Asynchronous version of [`DeviceTransport::exchange`].
+    fn exchange_async<'a>(
+        &'a mut self,
+        request: &'a HostRequest,
+    ) -> TransportFuture<'a, DeviceResponse>
+    where
+        Self: Sized + 'a,
+    {
+        Box::pin(async move { self.exchange(request) })
+    }
 }
 
-pub fn read_device_response<R>(reader: &mut R) -> Result<DeviceResponse, SharedError>
+impl<T> DeviceTransport for T
 where
-    R: Read + ?Sized,
+    T: Read + Write + ?Sized,
 {
-    let (command, payload) = read_framed_message(reader)?;
-    let response = postcard::from_bytes(&payload).map_err(SharedError::from)?;
-    validate_response_command(command, &response)?;
-    Ok(response)
+    fn write_frame(&mut self, command: CdcCommand, payload: &[u8]) -> Result<(), SharedError> {
+        write_framed_message(self, command, payload)
+    }
+
+    fn read_frame(&mut self) -> Result<(CdcCommand, Vec<u8>), SharedError> {
+        read_framed_message(self)
+    }
+}
+
+pub fn send_host_request<T>(transport: &mut T, request: &HostRequest) -> Result<(), SharedError>
+where
+    T: DeviceTransport + ?Sized,
+{
+    transport.send_request(request)
+}
+
+pub fn read_device_response<T>(transport: &mut T) -> Result<DeviceResponse, SharedError>
+where
+    T: DeviceTransport + ?Sized,
+{
+    transport.read_response()
 }
 
 pub fn handle_device_response(
     response: DeviceResponse,
     tracker: Option<&mut FrameTracker>,
-    artifacts: Option<&mut PullArtifacts>,
+    artifacts: Option<&mut dyn ArtifactStore>,
 ) -> Result<bool, SharedError> {
     match response {
         DeviceResponse::Hello(info) => {
