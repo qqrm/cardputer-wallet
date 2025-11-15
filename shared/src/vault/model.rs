@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
