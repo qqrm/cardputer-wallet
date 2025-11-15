@@ -172,14 +172,11 @@ where
 
     let mut artifacts = PullArtifacts::default();
     let head_response = read_device_response(port)?;
-    let head = match head_response {
-        DeviceResponse::Head(head) => head,
-        other => {
-            handle_device_response(other, None, Some(&mut artifacts))?;
-            return Err(SharedError::Transport(
-                "unexpected device response while fetching head metadata".into(),
-            ));
-        }
+    let DeviceResponse::Head(head) = head_response else {
+        handle_device_response(head_response, None, Some(&mut artifacts))?;
+        return Err(SharedError::Transport(
+            "unexpected device response while fetching head metadata".into(),
+        ));
     };
 
     print_head(&head);
@@ -264,18 +261,14 @@ where
         send_host_request(port, &request)?;
 
         let response = read_device_response(port)?;
-        match response {
-            DeviceResponse::Ack(message) => {
-                print_ack(&message);
-            }
-            other => {
-                let description = format!("{other:?}");
-                handle_device_response(other, None, None)?;
-                return Err(SharedError::Transport(format!(
-                    "unexpected device response while pushing operations: {description}"
-                )));
-            }
-        }
+        let DeviceResponse::Ack(message) = response else {
+            let description = format!("{response:?}");
+            handle_device_response(response, None, None)?;
+            return Err(SharedError::Transport(format!(
+                "unexpected device response while pushing operations: {description}"
+            )));
+        };
+        print_ack(&message);
     }
 
     clear_local_operations(&args.repo)?;
@@ -353,23 +346,20 @@ where
             let request = HostRequest::PushVault(frame);
             send_host_request(port, &request)?;
             let response = read_device_response(port)?;
-            match response {
-                DeviceResponse::Ack(message) => {
-                    print_ack(&message);
-                }
-                DeviceResponse::Nack(nack) => {
+            let DeviceResponse::Ack(message) = response else {
+                if let DeviceResponse::Nack(nack) = response {
                     return Err(SharedError::Transport(format!(
                         "device rejected {label}: {}",
                         nack.message
                     )));
                 }
-                other => {
-                    let description = format!("{other:?}");
-                    return Err(SharedError::Transport(format!(
-                        "unexpected device response while pushing {label}: {description}"
-                    )));
-                }
-            }
+                let description = format!("{response:?}");
+                handle_device_response(response, None, None)?;
+                return Err(SharedError::Transport(format!(
+                    "unexpected device response while pushing {label}: {description}"
+                )));
+            };
+            print_ack(&message);
 
             if remaining == 0 {
                 break;
@@ -390,18 +380,13 @@ where
         args.credentials.display()
     );
 
-    let (sequence, checksum) = match load_sync_state(&args.repo)? {
-        Some(pair) => pair,
-        None => {
-            eprintln!(
-                "Missing journal state in '{}'. Run pull before confirming a push.",
-                args.repo.display()
-            );
-            return Err(SharedError::Transport(
-                "journal state not found for push acknowledgement".into(),
-            ));
-        }
-    };
+    let (sequence, checksum) = load_sync_state(&args.repo)?.ok_or_else(|| {
+        eprintln!(
+            "Missing journal state in '{}'. Run pull before confirming a push.",
+            args.repo.display()
+        );
+        SharedError::Transport("journal state not found for push acknowledgement".into())
+    })?;
 
     let request = HostRequest::Ack(AckRequest {
         protocol_version: PROTOCOL_VERSION,
