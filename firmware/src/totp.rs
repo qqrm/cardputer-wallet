@@ -76,10 +76,15 @@ impl TotpProvider for SharedTotp {
     }
 
     fn tick(&mut self, elapsed_ms: u32) {
+        if elapsed_ms == 0 {
+            return;
+        }
+
+        if self.now_ms > 0 {
+            self.now_ms = self.now_ms.saturating_add(elapsed_ms as u64);
+        }
+
         if self.snapshot.remaining_ms <= elapsed_ms {
-            if self.now_ms > 0 {
-                self.now_ms = self.now_ms.saturating_add(elapsed_ms as u64);
-            }
             self.refresh_snapshot();
         } else {
             self.snapshot.remaining_ms -= elapsed_ms;
