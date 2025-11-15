@@ -246,10 +246,8 @@ where
     S: NorFlash,
 {
     let mut ctx = SyncContext::new();
-    match ctx.load_from_flash(flash, range).await {
-        Ok(()) => Ok(ctx),
-        Err(err) => Err(err),
-    }
+    ctx.load_from_flash(flash, range).await?;
+    Ok(ctx)
 }
 
 #[cfg(target_arch = "xtensa")]
@@ -990,20 +988,13 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            match Self::validate_flash_blob::<S::Error>(
+            let blob = Self::validate_flash_blob::<S::Error>(
                 recipients,
                 RECIPIENTS_BUFFER_CAPACITY,
                 "recipients manifest",
-            ) {
-                Ok(blob) => {
-                    self.recipients_manifest = blob;
-                }
-                Err(err) => {
-                    self.vault_image = Zeroizing::new(Vec::new());
-                    self.vault_offset = 0;
-                    return Err(err);
-                }
-            }
+            )
+            .map_err(|err| self.reset_vault_on_error(err))?;
+            self.recipients_manifest = blob;
         }
 
         self.signature = Zeroizing::new(Vec::new());
@@ -1018,20 +1009,13 @@ impl SyncContext {
         .await
         .map_err(StorageError::Flash)?
         {
-            match Self::validate_signature_blob::<S::Error>(signature) {
-                Ok(blob) => {
-                    self.signature = blob;
-                    if self.signature.len() == SIGNATURE_BUFFER_CAPACITY
-                        && let Ok(bytes) = self.signature.as_slice().try_into()
-                    {
-                        self.expected_signature = Some(bytes);
-                    }
-                }
-                Err(err) => {
-                    self.vault_image = Zeroizing::new(Vec::new());
-                    self.vault_offset = 0;
-                    return Err(err);
-                }
+            let blob = Self::validate_signature_blob::<S::Error>(signature)
+                .map_err(|err| self.reset_vault_on_error(err))?;
+            self.signature = blob;
+            if self.signature.len() == SIGNATURE_BUFFER_CAPACITY
+                && let Ok(bytes) = self.signature.as_slice().try_into()
+            {
+                self.expected_signature = Some(bytes);
             }
         }
 
@@ -1086,6 +1070,16 @@ impl SyncContext {
         self.next_sequence = 1;
 
         Ok(())
+    }
+
+    fn reset_vault_buffers(&mut self) {
+        self.vault_image = Zeroizing::new(Vec::new());
+        self.vault_offset = 0;
+    }
+
+    fn reset_vault_on_error<E>(&mut self, err: StorageError<E>) -> StorageError<E> {
+        self.reset_vault_buffers();
+        err
     }
 
     fn validate_flash_blob<E>(
@@ -1970,12 +1964,10 @@ pub mod runtime {
         esp_hal_embassy::init(timer0);
 
         let mut flash = BootFlash::new(FlashStorage::new(peripherals.FLASH));
-        let boot_context = match flash.sequential_storage_range() {
-            Some(range) => block_on(initialize_context_from_flash(&mut flash, range)),
-            None => Err(StorageError::Decode(
-                "sync flash partition not found".to_string(),
-            )),
-        };
+        let boot_context = flash
+            .sequential_storage_range()
+            .ok_or_else(|| StorageError::Decode("sync flash partition not found".to_string()))
+            .and_then(|range| block_on(initialize_context_from_flash(&mut flash, range)));
 
         let usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
 
@@ -2016,10 +2008,9 @@ mod tasks {
 
     #[task]
     pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, ctx: BootContext) {
-        let (mut context, mut boot_error) = match ctx {
-            Ok(ctx) => (ctx, None),
-            Err(error) => (SyncContext::new(), Some(error)),
-        };
+        let (mut context, mut boot_error) = ctx
+            .map(|ctx| (ctx, None))
+            .unwrap_or_else(|error| (SyncContext::new(), Some(error)));
 
         if let Some(error) = &boot_error {
             log_boot_failure(error);
@@ -3045,6 +3036,41 @@ mod tests {
                 assert!(!ctx.vault_image.is_empty());
             }
             other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn initialize_context_from_flash_propagates_errors() {
+        type Flash = MockFlashBase<16, 4, 1024>;
+        let mut flash = Flash::new(WriteCountCheck::Twice, None, false);
+        let range = Flash::FULL_FLASH_RANGE;
+        let mut cache = NoCache::new();
+        let mut buffer = vec![0u8; STORAGE_DATA_BUFFER_CAPACITY];
+
+        super::block_on(async {
+            map::store_item(
+                &mut flash,
+                range.clone(),
+                &mut cache,
+                buffer.as_mut_slice(),
+                &STORAGE_KEY_VAULT,
+                &vec![0xAA; VAULT_BUFFER_CAPACITY + 1],
+            )
+            .await
+            .unwrap();
+        });
+
+        let error = super::block_on(super::initialize_context_from_flash(
+            &mut flash,
+            range.clone(),
+        ))
+        .expect_err("oversized vault image should fail");
+
+        match error {
+            StorageError::Decode(message) => {
+                assert!(message.contains("vault image exceeds capacity"));
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 
