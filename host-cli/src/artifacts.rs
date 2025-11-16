@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use shared::error::SharedError;
 use shared::journal::FrameState;
-use shared::schema::{JournalFrame, VaultChunk};
+use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
 use shared::transfer::ArtifactCollector;
 
 use crate::constants::SYNC_STATE_FILE;
@@ -14,6 +14,9 @@ pub mod memory;
 
 /// Trait describing storage backends used while pulling vault artifacts from the device.
 pub trait ArtifactStore {
+    /// Configure the expected hash for a given artifact.
+    fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]);
+
     /// Configure whether recipients data should be collected during the transfer.
     fn set_recipients_expected(&mut self, expected: bool);
 
@@ -48,7 +51,21 @@ pub struct PullArtifacts {
     pub(crate) log_context: Vec<String>,
 }
 
+impl PullArtifacts {
+    pub fn recipients_expected(&self) -> bool {
+        self.collector.recipients_expected()
+    }
+
+    pub fn recipients_received(&self) -> bool {
+        self.collector.recipients_seen()
+    }
+}
+
 impl ArtifactStore for PullArtifacts {
+    fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
+        self.collector.set_expected_hash(artifact, hash);
+    }
+
     fn set_recipients_expected(&mut self, expected: bool) {
         self.collector.set_recipients_expected(expected);
     }

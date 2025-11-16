@@ -684,11 +684,13 @@ fn pull_command_uses_in_memory_transport_and_store() {
 
     fs::write(&args.credentials, json!({}).to_string()).expect("write credentials");
 
+    let vault_payload = vec![1, 2, 3, 4];
+    let vault_checksum = chunk_checksum(&vault_payload);
     let responses = vec![
         DeviceResponse::Head(PullHeadResponse {
             protocol_version: PROTOCOL_VERSION,
             vault_generation: 1,
-            vault_hash: [0u8; 32],
+            vault_hash: hash_with_crc(0x11, &vault_payload),
             recipients_hash: [0u8; 32],
             signature_hash: [0u8; 32],
         }),
@@ -698,8 +700,8 @@ fn pull_command_uses_in_memory_transport_and_store() {
             total_size: 4,
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
-            data: vec![1, 2, 3, 4],
-            checksum: chunk_checksum(&[1, 2, 3, 4]),
+            data: vault_payload.clone(),
+            checksum: vault_checksum,
             is_last: true,
             artifact: VaultArtifact::Vault,
         }),
@@ -716,9 +718,64 @@ fn pull_command_uses_in_memory_transport_and_store() {
 
     assert_eq!(
         store.artifact_bytes(VaultArtifact::Vault),
-        Some(vec![1, 2, 3, 4])
+        Some(vault_payload)
     );
     assert!(store.artifact_bytes(VaultArtifact::Recipients).is_none());
+}
+
+#[test]
+fn pull_errors_when_expected_recipients_missing() {
+    let temp = tempdir().expect("tempdir");
+    let repo_path = temp.path().join("missing-recipients/repo");
+    fs::create_dir_all(&repo_path).expect("create repo");
+    let args = RepoArgs {
+        repo: repo_path,
+        credentials: temp.path().join("creds"),
+        signing_pubkey: None,
+    };
+
+    fs::write(&args.credentials, json!({}).to_string()).expect("write credentials");
+
+    let vault_payload = vec![1, 2, 3, 4];
+    let recipients_payload = vec![9, 8, 7, 6];
+    let vault_len = vault_payload.len() as u64;
+    let vault_checksum = chunk_checksum(&vault_payload);
+    let responses = vec![
+        DeviceResponse::Head(PullHeadResponse {
+            protocol_version: PROTOCOL_VERSION,
+            vault_generation: 1,
+            vault_hash: hash_with_crc(0x21, &vault_payload),
+            recipients_hash: hash_with_crc(0x34, &recipients_payload),
+            signature_hash: [0u8; 32],
+        }),
+        DeviceResponse::VaultChunk(VaultChunk {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: 1,
+            total_size: vault_len,
+            remaining_bytes: 0,
+            device_chunk_size: MAX_CHUNK_SIZE,
+            data: vault_payload,
+            checksum: vault_checksum,
+            is_last: true,
+            artifact: VaultArtifact::Vault,
+        }),
+        DeviceResponse::Ack(AckResponse {
+            protocol_version: PROTOCOL_VERSION,
+            message: "complete".into(),
+        }),
+    ];
+
+    let mut transport = InMemoryDeviceTransport::new(responses);
+    let mut store = InMemoryArtifactStore::default();
+
+    let err = commands::pull::run(&mut transport, &mut store, &args)
+        .expect_err("expected recipients failure");
+    match err {
+        SharedError::Transport(message) => {
+            assert!(message.contains("recipients manifest missing"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
