@@ -57,7 +57,8 @@ impl VaultViewModel for TestVault {
 
 #[test]
 fn ui_renders_entries_and_transport_status() {
-    transport::reset();
+    transport::set_usb_state(TransportState::Offline);
+    transport::set_ble_state(TransportState::Offline);
 
     let mut totp = SharedTotp::new();
     totp.upsert_config("alpha", sample_totp_config());
