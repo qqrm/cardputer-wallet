@@ -1,6 +1,6 @@
 use super::*;
 use crate::commands::signature::compute_signature_message;
-use crate::commands::{ArtifactStore, DeviceTransport};
+use crate::commands::{DeviceTransport, RepoArtifactStore};
 use crate::constants::{
     CARDPUTER_USB_PID, CARDPUTER_USB_VID, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_FILE,
     VAULT_FILE,
@@ -389,15 +389,19 @@ impl InMemoryDeviceTransport {
 }
 
 impl DeviceTransport for InMemoryDeviceTransport {
-    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError> {
-        self.requests.push(request.clone());
+    fn write_frame(&mut self, _command: CdcCommand, payload: &[u8]) -> Result<(), SharedError> {
+        let request: HostRequest = postcard_from_bytes(payload).map_err(SharedError::from)?;
+        self.requests.push(request);
         Ok(())
     }
 
-    fn receive(&mut self) -> Result<DeviceResponse, SharedError> {
-        self.responses.pop_front().ok_or_else(|| {
+    fn read_frame(&mut self) -> Result<(CdcCommand, Vec<u8>), SharedError> {
+        let response = self.responses.pop_front().ok_or_else(|| {
             SharedError::Transport("in-memory transport ran out of responses".into())
-        })
+        })?;
+        let command = command_for_response(&response);
+        let payload = postcard_to_allocvec(&response).map_err(SharedError::from)?;
+        Ok((command, payload))
     }
 }
 
@@ -426,7 +430,7 @@ impl InMemoryArtifactStore {
     }
 }
 
-impl ArtifactStore for InMemoryArtifactStore {
+impl RepoArtifactStore for InMemoryArtifactStore {
     fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError> {
         Ok(self.artifact_bytes(artifact))
     }
@@ -1329,4 +1333,77 @@ impl Write for MockPort {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn mock_port_is_a_device_transport() {
+    fn assert_transport<T: DeviceTransport>() {}
+    assert_transport::<MockPort>();
+}
+
+#[test]
+fn push_runs_with_mock_transport_and_in_memory_store() {
+    let temp = tempdir().expect("tempdir");
+    let args = RepoArgs {
+        repo: temp.path().join("repo"),
+        credentials: temp.path().join("creds"),
+        signing_pubkey: None,
+    };
+
+    if let Some(parent) = args.repo.parent() {
+        fs::create_dir_all(parent).expect("create repo parent");
+    }
+    fs::create_dir_all(&args.repo).expect("create repo directory");
+    write_empty_credentials(&args.credentials);
+
+    let mut transport = MockPort::new(Vec::new());
+    let mut store = InMemoryArtifactStore::default();
+
+    commands::push::run(&mut transport, &mut store, &args)
+        .expect("push exits early without pending operations");
+}
+
+#[test]
+fn pull_streams_into_in_memory_store() {
+    let vault_hash = hash_with_crc(0xAA, b"vault");
+    let head = DeviceResponse::Head(PullHeadResponse {
+        protocol_version: PROTOCOL_VERSION,
+        vault_generation: 7,
+        vault_hash,
+        recipients_hash: [0u8; 32],
+        signature_hash: [0u8; 32],
+    });
+    let chunk = DeviceResponse::VaultChunk(VaultChunk {
+        protocol_version: PROTOCOL_VERSION,
+        sequence: 1,
+        total_size: 5,
+        remaining_bytes: 0,
+        device_chunk_size: MAX_CHUNK_SIZE,
+        data: b"vault".to_vec(),
+        checksum: chunk_checksum(b"vault"),
+        is_last: true,
+        artifact: VaultArtifact::Vault,
+    });
+    let responses = [encode_response(head), encode_response(chunk)].concat();
+
+    let temp = tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("create repo directory");
+    let args = RepoArgs {
+        repo: repo_path,
+        credentials: temp.path().join("creds"),
+        signing_pubkey: None,
+    };
+    write_empty_credentials(&args.credentials);
+
+    let mut transport = MockPort::new(responses);
+    let mut store = InMemoryArtifactStore::default();
+
+    commands::pull::run(&mut transport, &mut store, &args).expect("pull succeeds");
+
+    assert_eq!(
+        store.artifact_bytes(VaultArtifact::Vault),
+        Some(b"vault".to_vec()),
+        "vault bytes persisted in memory",
+    );
 }

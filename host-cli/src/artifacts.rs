@@ -13,7 +13,7 @@ use crate::constants::SYNC_STATE_FILE;
 pub mod memory;
 
 /// Trait describing storage backends used while pulling vault artifacts from the device.
-pub trait ArtifactStore {
+pub trait TransferArtifactStore {
     /// Configure the expected hash for a given artifact.
     fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]);
 
@@ -61,7 +61,7 @@ impl PullArtifacts {
     }
 }
 
-impl ArtifactStore for PullArtifacts {
+impl TransferArtifactStore for PullArtifacts {
     fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
         self.collector.set_expected_hash(artifact, hash);
     }

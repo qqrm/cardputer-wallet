@@ -9,12 +9,14 @@ use shared::schema::{
 };
 
 use crate::RepoArgs;
-use crate::artifacts::{ArtifactStore as TransferArtifactStore, PullArtifacts, persist_sync_state};
+use crate::artifacts::{PullArtifacts, TransferArtifactStore, persist_sync_state};
 use crate::commands::host_config::HostConfig;
 use crate::commands::signature::compute_signature_message;
-use crate::commands::{ArtifactStore as RepoArtifactStore, DeviceTransport, print_repo_banner};
+use crate::commands::{DeviceTransport, RepoArtifactStore, print_repo_banner};
 use crate::constants::{CONFIG_FILE, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_SIZE};
-use crate::transport::{handle_device_response, print_head};
+use crate::transport::{
+    handle_device_response, print_head, read_device_response, send_host_request,
+};
 
 pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
 where
@@ -30,11 +32,11 @@ where
         protocol_version: PROTOCOL_VERSION,
     });
 
-    transport.send(&head_request)?;
+    send_host_request(transport, &head_request)?;
     println!("Requested head metadata. Awaiting response…");
 
     let mut artifacts = PullArtifacts::default();
-    let head_response = transport.receive()?;
+    let head_response = read_device_response(transport)?;
     let DeviceResponse::Head(head) = head_response else {
         handle_device_response(head_response, None, Some(&mut artifacts))?;
         return Err(SharedError::Transport(
@@ -67,18 +69,18 @@ where
         known_generation: None,
     });
 
-    transport.send(&request)?;
+    send_host_request(transport, &request)?;
     println!("Request sent. Waiting for device responses…");
 
     let mut state_tracker = FrameTracker::default();
     let mut should_continue = true;
 
     while should_continue {
-        let response = transport.receive()?;
+        let response = read_device_response(transport)?;
         should_continue =
             handle_device_response(response, Some(&mut state_tracker), Some(&mut artifacts))?;
         if should_continue {
-            transport.send(&request)?;
+            send_host_request(transport, &request)?;
         }
     }
 

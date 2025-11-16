@@ -3,14 +3,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use shared::error::SharedError;
-use shared::schema::{DeviceResponse, HostRequest, VaultArtifact};
+use shared::schema::VaultArtifact;
 
 use crate::artifacts::io_error;
 use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, VAULT_FILE};
-use crate::transport::{
-    detect_first_serial_port, open_serial_port, read_device_response, send_host_request,
-};
+use crate::transport::{detect_first_serial_port, open_serial_port};
 use crate::{Cli, Command, RepoArgs};
+
+pub use crate::transport::DeviceTransport;
 
 pub mod confirm;
 pub mod get_time;
@@ -58,25 +58,7 @@ pub(crate) fn print_repo_banner(args: &RepoArgs) {
     );
 }
 
-pub trait DeviceTransport {
-    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError>;
-    fn receive(&mut self) -> Result<DeviceResponse, SharedError>;
-}
-
-impl<T> DeviceTransport for T
-where
-    T: io::Read + io::Write + ?Sized,
-{
-    fn send(&mut self, request: &HostRequest) -> Result<(), SharedError> {
-        send_host_request(self, request)
-    }
-
-    fn receive(&mut self) -> Result<DeviceResponse, SharedError> {
-        read_device_response(self)
-    }
-}
-
-pub trait ArtifactStore {
+pub trait RepoArtifactStore {
     fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError>;
     fn persist(&mut self, artifact: VaultArtifact, data: &[u8]) -> Result<(), SharedError>;
 }
@@ -101,7 +83,7 @@ impl FilesystemArtifactStore {
     }
 }
 
-impl ArtifactStore for FilesystemArtifactStore {
+impl RepoArtifactStore for FilesystemArtifactStore {
     fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError> {
         let (path, _) = self.artifact_path(artifact);
         match fs::read(&path) {
