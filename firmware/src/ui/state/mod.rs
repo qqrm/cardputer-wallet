@@ -34,6 +34,10 @@ pub enum UiEffect {
     #[default]
     None,
     StartSync,
+    SendSecret {
+        entry_id: String,
+        field: SecretField,
+    },
     BeginEdit {
         entry_id: String,
     },
@@ -43,6 +47,14 @@ pub enum UiEffect {
     CancelEdit {
         entry_id: String,
     },
+}
+
+/// Secret fields that may be transmitted over HID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretField {
+    Username,
+    Password,
+    Totp,
 }
 
 /// Entry metadata used to populate views.

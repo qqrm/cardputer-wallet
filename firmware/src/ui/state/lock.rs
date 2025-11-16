@@ -19,7 +19,7 @@ impl LockState {
 impl UiRuntime {
     pub(super) fn handle_lock(&mut self, command: UiCommand) -> UiEffect {
         match command {
-            UiCommand::Activate => {
+            UiCommand::Activate | UiCommand::SendUsername | UiCommand::SendPassword => {
                 self.set_screen(UiScreen::Home);
                 UiEffect::None
             }

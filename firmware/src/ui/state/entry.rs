@@ -1,7 +1,7 @@
 use alloc::{string::String, vec, vec::Vec};
 use core::cmp;
 
-use super::{EntrySummary, UiEffect, UiRuntime, UiScreen};
+use super::{EntrySummary, SecretField, UiEffect, UiRuntime, UiScreen};
 use crate::ui::{
     input::UiCommand,
     render::{
@@ -60,6 +60,18 @@ impl SettingsState {
 impl UiRuntime {
     pub(super) fn handle_home(&mut self, command: UiCommand) -> UiEffect {
         match command {
+            UiCommand::SendUsername => self.send_secret_from_home(SecretField::Username),
+            UiCommand::SendPassword => self.send_secret_from_home(SecretField::Password),
+            UiCommand::SendTotp { fallback } => {
+                if self.home.search_focus {
+                    if let Some(c) = fallback.filter(|ch| !ch.is_control()) {
+                        self.push_search_char(c);
+                    }
+                    UiEffect::None
+                } else {
+                    self.send_secret_from_home(SecretField::Totp)
+                }
+            }
             UiCommand::Activate => {
                 if let Some(entry) = self.selected_entry_id() {
                     self.open_entry(entry)
@@ -104,12 +116,7 @@ impl UiRuntime {
             }
             UiCommand::InsertChar(c) => {
                 if !c.is_control() {
-                    if !self.home.search_focus {
-                        self.home.search_focus = true;
-                    }
-                    self.home.search_query.push(c);
-                    self.home.selected_recent = 0;
-                    self.sync_totp_selection();
+                    self.push_search_char(c);
                 }
                 UiEffect::None
             }
@@ -135,6 +142,9 @@ impl UiRuntime {
 
     pub(super) fn handle_entry(&mut self, command: UiCommand) -> UiEffect {
         match command {
+            UiCommand::SendUsername => self.send_secret_from_entry(SecretField::Username),
+            UiCommand::SendPassword => self.send_secret_from_entry(SecretField::Password),
+            UiCommand::SendTotp { .. } => self.send_secret_from_entry(SecretField::Totp),
             UiCommand::Back | UiCommand::GoHome => {
                 self.set_screen(UiScreen::Home);
                 UiEffect::None
@@ -170,11 +180,14 @@ impl UiRuntime {
     pub(super) fn handle_edit(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::InsertChar(c) => {
-                if let Some(edit) = self.edit.as_mut()
-                    && let Some(field) = edit.fields.get_mut(edit.active_index)
-                    && !c.is_control()
-                {
-                    field.value.push(c);
+                if !c.is_control() {
+                    self.push_edit_char(c);
+                }
+                UiEffect::None
+            }
+            UiCommand::SendTotp { fallback } => {
+                if let Some(c) = fallback.filter(|ch| !ch.is_control()) {
+                    self.push_edit_char(c);
                 }
                 UiEffect::None
             }
@@ -280,6 +293,61 @@ impl UiRuntime {
         self.visible_entries()
             .get(self.home.selected_recent)
             .map(|entry| entry.id.clone())
+    }
+
+    fn push_search_char(&mut self, c: char) {
+        if !self.home.search_focus {
+            self.home.search_focus = true;
+        }
+        self.home.search_query.push(c);
+        self.home.selected_recent = 0;
+        self.sync_totp_selection();
+    }
+
+    fn push_edit_char(&mut self, c: char) {
+        if let Some(edit) = self.edit.as_mut()
+            && let Some(field) = edit.fields.get_mut(edit.active_index)
+        {
+            field.value.push(c);
+        }
+    }
+
+    fn send_secret_from_home(&mut self, field: SecretField) -> UiEffect {
+        if self.home.search_focus {
+            return UiEffect::None;
+        }
+        let Some(entry_id) = self.selected_entry_id() else {
+            return UiEffect::None;
+        };
+        if field == SecretField::Totp && !self.selection_supports_totp() {
+            return UiEffect::None;
+        }
+        UiEffect::SendSecret { entry_id, field }
+    }
+
+    fn selection_supports_totp(&self) -> bool {
+        self.visible_entries()
+            .get(self.home.selected_recent)
+            .and_then(|entry| entry.totp.as_ref())
+            .is_some()
+    }
+
+    fn send_secret_from_entry(&mut self, field: SecretField) -> UiEffect {
+        let Some(entry_id) = self.active_entry_id() else {
+            return UiEffect::None;
+        };
+        if field == SecretField::Totp && !self.entry_screen_supports_totp() {
+            return UiEffect::None;
+        }
+        UiEffect::SendSecret { entry_id, field }
+    }
+
+    fn entry_screen_supports_totp(&self) -> bool {
+        self.entry
+            .as_ref()
+            .and_then(|state| self.vault.entry(&state.entry_id))
+            .and_then(|entry| entry.totp)
+            .is_some()
     }
 
     fn active_entry_id(&self) -> Option<String> {
@@ -650,5 +718,54 @@ mod tests {
             }
             _ => panic!("expected home view"),
         }
+    }
+
+    #[test]
+    fn send_username_emits_effect_for_selection() {
+        let vault =
+            super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
+        let mut ui = super::super::fixtures::build_runtime(vault);
+        ui.home.search_focus = false;
+        let effect = ui.handle_home(UiCommand::SendUsername);
+        assert_eq!(
+            effect,
+            UiEffect::SendSecret {
+                entry_id: String::from("alpha"),
+                field: SecretField::Username,
+            }
+        );
+    }
+
+    #[test]
+    fn send_totp_types_into_search_when_focused() {
+        let vault =
+            super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
+        let mut ui = super::super::fixtures::build_runtime(vault);
+        ui.home.search_focus = true;
+        let effect = ui.handle_home(UiCommand::SendTotp {
+            fallback: Some('t'),
+        });
+        assert_eq!(effect, UiEffect::None);
+        assert_eq!(ui.home.search_query, "t");
+    }
+
+    #[test]
+    fn send_totp_requires_totp_entry() {
+        let vault =
+            super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
+        let mut ui = super::super::fixtures::build_runtime(vault);
+        ui.home.search_focus = false;
+        ui.home.selected_recent = 2; // gamma has TOTP
+        let effect = ui.handle_home(UiCommand::SendTotp { fallback: None });
+        assert_eq!(
+            effect,
+            UiEffect::SendSecret {
+                entry_id: String::from("gamma"),
+                field: SecretField::Totp,
+            }
+        );
+        ui.home.selected_recent = 0;
+        let none_effect = ui.handle_home(UiCommand::SendTotp { fallback: None });
+        assert_eq!(none_effect, UiEffect::None);
     }
 }

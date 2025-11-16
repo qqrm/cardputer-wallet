@@ -74,6 +74,9 @@ pub enum UiCommand {
     ConfirmEdit,
     CancelEdit,
     ToggleHints,
+    SendUsername,
+    SendPassword,
+    SendTotp { fallback: Option<char> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +100,40 @@ impl Default for Keymap {
         map.add_binding(
             PhysicalKey::Enter,
             KeyModifiers::default(),
+            UiCommand::SendUsername,
+        );
+        map.add_binding(
+            PhysicalKey::Enter,
+            KeyModifiers {
+                function: true,
+                ..KeyModifiers::default()
+            },
+            UiCommand::SendPassword,
+        );
+        map.add_binding(
+            PhysicalKey::Enter,
+            KeyModifiers {
+                shift: true,
+                ..KeyModifiers::default()
+            },
             UiCommand::Activate,
+        );
+        map.add_binding(
+            PhysicalKey::Char('t'),
+            KeyModifiers::default(),
+            UiCommand::SendTotp {
+                fallback: Some('t'),
+            },
+        );
+        map.add_binding(
+            PhysicalKey::Char('T'),
+            KeyModifiers {
+                shift: true,
+                ..KeyModifiers::default()
+            },
+            UiCommand::SendTotp {
+                fallback: Some('T'),
+            },
         );
         map.add_binding(
             PhysicalKey::Escape,
@@ -206,6 +242,14 @@ impl Keymap {
             return None;
         }
 
+        if let Some(binding) = self
+            .bindings
+            .iter()
+            .find(|binding| binding.key == event.key && binding.modifiers == event.modifiers)
+        {
+            return Some(binding.command);
+        }
+
         if let PhysicalKey::Char(c) = event.key
             && !event.modifiers.control
             && !event.modifiers.alt
@@ -222,9 +266,6 @@ impl Keymap {
             return Some(UiCommand::InsertChar(' '));
         }
 
-        self.bindings
-            .iter()
-            .find(|binding| binding.key == event.key && binding.modifiers == event.modifiers)
-            .map(|binding| binding.command)
+        None
     }
 }

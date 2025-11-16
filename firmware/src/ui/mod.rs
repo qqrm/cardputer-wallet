@@ -12,11 +12,14 @@ mod render;
 mod state;
 pub mod transport;
 
-pub use data::{JournalAction, JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel};
+pub use data::{
+    EntrySecretMaterial, JournalAction, JournalEntryView, SyncVaultViewModel, TotpProvider,
+    TotpSnapshot, VaultViewModel,
+};
 pub use input::{KeyEvent, KeyModifiers, Keymap, PhysicalKey, UiCommand};
 pub use render::{
     EditView, EntryView, Frame, HintBar, HintItem, HomeView, LockView, RecentList, SearchWidget,
     SettingsView, SyncView, TotpWidget, ViewContent,
 };
-pub use state::{EntrySummary, UiEffect, UiRuntime, UiScreen};
+pub use state::{EntrySummary, SecretField, UiEffect, UiRuntime, UiScreen};
 pub use transport::{TransportIndicators, TransportKind, TransportState, TransportStatus};

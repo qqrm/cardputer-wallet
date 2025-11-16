@@ -1,9 +1,13 @@
+#[cfg(any(test, feature = "ui-tests"))]
+use alloc::vec::Vec;
 use alloc::{collections::BTreeMap, string::String, string::ToString};
 use core::cmp;
 
 use crate::ui::{TotpProvider, TotpSnapshot};
+use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use shared::totp::{TotpCode, generate};
 use shared::vault::TotpConfig;
+use static_cell::StaticCell;
 
 const FALLBACK_PERIOD: u8 = 30;
 
@@ -104,6 +108,78 @@ fn to_snapshot(config: &TotpConfig, code: &TotpCode) -> TotpSnapshot {
         period,
         remaining_ms: cmp::min(code.remaining_ms, period as u32 * 1_000),
     }
+}
+
+fn shared_totp() -> &'static Mutex<CriticalSectionRawMutex, SharedTotp> {
+    static SHARED: StaticCell<Mutex<CriticalSectionRawMutex, SharedTotp>> = StaticCell::new();
+    SHARED.init_with(|| Mutex::new(SharedTotp::new()))
+}
+
+/// Provider bridge that shares TOTP state between the UI and HID dispatchers.
+pub struct GlobalTotpProvider {
+    shared: &'static Mutex<CriticalSectionRawMutex, SharedTotp>,
+}
+
+impl GlobalTotpProvider {
+    pub fn new() -> Self {
+        Self {
+            shared: shared_totp(),
+        }
+    }
+
+    pub fn code_for_entry(&self, entry_id: &str) -> Option<String> {
+        self.shared.lock(|totp| {
+            if totp.active_entry.as_deref() == Some(entry_id) {
+                totp.code_for_hid()
+            } else {
+                None
+            }
+        })
+    }
+}
+
+impl TotpProvider for GlobalTotpProvider {
+    fn select_entry(&mut self, entry_id: Option<&str>) {
+        self.shared.lock(|totp| totp.select_entry(entry_id));
+    }
+
+    fn snapshot(&self) -> TotpSnapshot {
+        self.shared.lock(|totp| totp.snapshot())
+    }
+
+    fn tick(&mut self, elapsed_ms: u32) {
+        self.shared.lock(|totp| totp.tick(elapsed_ms));
+    }
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+pub fn reset() {
+    shared_totp().lock(|totp| *totp = SharedTotp::new());
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+pub fn replace_configs(configs: Vec<(String, TotpConfig)>) {
+    shared_totp().lock(|totp| {
+        totp.configs.clear();
+        for (entry_id, config) in configs {
+            totp.upsert_config(entry_id, config);
+        }
+    });
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+pub fn select_entry(entry_id: Option<&str>) {
+    shared_totp().lock(|totp| totp.select_entry(entry_id));
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+pub fn sync_time(now_ms: u64) {
+    shared_totp().lock(|totp| totp.sync_time(now_ms));
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+pub fn hid_code() -> Option<String> {
+    shared_totp().lock(|totp| totp.code_for_hid())
 }
 
 #[cfg(test)]
