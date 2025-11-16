@@ -645,9 +645,9 @@ mod tasks {
         )
         .map_err(FrameIoError::Protocol)?;
 
-        write_all(sender, &header).await?;
+        write_all(sender, packet_size, &header).await?;
         if !payload.is_empty() {
-            write_all(sender, payload).await?;
+            write_all(sender, packet_size, payload).await?;
             if payload.len() % packet_size == 0 {
                 sender
                     .write_packet(&[])
@@ -660,10 +660,12 @@ mod tasks {
 
     async fn write_all(
         sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        packet_size: usize,
         mut data: &[u8],
     ) -> Result<(), FrameIoError> {
         while !data.is_empty() {
-            match sender.write(data).await {
+            let chunk_len = packet_size.min(data.len());
+            match sender.write(&data[..chunk_len]).await {
                 Ok(0) => continue,
                 Ok(written) => data = &data[written..],
                 Err(err) => return Err(FrameIoError::Endpoint(err)),
