@@ -44,6 +44,17 @@ where
 
     print_head(&head);
     TransferArtifactStore::record_log(&mut artifacts, "head response");
+    TransferArtifactStore::set_expected_hash(&mut artifacts, VaultArtifact::Vault, head.vault_hash);
+    TransferArtifactStore::set_expected_hash(
+        &mut artifacts,
+        VaultArtifact::Recipients,
+        head.recipients_hash,
+    );
+    TransferArtifactStore::set_expected_hash(
+        &mut artifacts,
+        VaultArtifact::Signature,
+        head.signature_hash,
+    );
     let recipients_expected = head.recipients_hash != [0u8; 32];
     TransferArtifactStore::set_recipients_expected(&mut artifacts, recipients_expected);
     let signature_expected = head.signature_hash != [0u8; 32];
@@ -71,9 +82,20 @@ where
         }
     }
 
+    ensure_expected_recipients(&artifacts)?;
     verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
     persist_artifacts(store, &artifacts)?;
     persist_sync_state(&args.repo, state_tracker.state())
+}
+
+fn ensure_expected_recipients(artifacts: &PullArtifacts) -> Result<(), SharedError> {
+    if artifacts.recipients_expected() && !artifacts.recipients_received() {
+        return Err(SharedError::Transport(
+            "recipients manifest missing from transfer".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn persist_artifacts<S>(store: &mut S, artifacts: &PullArtifacts) -> Result<(), SharedError>

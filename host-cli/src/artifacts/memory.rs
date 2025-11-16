@@ -24,6 +24,21 @@ impl MemoryArtifactStore {
 }
 
 impl ArtifactStore for MemoryArtifactStore {
+    fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
+        let expected = hash != [0u8; 32];
+        match artifact {
+            VaultArtifact::Vault => {
+                let _ = expected;
+            }
+            VaultArtifact::Recipients => {
+                self.recipients_expected = expected;
+            }
+            VaultArtifact::Signature => {
+                self.signature_expected = expected;
+            }
+        }
+    }
+
     fn set_recipients_expected(&mut self, expected: bool) {
         self.recipients_expected = expected;
     }
