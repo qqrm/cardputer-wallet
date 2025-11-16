@@ -1,9 +1,12 @@
 use alloc::{format, string::String};
 use core::mem;
 
-use super::{UiEffect, UiRuntime, UiScreen};
+use super::{UiEffect, UiRuntime};
 use crate::crypto::{KeyError, PIN_WIPE_THRESHOLD, PinLockStatus, PinUnlockError};
 use crate::ui::{input::UiCommand, render::LockView};
+
+#[cfg(test)]
+use super::UiScreen;
 
 const PIN_DIGITS: usize = 6;
 

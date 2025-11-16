@@ -370,6 +370,11 @@ impl CryptoMaterial {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "ui-tests"))]
+    pub(crate) fn test_set_vault_key(&mut self, key: [u8; 32]) {
+        self.vault_key = Some(Zeroizing::new(key));
+    }
+
     pub fn unlock_vault_key(&mut self, pin: &[u8]) -> Result<(), KeyError> {
         if self.wrapped_vault_key.is_empty() {
             return Err(KeyError::VaultKeyUnavailable);
