@@ -44,9 +44,6 @@ jobs:
       - name: Select ESP toolchain
         run: rustup default esp
 
-      - name: Install clippy component for ESP toolchain
-        run: rustup +esp component add clippy
-
       - name: Run cargo clippy (firmware)
         run: >-
           bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings"
