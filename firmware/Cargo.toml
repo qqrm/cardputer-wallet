@@ -14,7 +14,7 @@ ui-tests = []
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 shared = { path = "../shared", default-features = false }
 zeroize = { version = "1.7", default-features = false, features = ["alloc", "zeroize_derive"] }
-sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
+sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc"] }
 embedded-storage-async = { version = "0.4", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
@@ -31,6 +31,7 @@ rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
 critical-section = { version = "1.2", default-features = false, features = ["std"] }
 shared = { path = "../shared", default-features = false, features = ["std"] }
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }
+sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 
 [[bin]]
 name = "cardputer-firmware"

@@ -47,11 +47,11 @@ jobs:
 
       - name: Run cargo check (firmware Xtensa)
         run: >-
-          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp check -p firmware --target xtensa-esp32s3-none-elf"
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp -Zbuild-std=core,alloc check -p firmware --target xtensa-esp32s3-none-elf"
 
       - name: Run cargo build (firmware Xtensa release)
         run: >-
-          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf"
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp -Zbuild-std=core,alloc build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf"
 
       - name: Run cargo test (firmware host)
         run: >-
