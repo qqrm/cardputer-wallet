@@ -18,9 +18,10 @@ This roadmap keeps the embedded password device focused on the minimum set of de
 
 ## Phase 2 – Transport and interaction loop
 - Integrate the `trouble` BLE HID profile alongside USB HID with a shared action queue (`firmware`, SPEC §8).
-- Expose the sync journal over USB CDC and BLE GATT, using `postcard` frames generated from the `ergot` schema (`firmware`, `host-cli`, SPEC §7, §8).
+- Expose the sync journal over USB CDC (BLE GATT transport is explicitly deferred to a later milestone so we stay focused on the credential-typing loop).
 - Build the minimal Cardputer UI: lock screen, entry list, entry detail with TOTP timer, and sync status indicator (SPEC §9, §10).
 - Extend the host CLI with `pull`, `push`, and diagnostics flows backed by the shared schema definitions (`host-cli`, SPEC §7).
+- Document the removable-storage vault flow so operators can move the encrypted blob between SD card, workstation, and CLI without depending on Git remotes.
 
 ## Phase 3 – Hardening and release readiness
 - Exercise long-running storage scenarios to validate flash wear levelling and recovery from unexpected resets (`firmware`, SPEC §4, §6).

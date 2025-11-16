@@ -53,7 +53,7 @@ source "$HOME/export-esp.sh"
 ./scripts/dev-check.sh
 ```
 
-Running `cardputer pull` after these steps now persists three artifacts inside the chosen repository:
+Running `cardputer pull` after these steps now persists three artifacts inside the chosen repository or SD-card mirror (remote Git hosting is not part of the v0.1 scope):
 
 - `vault.enc` – the encrypted vault image.
 - `recips.json` – the recipients manifest.
@@ -89,7 +89,7 @@ After a pull completes, the CLI emits `vault.sig` alongside `vault.enc` (and `re
 2. Compute the BLAKE3 digest for the signature domain `cardputer.vault.signature.v1`, sequentially hashing the filenames (`vault.enc`, `recips.json`, `config.json`) together with their lengths and contents. This is the same message the CLI prepares via the internal `compute_signature_message` helper.
 3. Verify the Ed25519 signature in `vault.sig` against the digest using the verifying key. Any Ed25519 tooling (`ed25519-dalek`, `age-plugin`, etc.) can perform this check.
 
-`cardputer push` re-encrypts the vault with the supplied `vault_key`, applies local operations, and signs the resulting snapshot with `signing_secret_key` before uploading frames back to the device. Both keys must therefore be present whenever a push is attempted.
+`cardputer push` re-encrypts the vault with the supplied `vault_key`, applies local operations, and signs the resulting snapshot with `signing_secret_key` before uploading frames back to the device. Both keys must therefore be present whenever a push is attempted. Host operators can optionally commit these artifacts to Git, but that workflow is considered a future enhancement rather than a v0.1 requirement.
 
 ## Reproducing the CI workflow locally
 
