@@ -49,6 +49,8 @@ fn sample_snapshot(entry_id: Uuid) -> VaultSnapshot {
     }
 }
 
+const TEST_PIN: &str = "000000";
+
 fn stage_context(ctx: &mut SyncContext, snapshot: &VaultSnapshot, key: [u8; 32]) {
     let mut rng = ChaCha20Rng::from_seed([0x55; 32]);
     let encrypted = encrypt_snapshot(snapshot, &key, &mut rng).expect("encrypt snapshot");
@@ -57,6 +59,8 @@ fn stage_context(ctx: &mut SyncContext, snapshot: &VaultSnapshot, key: [u8; 32])
     ctx.test_set_journal(vec![JournalOperation::Add {
         entry_id: snapshot.entries[0].id.to_string(),
     }]);
+    ctx.test_configure_pin(TEST_PIN.as_bytes(), &mut rng)
+        .expect("configure pin");
 }
 
 #[test]
@@ -79,6 +83,9 @@ fn ui_renders_entries_and_transport_status() {
 
     system::reset_ui_runtime();
     assert_eq!(system::ui_screen(), UiScreen::Lock);
+    for digit in TEST_PIN.chars() {
+        system::ui_apply_command(UiCommand::InsertChar(digit));
+    }
     system::ui_apply_command(UiCommand::Activate);
     assert_eq!(system::ui_screen(), UiScreen::Home);
 

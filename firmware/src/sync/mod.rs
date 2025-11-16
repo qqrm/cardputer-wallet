@@ -15,6 +15,8 @@ use crate::storage::StorageError;
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
+#[cfg(any(test, feature = "ui-tests"))]
+use rand_core::{CryptoRng, RngCore};
 use sequential_storage::{cache::NoCache, map};
 
 use shared::cdc::transport::{FrameTransportError, command_for_request, command_for_response};
@@ -445,6 +447,10 @@ impl SyncContext {
 
     pub fn pin_lock_status(&self, now_ms: u64) -> PinLockStatus {
         self.pin_lock.status(now_ms)
+    }
+
+    pub fn current_time_ms(&self) -> u64 {
+        self.current_time_ms
     }
 
     /// Register a journal operation that should be emitted on the next pull.
@@ -1040,6 +1046,35 @@ fn handle_push_vault(
                 frame.remaining_bytes
             ),
         }))
+    }
+}
+
+#[cfg(any(test, feature = "ui-tests"))]
+impl SyncContext {
+    pub fn test_set_vault_key(&mut self, key: [u8; 32]) {
+        self.crypto.vault_key = Some(Zeroizing::new(key));
+    }
+
+    pub fn test_set_vault_image(&mut self, image: Vec<u8>) {
+        self.vault_image = Zeroizing::new(image);
+    }
+
+    pub fn test_set_journal(&mut self, ops: Vec<JournalOperation>) {
+        self.journal_ops = ops;
+    }
+
+    pub fn test_configure_pin<R: RngCore + CryptoRng>(
+        &mut self,
+        pin: &[u8],
+        rng: &mut R,
+    ) -> Result<(), KeyError> {
+        self.crypto.wrap_new_keys(pin, rng)?;
+        self.crypto.wipe();
+        Ok(())
+    }
+
+    pub fn test_set_current_time_ms(&mut self, now_ms: u64) {
+        self.current_time_ms = now_ms;
     }
 }
 
