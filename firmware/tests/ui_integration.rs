@@ -1,3 +1,5 @@
+#![cfg(feature = "ui-tests")]
+
 use firmware::sync::SyncContext;
 use firmware::system;
 use firmware::totp;

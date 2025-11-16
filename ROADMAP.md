@@ -46,3 +46,4 @@ Any failure in this list blocks the release. Cosmetic work such as boot animatio
 - Capture feedback from hardware dry runs and adjust UX or timing parameters accordingly (SPEC §8, §9).
 - Monitor CI stability; treat regressions as release blockers.
 - Run `./scripts/dev-check.sh` before committing to keep the workspace aligned with the standard validation suite.
+- Use the updated `./scripts/dev-check.sh` to lint and test the firmware on the host `x86_64-unknown-linux-gnu` target before the optional Xtensa check so that both contexts stay green without redundant builds.

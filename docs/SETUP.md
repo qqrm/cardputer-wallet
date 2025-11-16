@@ -46,7 +46,9 @@ espflash flash target/xtensa-esp32s3-none-elf/release/firmware
 
 ## Host tooling
 
-The host-side crates (`host-cli` and `shared`) target the standard Rust toolchain. After installing the Espressif toolchain with `espup` and sourcing the generated environment script, you can run the consolidated validation flow:
+The host-side crates (`host-cli` and `shared`) target the standard Rust toolchain. The consolidated `./scripts/dev-check.sh` helper now runs the fast host-target firmware checks (`cargo clippy -p firmware --all-targets --features firmware-bin` and `cargo test -p firmware --lib --target x86_64-unknown-linux-gnu --features firmware-bin`) before touching the Xtensa environment, so you can still catch most regressions even if the Espressif toolchain is not yet installed.
+
+To add the Xtensa coverage, install the Espressif toolchain and source the generated environment script before invoking the helper:
 
 ```bash
 source "$HOME/export-esp.sh"
@@ -100,12 +102,8 @@ source "$HOME/.cargo/env"
 cargo install espup
 espup install --targets esp32s3
 rustup default esp
-source "$HOME/export-esp.sh"
-cargo clippy --manifest-path firmware/Cargo.toml --all-targets --all-features -- -D warnings
-cargo check -p firmware --target xtensa-esp32s3-none-elf
+./scripts/dev-check.sh
 cargo build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf
-cargo test --manifest-path firmware/Cargo.toml --target x86_64-unknown-linux-gnu
 ```
 
-The additional `cargo check` and `cargo build` steps ensure that Xtensa-specific code paths link correctly, while the explicit host-targeted `cargo test` run preserves fast feedback for unit tests.
-The helper script executes `cargo fmt`, `cargo clippy`, `cargo test`, and finally `cargo check` for the firmware target, ensuring both the host and embedded crates are validated with a single command.
+Running the helper after installing the Espressif toolchain sources `export-esp.sh`, executes `cargo fmt`, and covers both host and embedded validation steps: the firmware crate is linted and its library tests run against the host `x86_64-unknown-linux-gnu` target using the `firmware-bin` feature, and then re-checked for the Xtensa configuration. The final `cargo build` command above demonstrates a production release build once the suite is green.
