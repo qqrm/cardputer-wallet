@@ -1,6 +1,6 @@
 use alloc::{format, string::String};
 
-use super::{UiEffect, UiRuntime, UiScreen};
+use super::{SYNC_IDLE_STAGE, UiEffect, UiRuntime, UiScreen};
 use crate::ui::{JournalAction, JournalEntryView, input::UiCommand, render::SyncView};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub(super) struct SyncState {
 impl SyncState {
     pub(super) fn new() -> Self {
         Self {
-            stage: String::from("Idle"),
+            stage: String::from(SYNC_IDLE_STAGE),
             progress_percent: 0,
         }
     }
@@ -26,7 +26,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             _ => UiEffect::None,
