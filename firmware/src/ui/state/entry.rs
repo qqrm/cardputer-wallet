@@ -126,7 +126,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Back | UiCommand::CancelEdit => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             _ => UiEffect::None,
@@ -140,7 +140,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             UiCommand::StartSync => {
@@ -230,7 +230,7 @@ impl UiRuntime {
                 }
             }
             UiCommand::Lock => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             UiCommand::StartSync => {
@@ -253,7 +253,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             UiCommand::MoveSelectionUp => {
