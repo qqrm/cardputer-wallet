@@ -86,12 +86,12 @@ bindings follow the v0.1 specification and are summarised below:
 Character keys without modifiers append to the active text field (search or
 form field).
 
-## Hint Bar
+## Hint Bar (post-MVP)
 
 The hint bar conveys the most relevant shortcuts for the current screen. It is
 toggleable via the `ToggleHints` command (mapped in software) and recomputes on
-state changes. Tests verify that the hint bar updates when transitioning across
-screens.
+state changes. Because it is categorized as a post-MVP nicety (SPEC §29), the
+feature can remain hidden during v0.1 stabilization without blocking release.
 
 ## Testing Harness
 
@@ -104,3 +104,26 @@ flows:
 
 These tests operate without hardware dependencies and provide a foundation for
 future UI integration or snapshot testing.
+
+## QA gating checklist for v0.1
+
+The UI module is considered release-ready only when the following checks—mapped
+to SPEC §1.1, §9–§12, and ROADMAP "Release blocking criteria"—pass on-device or
+within the simulator:
+
+1. **PIN enforcement** – Unlock flow blocks access to `Home` until the PIN is
+   entered and backoff counters increment on failures.
+2. **Entry navigation** – The Home screen shows the search field, recent list,
+   and transport indicators; Enter/Fn+Enter must type username/password via USB
+   HID without rendering passwords.
+3. **TOTP and sync actions** – `T` triggers OTP typing only when a code is ready
+   and `S` opens the sync overlay with accurate progress updates.
+4. **Settings scope** – Only the MVP toggles (transport selection, default Enter
+   action, brightness, auto-lock) are exposed. Extended settings and hint overlays
+   are deferred and should not block release if absent.
+5. **State resets** – Returning to `Lock` clears transient buffers (search text,
+   edit form) per the zeroization policy.
+
+Failures in this checklist block v0.1; cosmetic regressions such as boot
+animations or hint bar rendering are explicitly post-MVP and should not hold the
+release.
