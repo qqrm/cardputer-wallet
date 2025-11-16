@@ -24,6 +24,7 @@ target
 Cargo.lock
 /.cargo/
 **/*.log
+AGENTS.md
 
 # Embedded firmware outputs
 firmware/build/
