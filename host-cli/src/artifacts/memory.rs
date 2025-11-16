@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use shared::error::SharedError;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
 
@@ -34,20 +32,20 @@ impl ArtifactStore for MemoryArtifactStore {
         self.signature_expected = expected;
     }
 
-    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
         match chunk.artifact {
             VaultArtifact::Vault => {
                 self.vault.extend_from_slice(&chunk.data);
                 if chunk.is_last {
                     if self.recipients_expected && !self.recipients_seen {
-                        return true;
+                        return Ok(true);
                     }
                     if self.signature_expected && !self.signature_seen {
-                        return true;
+                        return Ok(true);
                     }
-                    return false;
+                    return Ok(false);
                 }
-                true
+                Ok(true)
             }
             VaultArtifact::Recipients => {
                 if chunk.sequence == 1 {
@@ -57,11 +55,11 @@ impl ArtifactStore for MemoryArtifactStore {
                 self.recipients.extend_from_slice(&chunk.data);
                 if chunk.is_last {
                     if self.signature_expected && !self.signature_seen {
-                        return true;
+                        return Ok(true);
                     }
-                    return false;
+                    return Ok(false);
                 }
-                true
+                Ok(true)
             }
             VaultArtifact::Signature => {
                 if chunk.sequence == 1 {
@@ -69,7 +67,7 @@ impl ArtifactStore for MemoryArtifactStore {
                 }
                 self.signature_seen = true;
                 self.signature.extend_from_slice(&chunk.data);
-                !chunk.is_last
+                Ok(!chunk.is_last)
             }
         }
     }
@@ -86,10 +84,6 @@ impl ArtifactStore for MemoryArtifactStore {
 
     fn record_log(&mut self, context: &str) {
         self.logs.push(context.to_owned());
-    }
-
-    fn persist(&self, _repo: &Path) -> Result<(), SharedError> {
-        Ok(())
     }
 
     fn vault_bytes(&self) -> &[u8] {
@@ -139,7 +133,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Vault,
         };
-        assert!(store.record_vault_chunk(&chunk));
+        assert!(
+            store
+                .record_vault_chunk(&chunk)
+                .expect("record vault chunk")
+        );
 
         chunk = VaultChunk {
             protocol_version: 1,
@@ -152,7 +150,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Recipients,
         };
-        assert!(store.record_vault_chunk(&chunk));
+        assert!(
+            store
+                .record_vault_chunk(&chunk)
+                .expect("record recipients chunk")
+        );
 
         chunk = VaultChunk {
             protocol_version: 1,
@@ -165,7 +167,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Signature,
         };
-        assert!(!store.record_vault_chunk(&chunk));
+        assert!(
+            !store
+                .record_vault_chunk(&chunk)
+                .expect("record signature chunk")
+        );
 
         assert_eq!(store.vault_bytes(), b"vault");
         assert_eq!(store.recipients_bytes(), Some(b"recipients".as_ref()));

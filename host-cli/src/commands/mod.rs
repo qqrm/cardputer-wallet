@@ -78,6 +78,7 @@ where
 
 pub trait ArtifactStore {
     fn load(&self, artifact: VaultArtifact) -> Result<Option<Vec<u8>>, SharedError>;
+    #[allow(dead_code)]
     fn persist(&mut self, artifact: VaultArtifact, data: &[u8]) -> Result<(), SharedError>;
 }
 

@@ -23,9 +23,11 @@ use crate::constants::{
     HOST_BUFFER_SIZE, SERIAL_BAUD_RATE,
 };
 
+#[cfg(test)]
 pub mod memory;
 
 /// Future returned by the asynchronous helpers implemented by [`DeviceTransport`].
+#[allow(dead_code)]
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SharedError>> + 'a>>;
 
 /// Abstraction over bidirectional device transports capable of exchanging CDC frames.
@@ -52,12 +54,14 @@ pub trait DeviceTransport {
     }
 
     /// Send a request and wait for the matching response.
+    #[allow(dead_code)]
     fn exchange(&mut self, request: &HostRequest) -> Result<DeviceResponse, SharedError> {
         self.send_request(request)?;
         self.read_response()
     }
 
     /// Asynchronous version of [`DeviceTransport::write_frame`].
+    #[allow(dead_code)]
     fn write_frame_async<'a>(
         &'a mut self,
         command: CdcCommand,
@@ -70,6 +74,7 @@ pub trait DeviceTransport {
     }
 
     /// Asynchronous version of [`DeviceTransport::read_frame`].
+    #[allow(dead_code)]
     fn read_frame_async<'a>(&'a mut self) -> TransportFuture<'a, (CdcCommand, Vec<u8>)>
     where
         Self: Sized + 'a,
@@ -78,6 +83,7 @@ pub trait DeviceTransport {
     }
 
     /// Asynchronous version of [`DeviceTransport::send_request`].
+    #[allow(dead_code)]
     fn send_request_async<'a>(&'a mut self, request: &'a HostRequest) -> TransportFuture<'a, ()>
     where
         Self: Sized + 'a,
@@ -86,6 +92,7 @@ pub trait DeviceTransport {
     }
 
     /// Asynchronous version of [`DeviceTransport::read_response`].
+    #[allow(dead_code)]
     fn read_response_async<'a>(&'a mut self) -> TransportFuture<'a, DeviceResponse>
     where
         Self: Sized + 'a,
@@ -94,6 +101,7 @@ pub trait DeviceTransport {
     }
 
     /// Asynchronous version of [`DeviceTransport::exchange`].
+    #[allow(dead_code)]
     fn exchange_async<'a>(
         &'a mut self,
         request: &'a HostRequest,

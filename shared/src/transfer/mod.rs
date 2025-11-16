@@ -256,6 +256,20 @@ impl ArtifactCollector {
         Self::default()
     }
 
+    pub fn set_recipients_expected(&mut self, expected: bool) {
+        self.recipients_expected = expected;
+        if !expected {
+            self.recipients_seen = false;
+        }
+    }
+
+    pub fn set_signature_expected(&mut self, expected: bool) {
+        self.signature_expected = expected;
+        if !expected {
+            self.signature_seen = false;
+        }
+    }
+
     pub fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
         let hash_option = if hash != [0u8; 32] { Some(hash) } else { None };
 
@@ -363,6 +377,14 @@ impl ArtifactCollector {
 
     pub fn signature_expected(&self) -> bool {
         self.signature_expected
+    }
+
+    pub fn recipients_seen(&self) -> bool {
+        self.recipients_seen
+    }
+
+    pub fn signature_seen(&self) -> bool {
+        self.signature_seen
     }
 
     fn ingest_chunk(buffer: &mut Vec<u8>, chunk: &VaultChunk) -> Result<(), TransferError> {

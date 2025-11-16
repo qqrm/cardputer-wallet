@@ -18,6 +18,7 @@ use serde_json::{Map, json};
 use serialport::SerialPortType;
 use shared::cdc::transport::{command_for_request, command_for_response, encode_frame};
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
+use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
 use shared::schema::{
     AckResponse, DeviceErrorCode, DeviceResponse, HostRequest, JournalFrame, NackResponse,
@@ -698,7 +699,7 @@ fn pull_command_uses_in_memory_transport_and_store() {
             remaining_bytes: 0,
             device_chunk_size: MAX_CHUNK_SIZE,
             data: vec![1, 2, 3, 4],
-            checksum: 0x1234_ABCD,
+            checksum: chunk_checksum(&[1, 2, 3, 4]),
             is_last: true,
             artifact: VaultArtifact::Vault,
         }),
