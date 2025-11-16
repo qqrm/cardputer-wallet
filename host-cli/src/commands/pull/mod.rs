@@ -9,17 +9,17 @@ use shared::schema::{
 };
 
 use crate::RepoArgs;
-use crate::artifacts::{ArtifactStore, PullArtifacts, persist_sync_state};
+use crate::artifacts::{ArtifactStore as TransferArtifactStore, PullArtifacts, persist_sync_state};
 use crate::commands::host_config::HostConfig;
 use crate::commands::signature::compute_signature_message;
-use crate::commands::{ArtifactStore, DeviceTransport, print_repo_banner};
+use crate::commands::{ArtifactStore as RepoArtifactStore, DeviceTransport, print_repo_banner};
 use crate::constants::{CONFIG_FILE, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_SIZE};
 use crate::transport::{handle_device_response, print_head};
 
 pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
 where
     T: DeviceTransport + ?Sized,
-    S: ArtifactStore + ?Sized,
+    S: RepoArtifactStore + ?Sized,
 {
     print_repo_banner(args);
 
@@ -43,11 +43,11 @@ where
     };
 
     print_head(&head);
-    ArtifactStore::record_log(&mut artifacts, "head response");
+    TransferArtifactStore::record_log(&mut artifacts, "head response");
     let recipients_expected = head.recipients_hash != [0u8; 32];
-    ArtifactStore::set_recipients_expected(&mut artifacts, recipients_expected);
+    TransferArtifactStore::set_recipients_expected(&mut artifacts, recipients_expected);
     let signature_expected = head.signature_hash != [0u8; 32];
-    ArtifactStore::set_signature_expected(&mut artifacts, signature_expected);
+    TransferArtifactStore::set_signature_expected(&mut artifacts, signature_expected);
 
     let request = HostRequest::PullVault(PullVaultRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -72,23 +72,23 @@ where
     }
 
     verify_pulled_signature(&artifacts, &args.repo, verifying_key.as_ref())?;
-    ArtifactStore::persist(&artifacts, &args.repo)?;
+    persist_artifacts(store, &artifacts)?;
     persist_sync_state(&args.repo, state_tracker.state())
 }
 
 fn persist_artifacts<S>(store: &mut S, artifacts: &PullArtifacts) -> Result<(), SharedError>
 where
-    S: ArtifactStore + ?Sized,
+    S: RepoArtifactStore + ?Sized,
 {
-    if !artifacts.vault.bytes.is_empty() {
-        store.persist(VaultArtifact::Vault, &artifacts.vault.bytes)?;
+    if !artifacts.vault_bytes().is_empty() {
+        store.persist(VaultArtifact::Vault, artifacts.vault_bytes())?;
     }
 
-    if let Some(recipients) = &artifacts.recipients_manifest {
+    if let Some(recipients) = artifacts.recipients_bytes() {
         store.persist(VaultArtifact::Recipients, recipients)?;
     }
 
-    if let Some(signature) = &artifacts.signature_bytes {
+    if let Some(signature) = artifacts.signature_bytes() {
         store.persist(VaultArtifact::Signature, signature)?;
     }
 
@@ -116,7 +116,7 @@ fn load_verifying_key(
 }
 
 fn verify_pulled_signature(
-    artifacts: &impl ArtifactStore,
+    artifacts: &impl TransferArtifactStore,
     repo: &Path,
     verifying_key: Option<&VerifyingKey>,
 ) -> Result<(), SharedError> {

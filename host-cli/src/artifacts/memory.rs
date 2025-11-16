@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use shared::error::SharedError;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
 
@@ -34,20 +32,17 @@ impl ArtifactStore for MemoryArtifactStore {
         self.signature_expected = expected;
     }
 
-    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
-        match chunk.artifact {
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
+        let should_continue = match chunk.artifact {
             VaultArtifact::Vault => {
                 self.vault.extend_from_slice(&chunk.data);
                 if chunk.is_last {
-                    if self.recipients_expected && !self.recipients_seen {
-                        return true;
-                    }
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
+                    let needs_recipients = self.recipients_expected && !self.recipients_seen;
+                    let needs_signature = self.signature_expected && !self.signature_seen;
+                    needs_recipients || needs_signature
+                } else {
+                    true
                 }
-                true
             }
             VaultArtifact::Recipients => {
                 if chunk.sequence == 1 {
@@ -56,12 +51,10 @@ impl ArtifactStore for MemoryArtifactStore {
                 self.recipients_seen = true;
                 self.recipients.extend_from_slice(&chunk.data);
                 if chunk.is_last {
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
+                    self.signature_expected && !self.signature_seen
+                } else {
+                    true
                 }
-                true
             }
             VaultArtifact::Signature => {
                 if chunk.sequence == 1 {
@@ -71,7 +64,9 @@ impl ArtifactStore for MemoryArtifactStore {
                 self.signature.extend_from_slice(&chunk.data);
                 !chunk.is_last
             }
-        }
+        };
+
+        Ok(should_continue)
     }
 
     fn record_journal_frame(&mut self, frame: &JournalFrame) {
@@ -88,10 +83,6 @@ impl ArtifactStore for MemoryArtifactStore {
         self.logs.push(context.to_owned());
     }
 
-    fn persist(&self, _repo: &Path) -> Result<(), SharedError> {
-        Ok(())
-    }
-
     fn vault_bytes(&self) -> &[u8] {
         &self.vault
     }
@@ -102,14 +93,6 @@ impl ArtifactStore for MemoryArtifactStore {
 
     fn signature_bytes(&self) -> Option<&[u8]> {
         self.signature_seen.then_some(self.signature.as_slice())
-    }
-
-    fn recipients_expected(&self) -> bool {
-        self.recipients_expected
-    }
-
-    fn recipients_seen(&self) -> bool {
-        self.recipients_seen
     }
 
     fn signature_expected(&self) -> bool {
@@ -139,7 +122,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Vault,
         };
-        assert!(store.record_vault_chunk(&chunk));
+        assert!(
+            store
+                .record_vault_chunk(&chunk)
+                .expect("record vault chunk")
+        );
 
         chunk = VaultChunk {
             protocol_version: 1,
@@ -152,7 +139,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Recipients,
         };
-        assert!(store.record_vault_chunk(&chunk));
+        assert!(
+            store
+                .record_vault_chunk(&chunk)
+                .expect("record recipients chunk")
+        );
 
         chunk = VaultChunk {
             protocol_version: 1,
@@ -165,7 +156,11 @@ mod tests {
             is_last: true,
             artifact: VaultArtifact::Signature,
         };
-        assert!(!store.record_vault_chunk(&chunk));
+        assert!(
+            !store
+                .record_vault_chunk(&chunk)
+                .expect("record signature chunk")
+        );
 
         assert_eq!(store.vault_bytes(), b"vault");
         assert_eq!(store.recipients_bytes(), Some(b"recipients".as_ref()));

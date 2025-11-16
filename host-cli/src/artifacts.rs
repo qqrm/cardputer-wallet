@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 
 use shared::error::SharedError;
 use shared::journal::FrameState;
-use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
+use shared::schema::{JournalFrame, VaultChunk};
 use shared::transfer::ArtifactCollector;
 
-use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, SYNC_STATE_FILE, VAULT_FILE};
+use crate::constants::SYNC_STATE_FILE;
 
+#[cfg(test)]
 pub mod memory;
 
 /// Trait describing storage backends used while pulling vault artifacts from the device.
@@ -20,16 +21,13 @@ pub trait ArtifactStore {
     fn set_signature_expected(&mut self, expected: bool);
 
     /// Record an incoming vault chunk. Returns `true` when additional chunks are required.
-    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool;
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError>;
 
     /// Record an incoming journal frame for later inspection.
     fn record_journal_frame(&mut self, frame: &JournalFrame);
 
     /// Record an informational log entry about the pull lifecycle.
     fn record_log(&mut self, context: &str);
-
-    /// Persist artifacts to the on-disk repository.
-    fn persist(&self, repo: &Path) -> Result<(), SharedError>;
 
     /// Access the collected vault bytes.
     fn vault_bytes(&self) -> &[u8];
@@ -39,12 +37,6 @@ pub trait ArtifactStore {
 
     /// Access the collected signature, if one was transferred.
     fn signature_bytes(&self) -> Option<&[u8]>;
-
-    /// Track whether a recipients manifest should be present in the transfer.
-    fn recipients_expected(&self) -> bool;
-
-    /// Track whether a recipients manifest has been observed in the transfer.
-    fn recipients_seen(&self) -> bool;
 
     /// Track whether a signature should be present in the transfer.
     fn signature_expected(&self) -> bool;
@@ -56,76 +48,19 @@ pub struct PullArtifacts {
     pub(crate) log_context: Vec<String>,
 }
 
-impl PullArtifacts {
-    fn record_recipients_manifest(&mut self, data: &[u8]) {
-        self.recipients_manifest = Some(data.to_vec());
-    }
-}
-
 impl ArtifactStore for PullArtifacts {
     fn set_recipients_expected(&mut self, expected: bool) {
-        self.recipients_expected = expected;
+        self.collector.set_recipients_expected(expected);
     }
 
     fn set_signature_expected(&mut self, expected: bool) {
-        self.signature_expected = expected;
+        self.collector.set_signature_expected(expected);
     }
 
-    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> bool {
-        match chunk.artifact {
-            VaultArtifact::Vault => {
-                self.vault.bytes.extend_from_slice(&chunk.data);
-                self.vault
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    if self.recipients_expected && !self.recipients_seen {
-                        return true;
-                    }
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
-                }
-                true
-            }
-            VaultArtifact::Recipients => {
-                if !self.recipients_seen || chunk.sequence == 1 {
-                    self.recipients.bytes.clear();
-                    self.recipients.metadata.clear();
-                }
-                self.recipients_seen = true;
-                self.recipients.bytes.extend_from_slice(&chunk.data);
-                self.recipients
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    let data = self.recipients.bytes.clone();
-                    self.record_recipients_manifest(&data);
-                    if self.signature_expected && !self.signature_seen {
-                        return true;
-                    }
-                    return false;
-                }
-                true
-            }
-            VaultArtifact::Signature => {
-                if !self.signature_seen || chunk.sequence == 1 {
-                    self.signature.bytes.clear();
-                    self.signature.metadata.clear();
-                }
-                self.signature_seen = true;
-                self.signature.bytes.extend_from_slice(&chunk.data);
-                self.signature
-                    .metadata
-                    .push(VaultChunkMetadata::from_chunk(chunk));
-                if chunk.is_last {
-                    self.signature_bytes = Some(self.signature.bytes.clone());
-                    return false;
-                }
-                true
-            }
-        }
+    fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
+        self.collector
+            .record_chunk(chunk)
+            .map_err(|err| SharedError::Transport(format!("failed to record vault chunk: {err}")))
     }
 
     fn record_journal_frame(&mut self, frame: &JournalFrame) {
@@ -142,97 +77,19 @@ impl ArtifactStore for PullArtifacts {
         self.log_context.push(context.into());
     }
 
-    fn persist(&self, repo: &Path) -> Result<(), SharedError> {
-        if self.vault.bytes.is_empty() && self.recipients_manifest.is_none() {
-            return Ok(());
-        }
-
-        fs::create_dir_all(repo)
-            .map_err(|err| io_error("create repository directory", repo, err))?;
-
-        let vault_bytes = self.collector.vault_bytes();
-        if !vault_bytes.is_empty() {
-            let vault_path = repo.join(VAULT_FILE);
-            if let Some(parent) = vault_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| io_error("prepare vault directory", parent, err))?;
-            }
-            fs::write(&vault_path, vault_bytes)
-                .map_err(|err| io_error("write vault artifact", &vault_path, err))?;
-            println!("Saved vault artifact to '{}'.", vault_path.display());
-        }
-
-        if let Some(recipients) = self.collector.recipients_bytes() {
-            let recipients_path = repo.join(RECIPIENTS_FILE);
-            if let Some(parent) = recipients_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| io_error("prepare recipients directory", parent, err))?;
-            }
-            fs::write(&recipients_path, recipients)
-                .map_err(|err| io_error("write recipients artifact", &recipients_path, err))?;
-            println!(
-                "Saved recipients manifest to '{}'.",
-                recipients_path.display()
-            );
-        }
-
-        if let Some(signature) = self.collector.signature_bytes() {
-            let signature_path = repo.join(SIGNATURE_FILE);
-            if let Some(parent) = signature_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| io_error("prepare signature directory", parent, err))?;
-            }
-            fs::write(&signature_path, signature)
-                .map_err(|err| io_error("write signature artifact", &signature_path, err))?;
-            println!("Saved vault signature to '{}'.", signature_path.display());
-        }
-
-        Ok(())
-    }
-
     fn vault_bytes(&self) -> &[u8] {
-        &self.vault.bytes
-    }
-
-    fn recipients_bytes(&self) -> Option<&[u8]> {
-        self.recipients_seen
-            .then_some(self.recipients.bytes.as_slice())
-            .or_else(|| self.recipients_manifest.as_deref())
-    }
-
-    fn signature_bytes(&self) -> Option<&[u8]> {
-        self.signature_bytes.as_deref().or_else(|| {
-            self.signature_seen
-                .then_some(self.signature.bytes.as_slice())
-        })
-    }
-
-    fn recipients_expected(&self) -> bool {
-        self.recipients_expected
-    }
-
-    fn recipients_seen(&self) -> bool {
-        self.recipients_seen
-    }
-
-    fn signature_expected(&self) -> bool {
-        self.signature_expected
-    }
-}
-
-    pub fn vault_bytes(&self) -> &[u8] {
         self.collector.vault_bytes()
     }
 
-    pub fn recipients_manifest(&self) -> Option<&[u8]> {
+    fn recipients_bytes(&self) -> Option<&[u8]> {
         self.collector.recipients_bytes()
     }
 
-    pub fn signature_bytes(&self) -> Option<&[u8]> {
+    fn signature_bytes(&self) -> Option<&[u8]> {
         self.collector.signature_bytes()
     }
 
-    pub fn signature_expected(&self) -> bool {
+    fn signature_expected(&self) -> bool {
         self.collector.signature_expected()
     }
 }

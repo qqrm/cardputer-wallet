@@ -1,7 +1,5 @@
 use std::fmt::Write as FmtWrite;
-use std::future::Future;
 use std::io::{self, Read, Write};
-use std::pin::Pin;
 use std::time::Duration;
 
 use serialport::{SerialPort, SerialPortType};
@@ -23,10 +21,8 @@ use crate::constants::{
     HOST_BUFFER_SIZE, SERIAL_BAUD_RATE,
 };
 
+#[cfg(test)]
 pub mod memory;
-
-/// Future returned by the asynchronous helpers implemented by [`DeviceTransport`].
-pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SharedError>> + 'a>>;
 
 /// Abstraction over bidirectional device transports capable of exchanging CDC frames.
 pub trait DeviceTransport {
@@ -49,59 +45,6 @@ pub trait DeviceTransport {
         let response = postcard::from_bytes(&payload).map_err(SharedError::from)?;
         validate_response_command(command, &response)?;
         Ok(response)
-    }
-
-    /// Send a request and wait for the matching response.
-    fn exchange(&mut self, request: &HostRequest) -> Result<DeviceResponse, SharedError> {
-        self.send_request(request)?;
-        self.read_response()
-    }
-
-    /// Asynchronous version of [`DeviceTransport::write_frame`].
-    fn write_frame_async<'a>(
-        &'a mut self,
-        command: CdcCommand,
-        payload: &'a [u8],
-    ) -> TransportFuture<'a, ()>
-    where
-        Self: Sized + 'a,
-    {
-        Box::pin(async move { self.write_frame(command, payload) })
-    }
-
-    /// Asynchronous version of [`DeviceTransport::read_frame`].
-    fn read_frame_async<'a>(&'a mut self) -> TransportFuture<'a, (CdcCommand, Vec<u8>)>
-    where
-        Self: Sized + 'a,
-    {
-        Box::pin(async move { self.read_frame() })
-    }
-
-    /// Asynchronous version of [`DeviceTransport::send_request`].
-    fn send_request_async<'a>(&'a mut self, request: &'a HostRequest) -> TransportFuture<'a, ()>
-    where
-        Self: Sized + 'a,
-    {
-        Box::pin(async move { self.send_request(request) })
-    }
-
-    /// Asynchronous version of [`DeviceTransport::read_response`].
-    fn read_response_async<'a>(&'a mut self) -> TransportFuture<'a, DeviceResponse>
-    where
-        Self: Sized + 'a,
-    {
-        Box::pin(async move { self.read_response() })
-    }
-
-    /// Asynchronous version of [`DeviceTransport::exchange`].
-    fn exchange_async<'a>(
-        &'a mut self,
-        request: &'a HostRequest,
-    ) -> TransportFuture<'a, DeviceResponse>
-    where
-        Self: Sized + 'a,
-    {
-        Box::pin(async move { self.exchange(request) })
     }
 }
 
