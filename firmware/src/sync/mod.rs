@@ -452,6 +452,16 @@ impl SyncContext {
         self.journal_ops.push(operation);
     }
 
+    /// Number of pending journal operations waiting to be synced.
+    pub fn pending_operations(&self) -> usize {
+        self.journal_ops.len()
+    }
+
+    /// Clear the in-memory journal backlog once it has been acknowledged.
+    pub fn clear_pending_operations(&mut self) {
+        self.journal_ops.clear();
+    }
+
     /// Reset sensitive buffers once a session finishes.
     pub fn wipe_sensitive(&mut self) {
         self.vault_image.iter_mut().for_each(|byte| *byte = 0);

@@ -96,6 +96,23 @@ impl UiRuntime {
         self.screen
     }
 
+    /// Display the sync overlay and reset its state.
+    pub fn open_sync_overlay(&mut self) {
+        self.set_screen(UiScreen::Sync);
+        self.sync.progress_percent = 0;
+        self.sync.stage = String::from("Preparing sync");
+    }
+
+    /// Return to the home screen after a sync session completes.
+    pub fn close_sync_overlay(&mut self) {
+        self.set_screen(UiScreen::Home);
+    }
+
+    /// Snapshot the current sync progress percentage and stage label.
+    pub fn sync_progress(&self) -> (u8, String) {
+        (self.sync.progress_percent, self.sync.stage.clone())
+    }
+
     /// Access the mutable keymap for custom bindings.
     pub fn keymap_mut(&mut self) -> &mut Keymap {
         &mut self.keymap

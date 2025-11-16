@@ -8,6 +8,8 @@ pub mod crypto;
 pub mod hid;
 pub mod storage;
 pub mod sync;
+#[cfg(any(test, feature = "ui-tests"))]
+pub mod system;
 pub mod totp;
 pub mod ui;
 
