@@ -65,14 +65,12 @@ impl LockState {
     }
 
     fn apply_error(&mut self, error: &PinUnlockError) {
-        self.status_message = Some(match error {
-            PinUnlockError::Backoff { remaining_ms } => {
-                format!("Try again in {}s", Self::seconds_from(*remaining_ms))
-            }
-            PinUnlockError::WipeRequired => String::from("Device requires secure wipe"),
-            PinUnlockError::Key(KeyError::CryptoFailure) => String::from("Incorrect PIN"),
-            PinUnlockError::Key(other) => format!("Unlock failed: {other}"),
-        });
+        self.status_message = match error {
+            PinUnlockError::Backoff { .. } => None,
+            PinUnlockError::WipeRequired => Some(String::from("Device requires secure wipe")),
+            PinUnlockError::Key(KeyError::CryptoFailure) => Some(String::from("Incorrect PIN")),
+            PinUnlockError::Key(other) => Some(format!("Unlock failed: {other}")),
+        };
     }
 
     fn clear_feedback(&mut self) {
@@ -126,6 +124,21 @@ impl LockState {
 
     pub(super) fn sync_status(&mut self, status: PinLockStatus) {
         self.update_from_status(status);
+    }
+
+    pub(super) fn tick(&mut self, elapsed_ms: u32) {
+        if elapsed_ms == 0 {
+            return;
+        }
+
+        if let Some(remaining) = self.backoff_remaining_ms {
+            let elapsed = u64::from(elapsed_ms);
+            if elapsed >= remaining {
+                self.backoff_remaining_ms = None;
+            } else {
+                self.backoff_remaining_ms = Some(remaining - elapsed);
+            }
+        }
     }
 }
 
@@ -207,6 +220,39 @@ mod tests {
         assert_eq!(view.backoff_remaining_ms, Some(5_000));
         assert_eq!(view.remaining_attempts, Some(PIN_WIPE_THRESHOLD - 3));
         assert!(view.prompt.contains("Try again"));
+    }
+
+    #[test]
+    fn backoff_clears_after_waiting_period() {
+        let vault =
+            super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
+        let mut ui = super::super::fixtures::build_runtime(vault);
+
+        let status = PinLockStatus {
+            consecutive_failures: 3,
+            total_failures: 3,
+            backoff_remaining_ms: Some(2_000),
+            wipe_required: false,
+        };
+        ui.lock.record_failure(
+            status,
+            &PinUnlockError::Backoff {
+                remaining_ms: 2_000,
+            },
+        );
+
+        for digit in ['1', '2', '3', '4', '5', '6'] {
+            ui.apply_command(UiCommand::InsertChar(digit));
+        }
+
+        assert_eq!(ui.apply_command(UiCommand::Activate), UiEffect::None);
+
+        ui.tick(2_000);
+
+        match ui.apply_command(UiCommand::Activate) {
+            UiEffect::UnlockRequested { pin } => assert_eq!(pin, "123456"),
+            other => panic!("unexpected effect: {other:?}"),
+        }
     }
 
     #[test]

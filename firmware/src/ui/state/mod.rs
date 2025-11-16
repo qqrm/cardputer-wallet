@@ -147,6 +147,7 @@ impl UiRuntime {
 
     /// Advance time for the TOTP countdown.
     pub fn tick(&mut self, elapsed_ms: u32) {
+        self.lock.tick(elapsed_ms);
         self.totp.tick(elapsed_ms);
     }
 
