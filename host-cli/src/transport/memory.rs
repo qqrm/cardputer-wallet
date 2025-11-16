@@ -54,7 +54,7 @@ impl DeviceTransport for MemoryDeviceTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::schema::{AckResponse, DeviceResponse};
+    use shared::schema::{AckResponse, DeviceResponse, PROTOCOL_VERSION};
 
     #[test]
     fn records_sent_frames() {
@@ -72,6 +72,7 @@ mod tests {
         let mut transport = MemoryDeviceTransport::new();
         transport
             .queue_response(DeviceResponse::Ack(AckResponse {
+                protocol_version: PROTOCOL_VERSION,
                 message: "ok".into(),
             }))
             .expect("queue response");
