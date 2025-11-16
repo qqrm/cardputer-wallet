@@ -24,18 +24,20 @@ use uuid::Uuid;
 use crate::RepoArgs;
 use crate::commands::host_config::{HostConfig, VaultSnapshot};
 use crate::commands::signature::compute_signature_message;
-use crate::commands::{ArtifactStore, DeviceTransport, print_repo_banner};
+use crate::commands::{DeviceTransport, RepoArtifactStore, print_repo_banner};
 use crate::constants::{
     CONFIG_FILE, LEGACY_LOCAL_OPERATIONS_FILE, LOCAL_OPERATIONS_FILE, MAX_CHUNK_SIZE,
     PUSH_FRAME_MAX_PAYLOAD, RECIPIENTS_FILE, SIGNATURE_FILE, SIGNATURE_SIZE, VAULT_AAD, VAULT_FILE,
     VAULT_NONCE_SIZE,
 };
-use crate::transport::{handle_device_response, print_ack};
+use crate::transport::{
+    handle_device_response, print_ack, read_device_response, send_host_request,
+};
 
 pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
 where
     T: DeviceTransport + ?Sized,
-    S: ArtifactStore + ?Sized,
+    S: RepoArtifactStore + ?Sized,
 {
     print_repo_banner(args);
 
@@ -74,9 +76,9 @@ where
         );
 
         let request = HostRequest::PushOps(frame);
-        transport.send(&request)?;
+        send_host_request(transport, &request)?;
 
-        let response = transport.receive()?;
+        let response = read_device_response(transport)?;
         let DeviceResponse::Ack(message) = response else {
             let description = format!("{response:?}");
             handle_device_response(response, None, None)?;
@@ -95,7 +97,7 @@ where
 fn push_vault_artifacts<T, S>(transport: &mut T, store: &S) -> Result<(), SharedError>
 where
     T: DeviceTransport + ?Sized,
-    S: ArtifactStore + ?Sized,
+    S: RepoArtifactStore + ?Sized,
 {
     let descriptors = [
         (VaultArtifact::Vault, "vault image"),
@@ -150,8 +152,8 @@ where
             sequence = sequence.saturating_add(1);
 
             let request = HostRequest::PushVault(frame);
-            transport.send(&request)?;
-            let response = transport.receive()?;
+            send_host_request(transport, &request)?;
+            let response = read_device_response(transport)?;
             let DeviceResponse::Ack(message) = response else {
                 if let DeviceResponse::Nack(nack) = response {
                     return Err(SharedError::Transport(format!(

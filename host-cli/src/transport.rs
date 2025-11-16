@@ -15,7 +15,7 @@ use shared::schema::{
     StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
 };
 
-use crate::artifacts::ArtifactStore;
+use crate::artifacts::TransferArtifactStore;
 use crate::constants::{
     CARDPUTER_IDENTITY_KEYWORDS, CARDPUTER_USB_PID, CARDPUTER_USB_VID, DEFAULT_TIMEOUT_SECS,
     HOST_BUFFER_SIZE, SERIAL_BAUD_RATE,
@@ -78,7 +78,7 @@ where
 pub fn handle_device_response(
     response: DeviceResponse,
     tracker: Option<&mut FrameTracker>,
-    artifacts: Option<&mut dyn ArtifactStore>,
+    artifacts: Option<&mut dyn TransferArtifactStore>,
 ) -> Result<bool, SharedError> {
     match response {
         DeviceResponse::Hello(info) => {

@@ -1,7 +1,7 @@
 use shared::error::SharedError;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
 
-use super::ArtifactStore;
+use super::TransferArtifactStore;
 
 /// Minimal in-memory artifact store used for unit tests.
 #[derive(Default)]
@@ -23,7 +23,7 @@ impl MemoryArtifactStore {
     }
 }
 
-impl ArtifactStore for MemoryArtifactStore {
+impl TransferArtifactStore for MemoryArtifactStore {
     fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
         let expected = hash != [0u8; 32];
         match artifact {
