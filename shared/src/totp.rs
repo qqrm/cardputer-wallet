@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
