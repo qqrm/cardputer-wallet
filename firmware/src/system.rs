@@ -100,16 +100,18 @@ fn start_sync_session() {
         Ok(())
     } else {
         unsafe {
-            sync_context()
-                .lock_mut(|ctx| sync_transport().lock_mut(|transport| transport.run_sync(ctx)))
+            sync_context().lock_mut(|ctx| {
+                let result = sync_transport().lock_mut(|transport| transport.run_sync(ctx));
+                if result.is_ok() {
+                    ctx.clear_pending_operations();
+                }
+                result
+            })
         }
     };
 
     match outcome {
         Ok(()) => {
-            unsafe {
-                sync_context().lock_mut(|ctx| ctx.clear_pending_operations());
-            }
             update_sync_stage(100, describe_completion_stage(&indicators, pending));
             unsafe {
                 ui_runtime().lock_mut(|runtime| runtime.close_sync_overlay());
