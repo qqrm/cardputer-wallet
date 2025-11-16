@@ -1,4 +1,5 @@
 use alloc::{boxed::Box, string::String};
+use zeroize::Zeroize;
 
 use super::{
     TotpProvider, VaultViewModel,
@@ -12,6 +13,8 @@ use entry::{EditState, EntryState, HomeState, SettingsState};
 use lock::LockState;
 use sync::SyncState;
 use widgets::default_settings_options;
+
+pub(super) const SYNC_IDLE_STAGE: &str = "Idle";
 
 mod entry;
 mod lock;
@@ -127,7 +130,7 @@ impl UiRuntime {
                 UiEffect::None
             }
             UiCommand::Lock => {
-                self.set_screen(UiScreen::Lock);
+                self.lock_runtime();
                 UiEffect::None
             }
             other => self.route_command(other),
@@ -185,6 +188,39 @@ impl UiRuntime {
     /// Synchronise the lock indicators without changing screens.
     pub fn sync_lock_status(&mut self, status: PinLockStatus) {
         self.lock.sync_status(status);
+    fn lock_runtime(&mut self) {
+        self.zeroize_home_filters();
+        self.reset_entry_and_edit_state();
+        self.reset_selection_indices();
+        self.reset_sync_status();
+        self.totp.select_entry(None);
+        self.set_screen(UiScreen::Lock);
+    }
+
+    fn zeroize_home_filters(&mut self) {
+        self.home.search_query.zeroize();
+        self.home.search_query.clear();
+        self.home.search_focus = true;
+        self.home.selected_recent = 0;
+    }
+
+    fn reset_entry_and_edit_state(&mut self) {
+        if let Some(mut edit) = self.edit.take() {
+            for field in edit.fields.iter_mut() {
+                field.value.zeroize();
+            }
+        }
+        self.entry = None;
+    }
+
+    fn reset_selection_indices(&mut self) {
+        self.settings.selected = 0;
+    }
+
+    fn reset_sync_status(&mut self) {
+        self.sync.stage.zeroize();
+        self.sync.stage = String::from(SYNC_IDLE_STAGE);
+        self.sync.progress_percent = 0;
     }
 }
 
@@ -286,5 +322,59 @@ pub(super) mod fixtures {
 
     pub(super) fn press(ui: &mut UiRuntime, key: PhysicalKey) {
         ui.handle_key_event(KeyEvent::pressed(key));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UiCommand, UiScreen, fixtures};
+    use crate::ui::render::ViewContent;
+
+    #[test]
+    fn relock_clears_home_search_and_selection() {
+        let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
+        let mut ui = fixtures::build_runtime(vault);
+
+        ui.apply_command(UiCommand::Activate);
+        ui.apply_command(UiCommand::InsertChar('a'));
+        ui.apply_command(UiCommand::InsertChar('l'));
+        ui.apply_command(UiCommand::MoveSelectionDown);
+        ui.apply_command(UiCommand::Lock);
+        assert_eq!(ui.screen(), UiScreen::Lock);
+
+        ui.apply_command(UiCommand::Activate);
+        let frame = ui.render();
+
+        match frame.content {
+            ViewContent::Home(home) => {
+                assert!(home.search.query.is_empty());
+                assert_eq!(home.recent.selected, Some(0));
+            }
+            other => panic!("expected home view after unlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relock_drops_edit_buffers() {
+        let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
+        let mut ui = fixtures::build_runtime(vault);
+
+        ui.apply_command(UiCommand::Activate);
+        ui.apply_command(UiCommand::EditEntry);
+        ui.apply_command(UiCommand::InsertChar('x'));
+        ui.apply_command(UiCommand::Lock);
+        assert_eq!(ui.screen(), UiScreen::Lock);
+
+        ui.apply_command(UiCommand::Activate);
+        ui.apply_command(UiCommand::EditEntry);
+        let frame = ui.render();
+
+        match frame.content {
+            ViewContent::Edit(edit) => {
+                assert!(!edit.form.fields.is_empty());
+                assert_eq!(edit.form.fields[0].value, String::from("Alpha"));
+            }
+            other => panic!("expected edit view after relaunch, got {other:?}"),
+        }
     }
 }
