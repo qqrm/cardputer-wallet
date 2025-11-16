@@ -179,6 +179,7 @@ impl UiRuntime {
 
     fn zeroize_home_filters(&mut self) {
         self.home.search_query.zeroize();
+        self.home.search_query.clear();
         self.home.search_focus = true;
         self.home.selected_recent = 0;
     }
