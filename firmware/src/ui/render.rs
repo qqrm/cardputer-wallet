@@ -54,6 +54,10 @@ pub enum ViewContent {
 pub struct LockView {
     pub prompt: String,
     pub remaining_attempts: Option<u8>,
+    pub entered_digits: usize,
+    pub max_digits: usize,
+    pub backoff_remaining_ms: Option<u64>,
+    pub wipe_required: bool,
 }
 
 /// Search bar state for the home screen.

@@ -49,6 +49,15 @@ impl KeyEvent {
             pressed: true,
         }
     }
+
+    /// Convenience constructor for a digit key press without modifiers.
+    pub fn digit(digit: char) -> Self {
+        Self {
+            key: PhysicalKey::Char(digit),
+            modifiers: KeyModifiers::default(),
+            pressed: true,
+        }
+    }
 }
 
 /// High level user intention extracted from the keyboard layer.

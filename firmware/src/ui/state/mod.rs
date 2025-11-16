@@ -6,6 +6,7 @@ use super::{
     render::{Frame, ViewContent},
     transport,
 };
+use crate::crypto::{PinLockStatus, PinUnlockError};
 
 use entry::{EditState, EntryState, HomeState, SettingsState};
 use lock::LockState;
@@ -42,6 +43,9 @@ pub enum UiEffect {
     },
     CancelEdit {
         entry_id: String,
+    },
+    UnlockRequested {
+        pin: String,
     },
 }
 
@@ -163,6 +167,23 @@ impl UiRuntime {
             content,
             hint_bar: self.hint_bar(),
         }
+    }
+
+    /// Update lock UI after a successful unlock.
+    pub fn register_unlock_success(&mut self, status: PinLockStatus) {
+        self.lock.record_success(status);
+        self.set_screen(UiScreen::Home);
+    }
+
+    /// Update lock UI when unlocking fails.
+    pub fn register_unlock_failure(&mut self, status: PinLockStatus, error: &PinUnlockError) {
+        self.lock.record_failure(status, error);
+        self.set_screen(UiScreen::Lock);
+    }
+
+    /// Synchronise the lock indicators without changing screens.
+    pub fn sync_lock_status(&mut self, status: PinLockStatus) {
+        self.lock.sync_status(status);
     }
 }
 
