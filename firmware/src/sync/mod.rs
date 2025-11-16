@@ -1052,7 +1052,7 @@ fn handle_push_vault(
 #[cfg(any(test, feature = "ui-tests"))]
 impl SyncContext {
     pub fn test_set_vault_key(&mut self, key: [u8; 32]) {
-        self.crypto.vault_key = Some(Zeroizing::new(key));
+        self.crypto.test_set_vault_key(key);
     }
 
     pub fn test_set_vault_image(&mut self, image: Vec<u8>) {

@@ -167,12 +167,20 @@ pub mod actions {
 #[cfg(target_arch = "xtensa")]
 pub mod runtime {
     use super::actions;
+    use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
     use embassy_executor::Executor;
+    use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
     use esp_hal::{
-        Blocking, Config, clock::CpuClock, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag,
+        Config,
+        clock::CpuClock,
+        otg_fs::{
+            Usb,
+            asynch::{Config as UsbDriverConfig, Driver as UsbDriver},
+        },
+        timer::timg::TimerGroup,
     };
     use esp_storage::FlashStorage;
     use static_cell::StaticCell;
@@ -187,6 +195,20 @@ pub mod runtime {
     }
 
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
+    static USB_DRIVER: StaticCell<UsbDriver<'static>> = StaticCell::new();
+    static USB_CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static USB_BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    static USB_MSOS_DESCRIPTOR: StaticCell<[u8; 0]> = StaticCell::new();
+    static USB_CONTROL_BUF: StaticCell<[u8; 256]> = StaticCell::new();
+    static USB_CDC_STATE: StaticCell<cdc_acm::State<'static>> = StaticCell::new();
+    static USB_EVENT_HANDLER: StaticCell<usb::UsbEventHandler> = StaticCell::new();
+    static USB_RX_BUFFER: StaticCell<[u8; USB_MAX_PACKET_SIZE as usize]> = StaticCell::new();
+
+    const USB_MAX_PACKET_SIZE: u16 = 64;
+    const USB_VID: u16 = 0x303A;
+    const USB_PID: u16 = 0x4001;
+
+    static mut USB_EP_OUT_BUFFER: [u8; 1024] = [0; 1024];
 
     pub fn main() -> ! {
         init_allocator();
@@ -206,7 +228,43 @@ pub mod runtime {
                 storage::block_on(storage::initialize_context_from_flash(&mut flash, range))
             });
 
-        let usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
+        let usb = Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
+
+        let driver = USB_DRIVER.init(UsbDriver::new(
+            usb,
+            unsafe { &mut USB_EP_OUT_BUFFER },
+            UsbDriverConfig::default(),
+        ));
+
+        let mut config = embassy_usb::Config::new(USB_VID, USB_PID);
+        config.manufacturer = Some("Cardputer");
+        config.product = Some("Cardputer Wallet");
+        config.serial_number = Some("0001");
+        config.device_class = 0xEF;
+        config.device_sub_class = 0x02;
+        config.device_protocol = 0x01;
+        config.composite_with_iads = true;
+
+        let mut builder = UsbBuilder::new(
+            driver,
+            config,
+            USB_CONFIG_DESCRIPTOR.init([0; 256]),
+            USB_BOS_DESCRIPTOR.init([0; 256]),
+            USB_MSOS_DESCRIPTOR.init([]),
+            USB_CONTROL_BUF.init([0; 256]),
+        );
+
+        let handler = USB_EVENT_HANDLER.init(usb::UsbEventHandler::new());
+        builder.handler(handler);
+
+        let cdc_state = USB_CDC_STATE.init(cdc_acm::State::new());
+        let cdc = cdc_acm::CdcAcmClass::new(&mut builder, cdc_state, USB_MAX_PACKET_SIZE);
+        let usb_device = builder.build();
+
+        let (cdc_sender, cdc_receiver, cdc_control) = cdc.split_with_control();
+        let buffered_receiver =
+            cdc_receiver.into_buffered(USB_RX_BUFFER.init([0u8; USB_MAX_PACKET_SIZE as usize]));
+        let usb_events = usb::event_receiver();
 
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
@@ -215,7 +273,16 @@ pub mod runtime {
                 .spawn(super::tasks::ble_profile(ble_actions))
                 .expect("spawn BLE task");
             spawner
-                .spawn(super::tasks::cdc_server(usb, boot_context))
+                .spawn(super::tasks::usb_device(usb_device))
+                .expect("spawn USB device task");
+            spawner
+                .spawn(super::tasks::cdc_server(
+                    buffered_receiver,
+                    cdc_sender,
+                    cdc_control,
+                    usb_events,
+                    boot_context,
+                ))
                 .expect("spawn CDC task");
         });
     }
@@ -227,14 +294,18 @@ mod tasks {
     use super::ble::{
         BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
     };
+    use super::usb::{UsbEventReceiver, UsbTransportEvent};
     use crate::storage::{self, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::ui::transport::{self, TransportState};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
-    use embassy_time::{Duration, Timer};
-    use esp_hal::{Blocking, usb_serial_jtag::UsbSerialJtag};
-    use nb::Error as NbError;
+    use embassy_futures::select::{Either, select};
+    use embassy_usb::{
+        UsbDevice,
+        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender},
+        driver::EndpointError,
+    };
     use trouble_host::types::capabilities::IoCapabilities;
 
     use esp_storage::FlashStorageError;
@@ -247,7 +318,21 @@ mod tasks {
     type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     #[task]
-    pub async fn cdc_server(mut serial: UsbSerialJtag<'static, Blocking>, ctx: BootContext) {
+    pub async fn usb_device(
+        mut device: UsbDevice<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+    ) {
+        device.run().await;
+    }
+
+    #[task]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cdc_server(
+        mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        mut control: ControlChanged<'static>,
+        mut events: UsbEventReceiver,
+        ctx: BootContext,
+    ) {
         let (mut context, mut boot_error) = ctx
             .map(|ctx| (ctx, None))
             .unwrap_or_else(|error| (SyncContext::new(), Some(error)));
@@ -256,74 +341,114 @@ mod tasks {
             log_boot_failure(error);
         }
 
-        transport::set_usb_state(TransportState::Waiting);
+        let callbacks = TransportCallbacks::new();
+        let packet_size = receiver.max_packet_size() as usize;
+        callbacks.waiting().await;
         loop {
-            match read_frame(&mut serial).await {
-                Ok((command, frame)) => {
-                    transport::set_usb_state(TransportState::Connected);
-                    if let Some(error) = boot_error.take() {
-                        let payload = boot_failure_payload(&error);
-                        if let Err(err) =
-                            write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
-                        {
-                            if matches!(err, sync::ProtocolError::Transport) {
-                                transport::set_usb_state(TransportState::Error);
-                            }
-                        }
-                        continue;
-                    }
+            if matches!(
+                wait_for_session(
+                    &mut receiver,
+                    &mut sender,
+                    &mut control,
+                    &mut events,
+                    &callbacks,
+                )
+                .await,
+                SessionControl::Drop
+            ) {
+                continue;
+            }
 
-                    match process_host_frame(command, &frame, &mut context) {
-                        Ok((response_command, response)) => {
-                            if let Err(err) = write_frame(&mut serial, response_command, &response)
+            loop {
+                let read_future = read_frame(&mut receiver);
+                let event_future = events.receive();
+                let combined = select(read_future, event_future);
+                let control_future = control.control_changed();
+
+                match select(combined, control_future).await {
+                    Either::First(Either::First(Ok((command, frame)))) => {
+                        callbacks.connected().await;
+                        if let Some(error) = boot_error.take() {
+                            let payload = boot_failure_payload(&error);
+                            if let Err(err) = write_frame(
+                                &mut sender,
+                                packet_size,
+                                shared::cdc::CdcCommand::Nack,
+                                &payload,
+                            )
+                            .await
                             {
-                                if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_state(TransportState::Error);
+                                if handle_frame_error(err, &callbacks).await {
+                                    break;
                                 }
                             }
+                            continue;
                         }
-                        Err(err) => {
-                            let payload = match sync::encode_response(
-                                &shared::schema::DeviceResponse::Nack(err.as_nack()),
-                            ) {
-                                Ok(encoded) => encoded,
-                                Err(encode_err) => {
-                                    let fatal = encode_err.as_nack();
-                                    sync::encode_response(&shared::schema::DeviceResponse::Nack(
-                                        fatal,
-                                    ))
-                                    .unwrap_or_default()
+
+                        match process_host_frame(command, &frame, &mut context) {
+                            Ok((response_command, response)) => {
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    response_command,
+                                    &response,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
                                 }
-                            };
-                            if let Err(err) =
-                                write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
-                            {
-                                if matches!(err, sync::ProtocolError::Transport) {
-                                    transport::set_usb_state(TransportState::Error);
+                            }
+                            Err(err) => {
+                                let payload = encode_nack_payload(err);
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    shared::cdc::CdcCommand::Nack,
+                                    &payload,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Err(err) => {
-                    let payload = match sync::encode_response(
-                        &shared::schema::DeviceResponse::Nack(err.as_nack()),
-                    ) {
-                        Ok(encoded) => encoded,
-                        Err(encode_err) => {
-                            let fatal = encode_err.as_nack();
-                            sync::encode_response(&shared::schema::DeviceResponse::Nack(fatal))
-                                .unwrap_or_default()
+                    Either::First(Either::First(Err(FrameIoError::Protocol(err)))) => {
+                        let payload = encode_nack_payload(err);
+                        if let Err(write_err) = write_frame(
+                            &mut sender,
+                            packet_size,
+                            shared::cdc::CdcCommand::Nack,
+                            &payload,
+                        )
+                        .await
+                        {
+                            if handle_frame_error(write_err, &callbacks).await {
+                                break;
+                            }
                         }
-                    };
-                    if matches!(err, sync::ProtocolError::Transport) {
-                        transport::set_usb_state(TransportState::Error);
                     }
-                    if let Err(err) =
-                        write_frame(&mut serial, shared::cdc::CdcCommand::Nack, &payload)
-                    {
-                        if matches!(err, sync::ProtocolError::Transport) {
-                            transport::set_usb_state(TransportState::Error);
+                    Either::First(Either::First(Err(FrameIoError::Endpoint(err)))) => {
+                        if handle_endpoint_error(err, &callbacks).await {
+                            break;
+                        }
+                    }
+                    Either::First(Either::Second(event)) => {
+                        if matches!(
+                            handle_usb_event(event, &callbacks, &receiver).await,
+                            SessionControl::Drop
+                        ) {
+                            break;
+                        }
+                    }
+                    Either::Second(()) => {
+                        if !receiver.dtr() {
+                            callbacks.waiting().await;
+                            break;
                         }
                     }
                 }
@@ -360,49 +485,156 @@ mod tasks {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SessionControl {
+        Continue,
+        Drop,
+    }
+
+    enum FrameIoError {
+        Protocol(sync::ProtocolError),
+        Endpoint(EndpointError),
+    }
+
+    struct TransportCallbacks;
+
+    impl TransportCallbacks {
+        const fn new() -> Self {
+            Self
+        }
+
+        async fn set(&self, state: TransportState) {
+            transport::set_usb_state(state);
+        }
+
+        async fn waiting(&self) {
+            self.set(TransportState::Waiting).await;
+        }
+
+        async fn connecting(&self) {
+            self.set(TransportState::Connecting).await;
+        }
+
+        async fn connected(&self) {
+            self.set(TransportState::Connected).await;
+        }
+
+        async fn offline(&self) {
+            self.set(TransportState::Offline).await;
+        }
+
+        async fn error(&self) {
+            self.set(TransportState::Error).await;
+        }
+    }
+
+    async fn wait_for_session(
+        receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        control: &mut ControlChanged<'static>,
+        events: &mut UsbEventReceiver,
+        callbacks: &TransportCallbacks,
+    ) -> SessionControl {
+        callbacks.waiting().await;
+        receiver.wait_connection().await;
+        sender.wait_connection().await;
+        callbacks.connecting().await;
+
+        loop {
+            if receiver.dtr() {
+                callbacks.connected().await;
+                return SessionControl::Continue;
+            }
+
+            let control_future = control.control_changed();
+            let event_future = events.receive();
+            match select(control_future, event_future).await {
+                Either::First(()) => continue,
+                Either::Second(event) => {
+                    if matches!(
+                        handle_usb_event(event, callbacks, receiver).await,
+                        SessionControl::Drop
+                    ) {
+                        return SessionControl::Drop;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_usb_event(
+        event: UsbTransportEvent,
+        callbacks: &TransportCallbacks,
+        receiver: &BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+    ) -> SessionControl {
+        match event {
+            UsbTransportEvent::Enabled => {
+                callbacks.waiting().await;
+                SessionControl::Continue
+            }
+            UsbTransportEvent::Disabled => {
+                callbacks.offline().await;
+                SessionControl::Drop
+            }
+            UsbTransportEvent::Suspended => {
+                callbacks.waiting().await;
+                SessionControl::Continue
+            }
+            UsbTransportEvent::Resumed => {
+                if receiver.dtr() {
+                    callbacks.connected().await;
+                } else {
+                    callbacks.waiting().await;
+                }
+                SessionControl::Continue
+            }
+        }
+    }
+
     async fn read_frame(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<(shared::cdc::CdcCommand, alloc::vec::Vec<u8>), sync::ProtocolError> {
+        reader: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+    ) -> Result<(shared::cdc::CdcCommand, Vec<u8>), FrameIoError> {
         use shared::cdc::{FRAME_HEADER_SIZE, decode_frame, decode_frame_header};
 
         let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
-        for byte in header_bytes.iter_mut() {
-            *byte = read_byte(serial).await?;
-        }
+        read_exact(reader, &mut header_bytes).await?;
 
         let header = decode_frame_header(
             shared::schema::PROTOCOL_VERSION,
             FRAME_MAX_SIZE,
             header_bytes,
-        )?;
+        )
+        .map_err(FrameIoError::Protocol)?;
 
-        let mut buffer = alloc::vec::Vec::with_capacity(header.length as usize);
-        for _ in 0..header.length {
-            buffer.push(read_byte(serial).await?);
-        }
+        let mut buffer = vec![0u8; header.length as usize];
+        read_exact(reader, &mut buffer).await?;
 
-        decode_frame(&header, &buffer)?;
+        decode_frame(&header, &buffer).map_err(FrameIoError::Protocol)?;
 
         Ok((header.command, buffer))
     }
 
-    async fn read_byte(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
-    ) -> Result<u8, sync::ProtocolError> {
-        loop {
-            match serial.read_byte() {
-                Ok(byte) => return Ok(byte),
-                Err(NbError::WouldBlock) => Timer::after(Duration::from_micros(250)).await,
-                Err(NbError::Other(_)) => return Err(sync::ProtocolError::Transport),
+    async fn read_exact(
+        reader: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        buf: &mut [u8],
+    ) -> Result<(), FrameIoError> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            match reader.read(&mut buf[offset..]).await {
+                Ok(0) => continue,
+                Ok(count) => offset += count,
+                Err(err) => return Err(FrameIoError::Endpoint(err)),
             }
         }
+        Ok(())
     }
 
-    fn write_frame(
-        serial: &mut UsbSerialJtag<'static, Blocking>,
+    async fn write_frame(
+        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        packet_size: usize,
         command: shared::cdc::CdcCommand,
         payload: &[u8],
-    ) -> Result<(), sync::ProtocolError> {
+    ) -> Result<(), FrameIoError> {
         use shared::cdc::encode_frame;
 
         let header = encode_frame(
@@ -410,19 +642,70 @@ mod tasks {
             command,
             payload,
             FRAME_MAX_SIZE,
-        )?;
+        )
+        .map_err(FrameIoError::Protocol)?;
 
-        serial
-            .write(&header)
-            .map_err(|_| sync::ProtocolError::Transport)?;
+        write_all(sender, packet_size, &header).await?;
         if !payload.is_empty() {
-            serial
-                .write(payload)
-                .map_err(|_| sync::ProtocolError::Transport)?;
+            write_all(sender, packet_size, payload).await?;
+            if payload.len() % packet_size == 0 {
+                sender
+                    .write_packet(&[])
+                    .await
+                    .map_err(FrameIoError::Endpoint)?;
+            }
         }
-        serial
-            .flush_tx()
-            .map_err(|_| sync::ProtocolError::Transport)
+        Ok(())
+    }
+
+    async fn write_all(
+        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        packet_size: usize,
+        mut data: &[u8],
+    ) -> Result<(), FrameIoError> {
+        while !data.is_empty() {
+            let chunk_len = packet_size.min(data.len());
+            match sender.write(&data[..chunk_len]).await {
+                Ok(0) => continue,
+                Ok(written) => data = &data[written..],
+                Err(err) => return Err(FrameIoError::Endpoint(err)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_endpoint_error(error: EndpointError, callbacks: &TransportCallbacks) -> bool {
+        match error {
+            EndpointError::Disabled => {
+                callbacks.waiting().await;
+                true
+            }
+            EndpointError::BufferOverflow => {
+                callbacks.error().await;
+                true
+            }
+        }
+    }
+
+    async fn handle_frame_error(error: FrameIoError, callbacks: &TransportCallbacks) -> bool {
+        match error {
+            FrameIoError::Endpoint(endpoint) => handle_endpoint_error(endpoint, callbacks).await,
+            FrameIoError::Protocol(_) => {
+                callbacks.error().await;
+                true
+            }
+        }
+    }
+
+    fn encode_nack_payload(err: sync::ProtocolError) -> Vec<u8> {
+        match sync::encode_response(&shared::schema::DeviceResponse::Nack(err.as_nack())) {
+            Ok(encoded) => encoded,
+            Err(encode_err) => {
+                let fatal = encode_err.as_nack();
+                sync::encode_response(&shared::schema::DeviceResponse::Nack(fatal))
+                    .unwrap_or_default()
+            }
+        }
     }
 
     #[task]
@@ -467,5 +750,76 @@ mod tasks {
             | HidError::MacroQueueFull
             | HidError::Profile(_) => transport::set_ble_state(TransportState::Error),
         }
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+mod usb {
+    use embassy_sync::{
+        blocking_mutex::raw::CriticalSectionRawMutex,
+        channel::{Channel, Receiver, Sender},
+    };
+    use embassy_usb::Handler;
+
+    const USB_EVENT_QUEUE_DEPTH: usize = 4;
+
+    static USB_EVENTS: Channel<CriticalSectionRawMutex, UsbTransportEvent, USB_EVENT_QUEUE_DEPTH> =
+        Channel::new();
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum UsbTransportEvent {
+        Enabled,
+        Disabled,
+        Suspended,
+        Resumed,
+    }
+
+    pub type UsbEventReceiver =
+        Receiver<'static, CriticalSectionRawMutex, UsbTransportEvent, USB_EVENT_QUEUE_DEPTH>;
+
+    pub struct UsbEventHandler {
+        sender: Sender<'static, CriticalSectionRawMutex, UsbTransportEvent, USB_EVENT_QUEUE_DEPTH>,
+    }
+
+    impl UsbEventHandler {
+        pub fn new() -> Self {
+            Self {
+                sender: USB_EVENTS.sender(),
+            }
+        }
+
+        fn publish(&mut self, event: UsbTransportEvent) {
+            let _ = self.sender.try_send(event);
+        }
+    }
+
+    impl Handler for UsbEventHandler {
+        fn enabled(&mut self, enabled: bool) {
+            self.publish(if enabled {
+                UsbTransportEvent::Enabled
+            } else {
+                UsbTransportEvent::Disabled
+            });
+        }
+
+        fn configured(&mut self, configured: bool) {
+            if configured {
+                self.publish(UsbTransportEvent::Enabled);
+            } else {
+                self.publish(UsbTransportEvent::Disabled);
+            }
+        }
+
+        fn suspended(&mut self, suspended: bool) {
+            self.publish(if suspended {
+                UsbTransportEvent::Suspended
+            } else {
+                UsbTransportEvent::Resumed
+            });
+        }
+    }
+
+    pub fn event_receiver() -> UsbEventReceiver {
+        USB_EVENTS.receiver()
     }
 }

@@ -1,9 +1,12 @@
 use alloc::{format, string::String};
 use core::mem;
 
-use super::{UiEffect, UiRuntime, UiScreen};
+use super::{UiEffect, UiRuntime};
 use crate::crypto::{KeyError, PIN_WIPE_THRESHOLD, PinLockStatus, PinUnlockError};
 use crate::ui::{input::UiCommand, render::LockView};
+
+#[cfg(test)]
+use super::UiScreen;
 
 const PIN_DIGITS: usize = 6;
 
@@ -78,7 +81,7 @@ impl LockState {
     }
 
     const fn seconds_from(ms: u64) -> u64 {
-        if ms == 0 { 0 } else { (ms + 999) / 1_000 }
+        ms.div_ceil(1_000)
     }
 
     fn prompt(&self) -> String {
@@ -90,10 +93,10 @@ impl LockState {
             return String::from("Device requires secure wipe");
         }
 
-        if let Some(ms) = self.backoff_remaining_ms {
-            if ms > 0 {
-                return format!("Try again in {}s", Self::seconds_from(ms));
-            }
+        if let Some(ms) = self.backoff_remaining_ms
+            && ms > 0
+        {
+            return format!("Try again in {}s", Self::seconds_from(ms));
         }
 
         String::from("Enter PIN to unlock")

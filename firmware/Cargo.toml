@@ -14,7 +14,7 @@ ui-tests = []
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 shared = { path = "../shared", default-features = false }
 zeroize = { version = "1.7", default-features = false, features = ["alloc", "zeroize_derive"] }
-sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
+sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc"] }
 embedded-storage-async = { version = "0.4", default-features = false }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
@@ -31,6 +31,7 @@ rand_chacha = { version = "0.3", default-features = false, features = ["std"] }
 critical-section = { version = "1.2", default-features = false, features = ["std"] }
 shared = { path = "../shared", default-features = false, features = ["std"] }
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }
+sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 
 [[bin]]
 name = "cardputer-firmware"
@@ -50,6 +51,8 @@ embassy-executor = { version = "0.9.1", features = ["log"] }
 embassy-time = { version = "0.5.0", features = ["log"] }
 embedded-io = "0.7.1"
 embedded-io-async = "0.7.0"
+embassy-usb = { version = "0.5.1", default-features = false }
+embassy-usb-driver = { version = "0.2.0", default-features = false }
 bt-hci = "0.6.0"
 static_cell = "2.1"
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }

@@ -188,6 +188,8 @@ impl UiRuntime {
     /// Synchronise the lock indicators without changing screens.
     pub fn sync_lock_status(&mut self, status: PinLockStatus) {
         self.lock.sync_status(status);
+    }
+
     fn lock_runtime(&mut self) {
         self.zeroize_home_filters();
         self.reset_entry_and_edit_state();
