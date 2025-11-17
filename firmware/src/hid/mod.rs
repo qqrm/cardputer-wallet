@@ -1,5 +1,10 @@
 //! Human-interface side of the firmware runtime, including session action queues and the Xtensa
 //! runtime entry point.
+#[cfg(target_arch = "xtensa")]
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+
+use crate::ui::transport::TransportState;
+
 #[cfg(any(test, target_arch = "xtensa"))]
 pub mod ble;
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -137,10 +142,10 @@ pub mod actions {
 
     pub fn publish(action: DeviceAction) {
         if let DeviceAction::StartSession { .. } = &action {
-            transport::set_ble_state(TransportState::Connecting);
+            super::publish_ble_state(TransportState::Connecting);
         }
         if let DeviceAction::EndSession = &action {
-            transport::set_ble_state(TransportState::Waiting);
+            super::publish_ble_state(TransportState::Waiting);
         }
         let sender = action_sender();
         let _ = sender.try_send(action);
@@ -165,11 +170,50 @@ pub mod actions {
 }
 
 #[cfg(target_arch = "xtensa")]
+type TransportSignal = Signal<CriticalSectionRawMutex, TransportState>;
+
+#[cfg(target_arch = "xtensa")]
+static USB_TRANSPORT_SIGNAL: TransportSignal = Signal::new();
+#[cfg(target_arch = "xtensa")]
+static BLE_TRANSPORT_SIGNAL: TransportSignal = Signal::new();
+
+#[cfg(target_arch = "xtensa")]
+fn publish_usb_state(state: TransportState) {
+    USB_TRANSPORT_SIGNAL.signal(state);
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+fn publish_usb_state(state: TransportState) {
+    crate::ui::transport::set_usb_state(state);
+}
+
+#[cfg(target_arch = "xtensa")]
+fn publish_ble_state(state: TransportState) {
+    BLE_TRANSPORT_SIGNAL.signal(state);
+}
+
+#[cfg(not(target_arch = "xtensa"))]
+fn publish_ble_state(state: TransportState) {
+    crate::ui::transport::set_ble_state(state);
+}
+
+#[cfg(target_arch = "xtensa")]
+fn usb_state_signal() -> &'static TransportSignal {
+    &USB_TRANSPORT_SIGNAL
+}
+
+#[cfg(target_arch = "xtensa")]
+fn ble_state_signal() -> &'static TransportSignal {
+    &BLE_TRANSPORT_SIGNAL
+}
+
+#[cfg(target_arch = "xtensa")]
 pub mod runtime {
     use super::actions;
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
+    use crate::system;
     use embassy_executor::Executor;
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
@@ -266,6 +310,9 @@ pub mod runtime {
             cdc_receiver.into_buffered(USB_RX_BUFFER.init([0u8; USB_MAX_PACKET_SIZE as usize]));
         let usb_events = usb::event_receiver();
 
+        let usb_states = super::usb_state_signal();
+        let ble_states = super::ble_state_signal();
+        let ui_commands = system::ui_command_sender();
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
             let ble_actions = actions::action_receiver();
@@ -275,6 +322,13 @@ pub mod runtime {
             spawner
                 .spawn(super::tasks::usb_device(usb_device))
                 .expect("spawn USB device task");
+            spawner
+                .spawn(super::tasks::transport_coordinator(
+                    usb_states,
+                    ble_states,
+                    ui_commands,
+                ))
+                .expect("spawn transport coordinator");
             spawner
                 .spawn(super::tasks::flash_restore_task(
                     flash,
@@ -304,10 +358,12 @@ mod tasks {
     use super::usb::{UsbEventReceiver, UsbTransportEvent};
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
+    use crate::system::{UiCommandSender, UiTaskMessage};
+    use crate::time;
     use crate::ui::transport::{self, TransportState};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
-    use embassy_futures::select::{Either, select};
+    use embassy_futures::select::{Either, Either3, select, select3};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_time::Timer;
     use embassy_usb::{
@@ -555,7 +611,7 @@ mod tasks {
         }
 
         async fn set(&self, state: TransportState) {
-            transport::set_usb_state(state);
+            super::publish_usb_state(state);
         }
 
         async fn waiting(&self) {
@@ -576,6 +632,87 @@ mod tasks {
 
         async fn error(&self) {
             self.set(TransportState::Error).await;
+        }
+    }
+
+    const TRANSPORT_DEBOUNCE_MS: u64 = 25;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CoordinatorEvent {
+        Usb(TransportState),
+        Ble(TransportState),
+        Time(u64),
+    }
+
+    #[task]
+    pub async fn transport_coordinator(
+        usb_states: &'static super::TransportSignal,
+        ble_states: &'static super::TransportSignal,
+        ui_commands: UiCommandSender,
+    ) {
+        let mut usb_state = TransportState::Offline;
+        let mut ble_state = TransportState::Offline;
+        let mut pending_time: Option<u64> = None;
+        let mut time_rx = time::time_receiver();
+
+        transport::set_usb_state(usb_state);
+        transport::set_ble_state(ble_state);
+
+        loop {
+            apply_update(
+                next_transport_event(usb_states, ble_states, &mut time_rx).await,
+                &mut usb_state,
+                &mut ble_state,
+                &mut pending_time,
+            );
+
+            let mut debounce = Timer::after_millis(TRANSPORT_DEBOUNCE_MS);
+            loop {
+                match select(
+                    next_transport_event(usb_states, ble_states, &mut time_rx),
+                    &mut debounce,
+                )
+                .await
+                {
+                    Either::First(update) => {
+                        apply_update(update, &mut usb_state, &mut ble_state, &mut pending_time);
+                        debounce = Timer::after_millis(TRANSPORT_DEBOUNCE_MS);
+                    }
+                    Either::Second(()) => break,
+                }
+            }
+
+            transport::set_usb_state(usb_state);
+            transport::set_ble_state(ble_state);
+
+            if let Some(now_ms) = pending_time.take() {
+                let _ = ui_commands.try_send(UiTaskMessage::SyncTime(now_ms));
+            }
+        }
+    }
+
+    async fn next_transport_event(
+        usb_states: &'static super::TransportSignal,
+        ble_states: &'static super::TransportSignal,
+        time_rx: &mut time::TimeReceiver,
+    ) -> CoordinatorEvent {
+        match select3(usb_states.wait(), ble_states.wait(), time_rx.changed()).await {
+            Either3::First(state) => CoordinatorEvent::Usb(state),
+            Either3::Second(state) => CoordinatorEvent::Ble(state),
+            Either3::Third(now_ms) => CoordinatorEvent::Time(now_ms),
+        }
+    }
+
+    fn apply_update(
+        event: CoordinatorEvent,
+        usb_state: &mut TransportState,
+        ble_state: &mut TransportState,
+        pending_time: &mut Option<u64>,
+    ) {
+        match event {
+            CoordinatorEvent::Usb(state) => *usb_state = state,
+            CoordinatorEvent::Ble(state) => *ble_state = state,
+            CoordinatorEvent::Time(now_ms) => *pending_time = Some(now_ms),
         }
     }
 
@@ -764,7 +901,7 @@ mod tasks {
         let profile = profile::TroubleProfile::new("Cardputer HID").expect("init BLE profile");
         let mut backend = BleHid::new(profile, IoCapabilities::KeyboardDisplay);
         let mut queue = HidCommandQueue::<HID_COMMAND_QUEUE_DEPTH>::new();
-        transport::set_ble_state(TransportState::Waiting);
+        super::publish_ble_state(TransportState::Waiting);
 
         loop {
             let action = receiver.receive().await;
@@ -782,10 +919,10 @@ mod tasks {
             HidResponse::Connected { .. }
             | HidResponse::ReportSent { .. }
             | HidResponse::MacroAccepted { .. } => {
-                transport::set_ble_state(TransportState::Connected)
+                super::publish_ble_state(TransportState::Connected)
             }
             HidResponse::Acknowledged { .. } | HidResponse::Disconnected => {
-                transport::set_ble_state(TransportState::Waiting);
+                super::publish_ble_state(TransportState::Waiting);
             }
         }
     }
@@ -793,13 +930,13 @@ mod tasks {
     fn handle_error(error: HidError) {
         match error {
             HidError::AlreadyConnected { .. } => {
-                transport::set_ble_state(TransportState::Connected);
+                super::publish_ble_state(TransportState::Connected);
             }
-            HidError::NoActiveSession => transport::set_ble_state(TransportState::Waiting),
+            HidError::NoActiveSession => super::publish_ble_state(TransportState::Waiting),
             HidError::SessionMismatch { .. }
             | HidError::CommandQueueFull(_)
             | HidError::MacroQueueFull
-            | HidError::Profile(_) => transport::set_ble_state(TransportState::Error),
+            | HidError::Profile(_) => super::publish_ble_state(TransportState::Error),
         }
     }
 }

@@ -168,6 +168,7 @@ type UiScreenSender = WatchSender<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBE
 pub enum UiTaskMessage {
     Key(KeyEvent),
     Command(UiCommand),
+    SyncTime(u64),
 }
 
 pub fn ui_command_sender() -> UiCommandSender {
@@ -214,7 +215,7 @@ pub async fn ui_task() {
                 publish_ui_state(&runtime);
             }
             Either3::Third(now_ms) => {
-                runtime.sync_time(now_ms);
+                handle_ui_message(&mut runtime, UiTaskMessage::SyncTime(now_ms));
                 publish_ui_state(&runtime);
             }
         }
@@ -225,6 +226,10 @@ fn handle_ui_message(runtime: &mut UiRuntime, message: UiTaskMessage) {
     let effect = match message {
         UiTaskMessage::Key(event) => runtime.handle_key_event(event),
         UiTaskMessage::Command(command) => runtime.apply_command(command),
+        UiTaskMessage::SyncTime(now_ms) => {
+            runtime.sync_time(now_ms);
+            UiEffect::None
+        }
     };
 
     dispatch_ui_effect(runtime, effect);
