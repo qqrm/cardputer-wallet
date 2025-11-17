@@ -322,7 +322,7 @@ mod tasks {
     use embassy_time::Timer;
     use embassy_usb::{
         UsbDevice,
-        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender},
+        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender as CdcSender},
         driver::EndpointError,
     };
     use trouble_host::types::capabilities::IoCapabilities;
@@ -439,7 +439,7 @@ mod tasks {
     #[allow(clippy::too_many_arguments)]
     pub async fn cdc_server(
         mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        mut sender: CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         mut control: ControlChanged<'static>,
         mut events: UsbEventReceiver,
     ) {
@@ -705,7 +705,7 @@ mod tasks {
 
     async fn wait_for_session(
         receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         control: &mut ControlChanged<'static>,
         events: &mut UsbEventReceiver,
         callbacks: &TransportCallbacks,
@@ -805,7 +805,7 @@ mod tasks {
     }
 
     async fn write_frame(
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
         command: shared::cdc::CdcCommand,
         payload: &[u8],
@@ -834,7 +834,7 @@ mod tasks {
     }
 
     async fn write_all(
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
         mut data: &[u8],
     ) -> Result<(), FrameIoError> {
