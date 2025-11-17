@@ -1,6 +1,7 @@
 use super::*;
+use crate::application;
 use crate::commands::signature::compute_signature_message;
-use crate::commands::{DeviceTransport, RepoArtifactStore};
+use crate::commands::{DeviceTransport, RepoArtifactStore, TransportProvider};
 use crate::constants::{
     CARDPUTER_USB_PID, CARDPUTER_USB_VID, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_FILE,
     VAULT_FILE,
@@ -21,14 +22,15 @@ use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, FrameHeader, compute_crc32};
 use shared::checksum::accumulate_checksum;
 use shared::error::SharedError;
 use shared::schema::{
-    AckResponse, DeviceErrorCode, DeviceResponse, HostRequest, JournalFrame, NackResponse,
-    PROTOCOL_VERSION, PullHeadResponse, PullVaultRequest, StatusRequest, StatusResponse,
-    VaultArtifact, VaultChunk, decode_host_request, encode_device_response, encode_host_request,
-    encode_journal_operations,
+    AckResponse, DeviceErrorCode, DeviceResponse, HelloResponse, HostRequest, JournalFrame,
+    NackResponse, PROTOCOL_VERSION, PullHeadResponse, PullVaultRequest, StatusRequest,
+    StatusResponse, VaultArtifact, VaultChunk, decode_host_request, encode_device_response,
+    encode_host_request, encode_journal_operations,
 };
 use shared::vault::{
     EntryUpdate, JournalOperation as VaultJournalOperation, SecretString, VaultEntry, VaultMetadata,
 };
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
@@ -173,6 +175,25 @@ fn hash_with_crc(fill: u8, data: &[u8]) -> [u8; 32] {
     hash
 }
 
+#[derive(Default)]
+struct RecordingTransportProvider {
+    requested_ports: RefCell<Vec<String>>,
+}
+
+impl TransportProvider for RecordingTransportProvider {
+    type Transport = dyn DeviceTransport;
+
+    fn connect(&self, port_path: &str) -> Result<Box<Self::Transport>, SharedError> {
+        self.requested_ports
+            .borrow_mut()
+            .push(port_path.to_string());
+        Ok(
+            Box::new(crate::transport::memory::MemoryDeviceTransport::new())
+                as Box<Self::Transport>,
+        )
+    }
+}
+
 #[test]
 fn detect_cardputer_by_vid_pid() {
     let ports = vec![
@@ -259,6 +280,21 @@ fn detect_cardputer_allows_any_port_override() {
 }
 
 #[test]
+fn connect_transport_uses_cli_port() {
+    let cli = Cli {
+        port: Some("/dev/ttyTEST".into()),
+        any_port: false,
+        command: Command::Hello,
+    };
+
+    let provider = RecordingTransportProvider::default();
+
+    let _transport = application::connect_transport(&cli, &provider).expect("connect transport");
+    let requested = provider.requested_ports.borrow();
+    assert_eq!(requested.as_slice(), ["/dev/ttyTEST"]);
+}
+
+#[test]
 fn framing_roundtrip() {
     let request = HostRequest::PullVault(PullVaultRequest {
         protocol_version: PROTOCOL_VERSION,
@@ -295,6 +331,30 @@ fn cli_header_matches_shared_encoding() {
     let expected =
         encode_frame(PROTOCOL_VERSION, command, &payload, usize::MAX).expect("encode header");
     assert_eq!(&frame[..FRAME_HEADER_SIZE], &expected);
+}
+
+#[test]
+fn run_uses_supplied_transport_without_opening_ports() {
+    let cli = Cli {
+        port: Some("/dev/null".into()),
+        any_port: false,
+        command: Command::Hello,
+    };
+
+    let mut transport = crate::transport::memory::MemoryDeviceTransport::new();
+    transport
+        .queue_response(DeviceResponse::Hello(HelloResponse {
+            protocol_version: PROTOCOL_VERSION,
+            device_name: "Test".into(),
+            firmware_version: "0.0.0".into(),
+            session_id: 1,
+        }))
+        .expect("queue response");
+
+    commands::run(cli, &mut transport).expect("run succeeds");
+
+    let last = transport.last_sent().expect("sent frame");
+    assert_eq!(last.0, CdcCommand::Hello);
 }
 
 #[test]

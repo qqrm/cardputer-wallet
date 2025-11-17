@@ -7,10 +7,15 @@ use shared::schema::VaultArtifact;
 
 use crate::artifacts::io_error;
 use crate::constants::{RECIPIENTS_FILE, SIGNATURE_FILE, VAULT_FILE};
-use crate::transport::{detect_first_serial_port, open_serial_port};
 use crate::{Cli, Command, RepoArgs};
 
 pub use crate::transport::DeviceTransport;
+
+pub trait TransportProvider {
+    type Transport: DeviceTransport + ?Sized;
+
+    fn connect(&self, port_path: &str) -> Result<Box<Self::Transport>, SharedError>;
+}
 
 pub mod confirm;
 pub mod get_time;
@@ -23,30 +28,25 @@ pub mod set_time;
 pub mod signature;
 pub mod status;
 
-pub fn run(cli: Cli) -> Result<(), SharedError> {
-    let port_path = match cli.port {
-        Some(port) => port,
-        None => detect_first_serial_port(cli.any_port)?,
-    };
-
-    println!("Connecting to Cardputer on {port_path}…");
-    let mut port = open_serial_port(&port_path)?;
-
+pub fn run<T>(cli: Cli, transport: &mut T) -> Result<(), SharedError>
+where
+    T: DeviceTransport + ?Sized,
+{
     match cli.command {
-        Command::Hello => hello::run(&mut *port),
-        Command::Status => status::run(&mut *port),
-        Command::SetTime(args) => set_time::run(&mut *port, &args),
-        Command::GetTime => get_time::run(&mut *port),
-        Command::PullHead => pull_head::run(&mut *port),
+        Command::Hello => hello::run(transport),
+        Command::Status => status::run(transport),
+        Command::SetTime(args) => set_time::run(transport, &args),
+        Command::GetTime => get_time::run(transport),
+        Command::PullHead => pull_head::run(transport),
         Command::Pull(args) => {
             let mut store = FilesystemArtifactStore::new(&args.repo);
-            pull::run(&mut *port, &mut store, &args)
+            pull::run(transport, &mut store, &args)
         }
         Command::Push(args) => {
             let mut store = FilesystemArtifactStore::new(&args.repo);
-            push::run(&mut *port, &mut store, &args)
+            push::run(transport, &mut store, &args)
         }
-        Command::Confirm(args) => confirm::run(&mut *port, &args),
+        Command::Confirm(args) => confirm::run(transport, &args),
     }
 }
 
