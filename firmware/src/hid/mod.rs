@@ -165,12 +165,18 @@ pub mod actions {
 }
 
 #[cfg(target_arch = "xtensa")]
+type BootContext =
+    Result<crate::sync::SyncContext, crate::storage::StorageError<esp_storage::FlashStorageError>>;
+
+#[cfg(target_arch = "xtensa")]
 pub mod runtime {
+    use super::BootContext;
     use super::actions;
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
-    use embassy_executor::{Executor, SpawnError};
+    use crate::system;
+    use embassy_executor::{SpawnError, raw::Executor};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
@@ -184,7 +190,6 @@ pub mod runtime {
         timer::timg::TimerGroup,
     };
     use esp_storage::{FlashStorage, FlashStorageError};
-    use firmware::system;
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -212,8 +217,6 @@ pub mod runtime {
     const USB_VID: u16 = 0x303A;
     const USB_PID: u16 = 0x4001;
     const FLASH_RESTORE_DELAY_MS: u64 = 2_000;
-
-    type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     static mut USB_EP_OUT_BUFFER: [u8; 1024] = [0; 1024];
 
@@ -323,6 +326,7 @@ pub mod runtime {
 
 #[cfg(target_arch = "xtensa")]
 mod tasks {
+    use super::BootContext;
     use super::actions;
     use super::ble::{
         BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
@@ -332,7 +336,7 @@ mod tasks {
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
-    use alloc::{format, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
     use embassy_sync::{
@@ -346,7 +350,7 @@ mod tasks {
         class::cdc_acm::{BufferedReceiver, ControlChanged, Sender as CdcSender},
         driver::EndpointError,
     };
-    use trouble_host::types::capabilities::IoCapabilities;
+    use trouble_host::IoCapabilities;
 
     use esp_storage::FlashStorageError;
 
@@ -354,7 +358,7 @@ mod tasks {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     #[cfg(target_arch = "xtensa")]
-    extern "C" {
+    unsafe extern "C" {
         fn ets_printf(format: *const core::ffi::c_char, ...) -> i32;
     }
 
@@ -816,7 +820,10 @@ mod tasks {
     async fn read_frame(
         reader: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
     ) -> Result<(shared::cdc::CdcCommand, Vec<u8>), FrameIoError> {
-        use shared::cdc::{FRAME_HEADER_SIZE, decode_frame, decode_frame_header};
+        use shared::cdc::{
+            FRAME_HEADER_SIZE,
+            transport::{decode_frame, decode_frame_header},
+        };
 
         let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
         read_exact(reader, &mut header_bytes).await?;
@@ -857,7 +864,7 @@ mod tasks {
         command: shared::cdc::CdcCommand,
         payload: &[u8],
     ) -> Result<(), FrameIoError> {
-        use shared::cdc::encode_frame;
+        use shared::cdc::transport::encode_frame;
 
         let header = encode_frame(
             shared::schema::PROTOCOL_VERSION,

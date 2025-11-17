@@ -1,8 +1,10 @@
 //! Persistent storage glue for flash-backed bootstrapping and context persistence.
 #[cfg(any(test, target_arch = "xtensa"))]
 use core::ops::Range;
+#[cfg(target_arch = "xtensa")]
+use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
 #[cfg(any(test, target_arch = "xtensa"))]
-use embedded_storage_async::nor_flash::NorFlash;
+use embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash;
 use sequential_storage::Error as FlashStorageError;
 
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -53,7 +55,7 @@ pub async fn initialize_context_from_flash<S>(
     range: Range<u32>,
 ) -> Result<SyncContext, StorageError<S::Error>>
 where
-    S: NorFlash,
+    S: AsyncNorFlash,
 {
     let mut ctx = SyncContext::new();
     ctx.load_from_flash(flash, range).await?;
@@ -62,15 +64,14 @@ where
 
 #[cfg(target_arch = "xtensa")]
 pub struct BootFlash<'d> {
-    storage:
-        embassy_embedded_hal::adapter::blocking_async::BlockingAsync<esp_storage::FlashStorage<'d>>,
+    storage: embassy_embedded_hal::adapter::BlockingAsync<esp_storage::FlashStorage<'d>>,
 }
 
 #[cfg(target_arch = "xtensa")]
 impl<'d> BootFlash<'d> {
     pub fn new(storage: esp_storage::FlashStorage<'d>) -> Self {
         Self {
-            storage: embassy_embedded_hal::adapter::blocking_async::BlockingAsync::new(storage),
+            storage: embassy_embedded_hal::adapter::BlockingAsync::new(storage),
         }
     }
 
@@ -185,8 +186,8 @@ impl<'d> embedded_storage_async::nor_flash::ReadNorFlash for BootFlash<'d> {
 
 #[cfg(target_arch = "xtensa")]
 impl<'d> embedded_storage_async::nor_flash::NorFlash for BootFlash<'d> {
-    const WRITE_SIZE: usize = esp_storage::FlashStorage::WRITE_SIZE as usize;
-    const ERASE_SIZE: usize = esp_storage::FlashStorage::ERASE_SIZE as usize;
+    const WRITE_SIZE: usize = <esp_storage::FlashStorage as BlockingNorFlash>::WRITE_SIZE as usize;
+    const ERASE_SIZE: usize = <esp_storage::FlashStorage as BlockingNorFlash>::ERASE_SIZE as usize;
 
     async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         self.storage.erase(from, to).await
