@@ -1,14 +1,25 @@
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::{Channel, Receiver as ChannelReceiver, Sender as ChannelSender};
 use embassy_sync::signal::Signal;
-use embassy_sync::watch::{Receiver as WatchReceiver, Sender as WatchSender, Watch};
+use embassy_sync::watch::{Receiver as WatchReceiver, Watch};
 use static_cell::StaticCell;
 
 use crate::sync::SyncContext;
 #[cfg(target_arch = "xtensa")]
 use crate::time;
+use crate::ui::{Frame, KeyEvent, UiCommand, UiEffect, UiScreen};
+
+#[cfg(any(target_arch = "xtensa", test))]
 use crate::totp::GlobalTotpProvider;
-use crate::ui::{Frame, KeyEvent, SyncVaultViewModel, UiCommand, UiEffect, UiRuntime, UiScreen};
+#[cfg(any(target_arch = "xtensa", test))]
+use crate::ui::{EntrySummary, JournalAction, JournalEntryView, UiRuntime, VaultViewModel};
+#[cfg(any(target_arch = "xtensa", test))]
+use alloc::{boxed::Box, format, string::String, vec::Vec};
+#[cfg(any(target_arch = "xtensa", test))]
+use embassy_sync::watch::Sender as WatchSender;
+#[cfg(any(target_arch = "xtensa", test))]
+use shared::schema::JournalOperation;
+#[cfg(any(target_arch = "xtensa", test))]
 use zeroize::Zeroizing;
 
 #[cfg(target_arch = "xtensa")]
@@ -20,6 +31,7 @@ type UiMutex = CriticalSectionRawMutex;
 
 const UI_CHANNEL_DEPTH: usize = 8;
 const UI_STATE_SUBSCRIBERS: usize = 4;
+#[cfg(target_arch = "xtensa")]
 const UI_TICK_MS: u64 = 50;
 
 static SYNC_CONTEXT: StaticCell<Mutex<UiMutex, SyncContext>> = StaticCell::new();
@@ -28,9 +40,66 @@ static UI_FRAMES: Watch<UiMutex, Frame, UI_STATE_SUBSCRIBERS> = Watch::new();
 static UI_SCREENS: Watch<UiMutex, UiScreen, UI_STATE_SUBSCRIBERS> = Watch::new_with(UiScreen::Lock);
 static UI_EFFECTS: Signal<UiMutex, UiEffect> = Signal::new();
 
+#[cfg(any(target_arch = "xtensa", test))]
+struct SystemVaultViewModel;
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl SystemVaultViewModel {
+    fn from_system() -> Self {
+        Self
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+impl VaultViewModel for SystemVaultViewModel {
+    fn entries(&self) -> Vec<EntrySummary> {
+        Vec::new()
+    }
+
+    fn entry(&self, id: &str) -> Option<EntrySummary> {
+        self.entries().into_iter().find(|entry| entry.id == id)
+    }
+
+    fn journal(&self) -> Vec<JournalEntryView> {
+        sync_context().lock(|ctx| {
+            ctx.journal_operations()
+                .iter()
+                .map(to_journal_entry)
+                .collect()
+        })
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
+fn to_journal_entry(operation: &JournalOperation) -> JournalEntryView {
+    match operation {
+        JournalOperation::Add { entry_id } => JournalEntryView::new(
+            entry_id.clone(),
+            JournalAction::Add,
+            Some(String::from("add entry")),
+            None,
+        ),
+        JournalOperation::UpdateField {
+            entry_id, field, ..
+        } => JournalEntryView::new(
+            entry_id.clone(),
+            JournalAction::Update,
+            Some(format!("update {field}")),
+            None,
+        ),
+        JournalOperation::Delete { entry_id } => JournalEntryView::new(
+            entry_id.clone(),
+            JournalAction::Delete,
+            Some(String::from("delete entry")),
+            None,
+        ),
+    }
+}
+
+#[cfg(any(target_arch = "xtensa", test))]
 fn new_ui_runtime() -> UiRuntime {
     UiRuntime::new(
-        Box::new(SyncVaultViewModel::from_system()),
+        Box::new(SystemVaultViewModel::from_system()),
         Box::new(GlobalTotpProvider::new()),
     )
 }
@@ -40,14 +109,22 @@ pub fn sync_context() -> &'static Mutex<UiMutex, SyncContext> {
 }
 
 pub fn replace_sync_context(new_ctx: SyncContext) {
-    sync_context().lock(|ctx| *ctx = new_ctx);
+    with_sync_context_mut(|ctx| *ctx = new_ctx);
+}
+
+fn with_sync_context_mut<R>(f: impl FnOnce(&mut SyncContext) -> R) -> R {
+    // Safety: `UiMutex` uses critical sections to provide exclusive access and the helper is
+    // only called from non-reentrant contexts, so it is safe to request mutable access here.
+    unsafe { sync_context().lock_mut(f) }
 }
 
 pub type UiCommandSender = ChannelSender<'static, UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH>;
 pub type UiCommandReceiver = ChannelReceiver<'static, UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH>;
 pub type UiFrameReceiver = WatchReceiver<'static, UiMutex, Frame, UI_STATE_SUBSCRIBERS>;
 pub type UiScreenReceiver = WatchReceiver<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBERS>;
+#[cfg(any(target_arch = "xtensa", test))]
 type UiFrameSender = WatchSender<'static, UiMutex, Frame, UI_STATE_SUBSCRIBERS>;
+#[cfg(any(target_arch = "xtensa", test))]
 type UiScreenSender = WatchSender<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBERS>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +184,7 @@ pub async fn ui_task() {
     }
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn handle_ui_message(runtime: &mut UiRuntime, message: UiTaskMessage) {
     let effect = match message {
         UiTaskMessage::Key(event) => runtime.handle_key_event(event),
@@ -116,6 +194,7 @@ fn handle_ui_message(runtime: &mut UiRuntime, message: UiTaskMessage) {
     dispatch_ui_effect(runtime, effect);
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn dispatch_ui_effect(runtime: &mut UiRuntime, effect: UiEffect) {
     match effect {
         UiEffect::UnlockRequested { pin } => {
@@ -128,9 +207,10 @@ fn dispatch_ui_effect(runtime: &mut UiRuntime, effect: UiEffect) {
     }
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn handle_unlock_request(runtime: &mut UiRuntime, pin: String) {
-    let mut pin_bytes = Zeroizing::new(pin.into_bytes());
-    let (result, status) = sync_context().lock(|ctx| {
+    let pin_bytes = Zeroizing::new(pin.into_bytes());
+    let (result, status) = with_sync_context_mut(|ctx| {
         let now = ctx.current_time_ms();
         let result = ctx.unlock_with_pin(pin_bytes.as_slice(), now);
         let status = ctx.pin_lock_status(now);
@@ -143,15 +223,18 @@ fn handle_unlock_request(runtime: &mut UiRuntime, pin: String) {
     }
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn publish_ui_state(runtime: &UiRuntime) {
     frame_sender().send(runtime.render());
     screen_sender().send(runtime.screen());
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn frame_sender() -> UiFrameSender {
     UI_FRAMES.sender()
 }
 
+#[cfg(any(target_arch = "xtensa", test))]
 fn screen_sender() -> UiScreenSender {
     UI_SCREENS.sender()
 }
@@ -160,13 +243,13 @@ fn screen_sender() -> UiScreenSender {
 mod tests {
     use super::*;
     use crate::crypto::PIN_WIPE_THRESHOLD;
-    use crate::ui::{input::UiCommand, render::ViewContent};
+    use crate::ui::{UiCommand, ViewContent};
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
     fn setup_context(pin: &str) -> UiRuntime {
         replace_sync_context(SyncContext::new());
-        sync_context().lock(|ctx| {
+        with_sync_context_mut(|ctx| {
             let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
             ctx.test_configure_pin(pin.as_bytes(), &mut rng)
                 .expect("configure pin");
@@ -224,7 +307,7 @@ mod tests {
             if let Some(remaining) = lock.backoff_remaining_ms {
                 saw_backoff = true;
                 assert!(lock.prompt.contains("Try again"));
-                sync_context().lock(|ctx| {
+                with_sync_context_mut(|ctx| {
                     let now = ctx.current_time_ms();
                     ctx.test_set_current_time_ms(now.saturating_add(remaining + 1));
                 });

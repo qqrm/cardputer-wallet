@@ -45,20 +45,6 @@ pub enum TransportState {
 }
 
 impl TransportState {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => TransportState::Waiting,
-            2 => TransportState::Connecting,
-            3 => TransportState::Connected,
-            4 => TransportState::Error,
-            _ => TransportState::Offline,
-        }
-    }
-
-    const fn as_u8(self) -> u8 {
-        self as u8
-    }
-
     fn description(self) -> &'static str {
         match self {
             TransportState::Offline => "offline",
@@ -112,7 +98,7 @@ type WatchMutex = CriticalSectionRawMutex;
 const TRANSPORT_RECEIVER_LIMIT: usize = 4;
 
 static TRANSPORT_WATCH: Watch<WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT> =
-    Watch::new_with(default_transport());
+    Watch::new();
 
 pub type TransportReceiver =
     Receiver<'static, WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT>;
@@ -143,7 +129,7 @@ fn sender() -> TransportSender {
     TRANSPORT_WATCH.sender()
 }
 
-fn modify_transport(update: impl FnOnce(&mut TransportIndicators)) {
+fn modify_transport(update: impl Fn(&mut TransportIndicators)) {
     sender().send_if_modified(|state| {
         let mut indicators = state.clone().unwrap_or_else(default_transport);
         let before = indicators.clone();
