@@ -369,12 +369,16 @@ mod tests {
         let mut ui = fixtures::build_runtime(vault);
 
         ui.apply_command(UiCommand::Activate);
+        ui.apply_command(UiCommand::MoveSelectionDown);
+        ui.apply_command(UiCommand::MoveSelectionDown);
         ui.apply_command(UiCommand::EditEntry);
         ui.apply_command(UiCommand::InsertChar('x'));
         ui.apply_command(UiCommand::Lock);
         assert_eq!(ui.screen(), UiScreen::Lock);
 
         ui.apply_command(UiCommand::Activate);
+        ui.apply_command(UiCommand::MoveSelectionDown);
+        ui.apply_command(UiCommand::MoveSelectionDown);
         ui.apply_command(UiCommand::EditEntry);
         let frame = ui.render();
 

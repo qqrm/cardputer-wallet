@@ -325,8 +325,8 @@ mod tasks {
         channel::{Channel, Receiver, Sender},
         signal::Signal,
     };
-    use embassy_time::Timer;
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+    use embassy_time::Timer;
     use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
@@ -417,6 +417,33 @@ mod tasks {
     #[task]
     pub async fn frame_worker(
         mut jobs: HostFrameReceiver,
+        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
+    ) {
+        let mut boot_state = boot_signal.wait().await;
+        if let Err(error) = &boot_state {
+            log_boot_failure(error);
+        }
+
+        loop {
+            if let Some(updated) = boot_signal.try_take() {
+                if let Err(error) = &updated {
+                    log_boot_failure(error);
+                }
+                boot_state = updated;
+            }
+
+            let mut job = jobs.receive().await;
+            let response = match boot_state.as_mut() {
+                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
+                    .map_err(HostFrameError::Protocol),
+                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
+            };
+
+            job.response.signal(response);
+        }
+    }
+
+    #[task]
     pub async fn time_broadcast() {
         let mut receiver = time::time_receiver();
         let mut clock = CalibratedClock::new();
@@ -446,39 +473,6 @@ mod tasks {
                     }
                 }
             }
-        }
-    }
-
-    #[task]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn cdc_server(
-        mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut control: ControlChanged<'static>,
-        mut events: UsbEventReceiver,
-        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
-    ) {
-        let mut boot_state = boot_signal.wait().await;
-        if let Err(error) = &boot_state {
-            log_boot_failure(error);
-        }
-
-        loop {
-            if let Some(updated) = boot_signal.try_take() {
-                if let Err(error) = &updated {
-                    log_boot_failure(error);
-                }
-                boot_state = updated;
-            }
-
-            let mut job = jobs.receive().await;
-            let response = match boot_state.as_mut() {
-                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
-                    .map_err(HostFrameError::Protocol),
-                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
-            };
-
-            job.response.signal(response);
         }
     }
 

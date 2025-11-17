@@ -45,6 +45,7 @@ pub enum TransportState {
 }
 
 impl TransportState {
+    #[cfg(target_arch = "xtensa")]
     fn from_u8(value: u8) -> Self {
         match value {
             1 => TransportState::Waiting,
@@ -55,6 +56,7 @@ impl TransportState {
         }
     }
 
+    #[cfg(target_arch = "xtensa")]
     const fn as_u8(self) -> u8 {
         self as u8
     }

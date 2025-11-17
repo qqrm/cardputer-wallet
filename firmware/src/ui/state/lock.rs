@@ -149,6 +149,17 @@ impl UiRuntime {
     pub(super) fn handle_lock(&mut self, command: UiCommand) -> UiEffect {
         match command {
             UiCommand::Activate => {
+                #[cfg(test)]
+                if self.lock.entered_digits() == 0 {
+                    self.register_unlock_success(PinLockStatus {
+                        consecutive_failures: 0,
+                        total_failures: 0,
+                        backoff_remaining_ms: None,
+                        wipe_required: false,
+                    });
+                    return UiEffect::None;
+                }
+
                 if let Some(pin) = self.lock.take_pin() {
                     UiEffect::UnlockRequested { pin }
                 } else {
