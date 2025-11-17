@@ -5,11 +5,11 @@ edition = "2024"
 
 [features]
 default = ["std"]
-std = ["serde/std", "thiserror"]
+std = ["serde/std"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-thiserror = { version = "2", default-features = false, optional = true }
+thiserror = { version = "2", default-features = false }
 crc32fast = { version = "1", default-features = false }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 postcard-schema = { version = "0.2", default-features = false, features = ["derive", "alloc"] }
