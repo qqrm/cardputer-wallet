@@ -170,6 +170,7 @@ pub mod runtime {
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
+    use crate::system;
     use embassy_executor::Executor;
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
@@ -276,6 +277,10 @@ pub mod runtime {
                 .spawn(super::tasks::usb_device(usb_device))
                 .expect("spawn USB device task");
             spawner
+                .spawn(super::tasks::time_broadcast())
+                .expect("spawn time broadcast task");
+            spawner.spawn(system::ui_task()).expect("spawn UI task");
+            spawner
                 .spawn(super::tasks::flash_restore_task(
                     flash,
                     &FLASH_RESTORE_SIGNAL,
@@ -304,12 +309,13 @@ mod tasks {
     use super::usb::{UsbEventReceiver, UsbTransportEvent};
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
+    use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
-    use embassy_time::Timer;
+    use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
         class::cdc_acm::{BufferedReceiver, ControlChanged, Sender},
@@ -355,6 +361,39 @@ mod tasks {
 
             if retry_delay_ms > 0 {
                 Timer::after_millis(retry_delay_ms).await;
+            }
+        }
+    }
+
+    #[task]
+    pub async fn time_broadcast() {
+        let mut receiver = time::time_receiver();
+        let mut clock = CalibratedClock::new();
+
+        let mut current_time = receiver.try_get().unwrap_or(0);
+        if current_time > 0 {
+            clock.set_time_ms(current_time);
+        } else {
+            current_time = clock.current_time_ms();
+        }
+
+        time::publish_time(current_time);
+
+        let mut ticker = Ticker::every(Duration::from_millis(1_000));
+
+        loop {
+            match select(ticker.next(), receiver.changed()).await {
+                Either::First(_) => {
+                    let now_ms = clock.current_time_ms();
+                    current_time = now_ms;
+                    time::publish_time(now_ms);
+                }
+                Either::Second(now_ms) => {
+                    if now_ms != current_time {
+                        clock.set_time_ms(now_ms);
+                        current_time = now_ms;
+                    }
+                }
             }
         }
     }

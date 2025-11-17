@@ -164,6 +164,14 @@ pub type UiScreenReceiver = WatchReceiver<'static, UiMutex, UiScreen, UI_STATE_S
 type UiFrameSender = WatchSender<'static, UiMutex, Frame, UI_STATE_SUBSCRIBERS>;
 type UiScreenSender = WatchSender<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBERS>;
 
+#[cfg(any(test, feature = "ui-tests", target_arch = "xtensa"))]
+const _: () = {
+    fn assert_send_static<T: Send + 'static>() {}
+
+    assert_send_static::<UiCommandReceiver>();
+    assert_send_static::<UiFrameReceiver>();
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiTaskMessage {
     Key(KeyEvent),
