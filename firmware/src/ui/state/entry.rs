@@ -596,41 +596,14 @@ mod tests {
 
     #[test]
     fn search_results_follow_spec_sorting() {
-        let mut entries = vec![
-            EntrySummary {
-                id: String::from("alpha"),
-                title: String::from("Alpha"),
-                username: String::from("admin"),
-                last_used: String::from("2024-01-03"),
-                totp: None,
-                note: None,
-            },
-            EntrySummary {
-                id: String::from("alpine"),
-                title: String::from("Alpine"),
-                username: String::from("ops"),
-                last_used: String::from("2024-01-02"),
-                totp: None,
-                note: None,
-            },
-            EntrySummary {
-                id: String::from("gamma"),
-                title: String::from("Gamma"),
-                username: String::from("alx"),
-                last_used: String::from("2024-01-10"),
-                totp: None,
-                note: None,
-            },
-            EntrySummary {
-                id: String::from("omega"),
-                title: String::from("Omega"),
-                username: String::from("user"),
-                last_used: String::from("2024-02-01"),
-                totp: None,
-                note: None,
-            },
-        ];
-        entries.extend(super::super::fixtures::sample_entries());
+        let mut entries = super::super::fixtures::generate_entries(
+            super::super::fixtures::EntryFixtureConfig::newest_first(4, false),
+        );
+        entries[1].id = String::from("alpine");
+        entries[1].title = String::from("Alpine");
+        entries[1].username = String::from("ops");
+        entries[2].username = String::from("alx");
+        entries[2].last_used = String::from("2024-01-10");
         let vault = super::super::fixtures::MemoryVault::new(entries);
         let mut ui = super::super::fixtures::build_runtime(vault);
         super::super::fixtures::press(&mut ui, PhysicalKey::Enter);
