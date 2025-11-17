@@ -4,3 +4,6 @@
 - The firmware platform is standardized on the Embassy framework for executors, async traits, and hardware abstraction layers.
 - Always prefer Embassy ecosystem crates (embassy-executor, embassy-usb, embassy-time, embassy-sync, etc.) when adding runtime capabilities.
 - When an Embassy crate does not cover the needed functionality, document the gap and rationale with the change before adopting third-party or bespoke alternatives.
+
+## CI parity requirement
+- Before opening any pull request, run the complete set of CI checks locally and fix all issues so the branch matches pipeline expectations.
