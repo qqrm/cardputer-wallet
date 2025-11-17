@@ -170,8 +170,7 @@ pub mod runtime {
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
-    use crate::system;
-    use embassy_executor::Executor;
+    use embassy_executor::{Executor, SpawnError};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
@@ -185,6 +184,7 @@ pub mod runtime {
         timer::timg::TimerGroup,
     };
     use esp_storage::{FlashStorage, FlashStorageError};
+    use firmware::system;
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -216,6 +216,13 @@ pub mod runtime {
     type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     static mut USB_EP_OUT_BUFFER: [u8; 1024] = [0; 1024];
+
+    fn spawn_or_log(name: &str, result: Result<(), SpawnError>) {
+        if let Err(error) = result {
+            log::error!("Failed to spawn {name}: {error:?}");
+            panic!("failed to spawn {name}: {error:?}");
+        }
+    }
 
     pub fn main() -> ! {
         init_allocator();
@@ -270,23 +277,27 @@ pub mod runtime {
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
             let ble_actions = actions::action_receiver();
-            spawner
-                .spawn(super::tasks::ble_profile(ble_actions))
-                .expect("spawn BLE task");
-            spawner
-                .spawn(super::tasks::usb_device(usb_device))
-                .expect("spawn USB device task");
-            spawner
-                .spawn(super::tasks::time_broadcast())
-                .expect("spawn time broadcast task");
-            spawner.spawn(system::ui_task()).expect("spawn UI task");
-            spawner
-                .spawn(super::tasks::flash_restore_task(
+            spawn_or_log(
+                "BLE task",
+                spawner.spawn(super::tasks::ble_profile(ble_actions)),
+            );
+            spawn_or_log(
+                "USB device task",
+                spawner.spawn(super::tasks::usb_device(usb_device)),
+            );
+            spawn_or_log(
+                "time broadcast task",
+                spawner.spawn(super::tasks::time_broadcast()),
+            );
+            spawn_or_log("UI task", spawner.spawn(system::ui_task()));
+            spawn_or_log(
+                "flash restore task",
+                spawner.spawn(super::tasks::flash_restore_task(
                     flash,
                     &FLASH_RESTORE_SIGNAL,
                     FLASH_RESTORE_DELAY_MS,
-                ))
-                .expect("spawn flash restore task");
+                )),
+            );
             let frame_jobs = super::tasks::host_frame_receiver();
             let frame_responses = super::tasks::host_frame_response_sender();
             spawner
@@ -294,16 +305,17 @@ pub mod runtime {
                     frame_jobs,
                     frame_responses,
                     &FLASH_RESTORE_SIGNAL,
-                ))
-                .expect("spawn frame worker task");
-            spawner
-                .spawn(super::tasks::cdc_server(
+                )),
+            );
+            spawn_or_log(
+                "CDC task",
+                spawner.spawn(super::tasks::cdc_server(
                     buffered_receiver,
                     cdc_sender,
                     cdc_control,
                     usb_events,
-                ))
-                .expect("spawn CDC task");
+                )),
+            );
         });
     }
 }
