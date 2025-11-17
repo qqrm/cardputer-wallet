@@ -1,16 +1,14 @@
-use std::io::{Read, Write};
-
 use shared::error::SharedError;
 use shared::schema::{AckRequest, HostRequest, PROTOCOL_VERSION};
 
 use crate::RepoArgs;
 use crate::artifacts::load_sync_state;
-use crate::commands::print_repo_banner;
+use crate::commands::{DeviceTransport, print_repo_banner};
 use crate::transport::{handle_device_response, read_device_response, send_host_request};
 
 pub fn run<P>(port: &mut P, args: &RepoArgs) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    P: DeviceTransport + ?Sized,
 {
     print_repo_banner(args);
 

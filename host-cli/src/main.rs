@@ -1,3 +1,4 @@
+mod application;
 mod artifacts;
 mod commands;
 mod constants;
@@ -12,6 +13,8 @@ mod tests;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use shared::error::SharedError;
+
+use crate::application::SerialTransportProvider;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cardputer host command line interface")]
@@ -73,7 +76,9 @@ pub struct SetTimeArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = commands::run(cli) {
+    let provider = SerialTransportProvider;
+
+    if let Err(err) = application::execute(cli, &provider) {
         match &err {
             SharedError::Transport(_) => {
                 eprintln!("Transport failure: {err}");

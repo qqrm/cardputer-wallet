@@ -1,13 +1,12 @@
-use std::io::{Read, Write};
-
 use shared::error::SharedError;
 use shared::schema::{HostRequest, PROTOCOL_VERSION, StatusRequest};
 
+use crate::commands::DeviceTransport;
 use crate::transport::{handle_device_response, read_device_response, send_host_request};
 
 pub fn run<P>(port: &mut P) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    P: DeviceTransport + ?Sized,
 {
     let request = HostRequest::Status(StatusRequest {
         protocol_version: PROTOCOL_VERSION,

@@ -1,15 +1,15 @@
-use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use shared::error::SharedError;
 use shared::schema::{GetTimeRequest, HostRequest, PROTOCOL_VERSION, SetTimeRequest};
 
 use crate::SetTimeArgs;
+use crate::commands::DeviceTransport;
 use crate::transport::{handle_device_response, read_device_response, send_host_request};
 
 pub fn run<P>(port: &mut P, args: &SetTimeArgs) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    P: DeviceTransport + ?Sized,
 {
     let epoch = if args.system {
         SystemTime::now()
@@ -37,7 +37,7 @@ where
 
 pub fn run_get_time<P>(port: &mut P) -> Result<(), SharedError>
 where
-    P: Read + Write + ?Sized,
+    P: DeviceTransport + ?Sized,
 {
     let request = HostRequest::GetTime(GetTimeRequest {
         protocol_version: PROTOCOL_VERSION,
