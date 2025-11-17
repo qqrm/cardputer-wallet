@@ -1,5 +1,5 @@
 #[cfg(any(test, target_arch = "xtensa"))]
-use alloc::{boxed::Box, format, string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::{Channel, Receiver as ChannelReceiver, Sender as ChannelSender};
@@ -18,7 +18,9 @@ use crate::ui::{Frame, KeyEvent, UiCommand, UiEffect, UiScreen};
 #[cfg(any(test, target_arch = "xtensa"))]
 use crate::totp::GlobalTotpProvider;
 #[cfg(any(test, target_arch = "xtensa"))]
-use crate::ui::{EntrySummary, JournalAction, JournalEntryView, UiRuntime, VaultViewModel};
+use crate::ui::{
+    EntrySummary, JournalEntryView, UiRuntime, VaultViewModel, journal::JournalOperationViewExt,
+};
 
 #[cfg(any(test, target_arch = "xtensa"))]
 use shared::schema::JournalOperation;
@@ -81,38 +83,9 @@ impl VaultViewModel for SyncVaultViewModel {
         sync_context()
             .lock(|ctx| ctx.journal_operations())
             .into_iter()
-            .map(|operation| to_journal_entry(&entries, operation))
+            .map(|operation| operation.into_view(&entries))
             .collect()
     }
-}
-
-#[cfg(any(test, target_arch = "xtensa"))]
-fn to_journal_entry(entries: &[VaultEntry], operation: JournalOperation) -> JournalEntryView {
-    let (entry_id, action, description) = match operation {
-        JournalOperation::Add { entry_id } => (
-            entry_id.clone(),
-            JournalAction::Add,
-            find_entry_title(entries, &entry_id),
-        ),
-        JournalOperation::UpdateField {
-            entry_id, field, ..
-        } => (
-            entry_id.clone(),
-            JournalAction::Update,
-            Some(format!("update {field}")),
-        ),
-        JournalOperation::Delete { entry_id } => (entry_id, JournalAction::Delete, None),
-    };
-
-    JournalEntryView::new(entry_id, action, description, None)
-}
-
-#[cfg(any(test, target_arch = "xtensa"))]
-fn find_entry_title(entries: &[VaultEntry], entry_id: &str) -> Option<String> {
-    entries
-        .iter()
-        .find(|entry| entry.id.to_string() == entry_id)
-        .map(entry_title)
 }
 
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -125,11 +98,6 @@ fn to_entry_summary(entry: VaultEntry) -> EntrySummary {
         totp: entry.totp.map(|_| String::from("totp")),
         note: entry.r#macro,
     }
-}
-
-#[cfg(any(test, target_arch = "xtensa"))]
-fn entry_title(entry: &VaultEntry) -> String {
-    entry.title.clone()
 }
 
 #[cfg(any(test, target_arch = "xtensa"))]

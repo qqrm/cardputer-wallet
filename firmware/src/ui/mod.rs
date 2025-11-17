@@ -8,12 +8,14 @@
 
 mod data;
 mod input;
+pub mod journal;
 mod render;
 mod state;
 pub mod transport;
 
 pub use data::{JournalAction, JournalEntryView, TotpProvider, TotpSnapshot, VaultViewModel};
 pub use input::{KeyEvent, KeyModifiers, Keymap, PhysicalKey, UiCommand};
+pub use journal::JournalOperationViewExt;
 pub use render::{
     EditView, EntryView, Frame, HintBar, HintItem, HomeView, LockView, RecentList, SearchWidget,
     SettingsView, SyncView, TotpWidget, ViewContent,
