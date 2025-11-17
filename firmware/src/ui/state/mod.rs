@@ -239,6 +239,7 @@ pub(super) mod fixtures {
     use alloc::{string::String, vec, vec::Vec};
 
     use super::*;
+    use crate::crypto::PinLockStatus;
     use crate::ui::{
         JournalEntryView, TotpSnapshot,
         input::{KeyEvent, PhysicalKey},
@@ -301,7 +302,7 @@ pub(super) mod fixtures {
                 id: String::from("alpha"),
                 title: String::from("Alpha"),
                 username: String::from("admin"),
-                last_used: String::from("2024-01-01"),
+                last_used: String::from("2024-01-03"),
                 totp: None,
                 note: None,
             },
@@ -317,7 +318,7 @@ pub(super) mod fixtures {
                 id: String::from("gamma"),
                 title: String::from("Gamma"),
                 username: String::from("admin"),
-                last_used: String::from("2024-01-03"),
+                last_used: String::from("2024-01-01"),
                 totp: Some(String::from("config")),
                 note: None,
             },
@@ -329,8 +330,35 @@ pub(super) mod fixtures {
         UiRuntime::new(Box::new(vault), Box::new(NullTotpProvider))
     }
 
+    fn unlocked_status() -> PinLockStatus {
+        PinLockStatus {
+            consecutive_failures: 0,
+            total_failures: 0,
+            backoff_remaining_ms: None,
+            wipe_required: false,
+        }
+    }
+
+    fn handle_effects(ui: &mut UiRuntime, effect: UiEffect, force_unlock: bool) {
+        match effect {
+            UiEffect::UnlockRequested { .. } => ui.register_unlock_success(unlocked_status()),
+            _ if force_unlock && ui.screen() == UiScreen::Lock => {
+                ui.register_unlock_success(unlocked_status())
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn apply(ui: &mut UiRuntime, command: UiCommand) {
+        let effect = ui.apply_command(command);
+        let force_unlock = matches!(command, UiCommand::Activate);
+        handle_effects(ui, effect, force_unlock);
+    }
+
     pub(super) fn press(ui: &mut UiRuntime, key: PhysicalKey) {
-        ui.handle_key_event(KeyEvent::pressed(key));
+        let effect = ui.handle_key_event(KeyEvent::pressed(key));
+        let force_unlock = matches!(key, PhysicalKey::Enter);
+        handle_effects(ui, effect, force_unlock);
     }
 }
 
@@ -344,14 +372,14 @@ mod tests {
         let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
         let mut ui = fixtures::build_runtime(vault);
 
-        ui.apply_command(UiCommand::Activate);
-        ui.apply_command(UiCommand::InsertChar('a'));
-        ui.apply_command(UiCommand::InsertChar('l'));
-        ui.apply_command(UiCommand::MoveSelectionDown);
-        ui.apply_command(UiCommand::Lock);
+        fixtures::apply(&mut ui, UiCommand::Activate);
+        fixtures::apply(&mut ui, UiCommand::InsertChar('a'));
+        fixtures::apply(&mut ui, UiCommand::InsertChar('l'));
+        fixtures::apply(&mut ui, UiCommand::MoveSelectionDown);
+        fixtures::apply(&mut ui, UiCommand::Lock);
         assert_eq!(ui.screen(), UiScreen::Lock);
 
-        ui.apply_command(UiCommand::Activate);
+        fixtures::apply(&mut ui, UiCommand::Activate);
         let frame = ui.render();
 
         match frame.content {
@@ -368,14 +396,14 @@ mod tests {
         let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
         let mut ui = fixtures::build_runtime(vault);
 
-        ui.apply_command(UiCommand::Activate);
-        ui.apply_command(UiCommand::EditEntry);
-        ui.apply_command(UiCommand::InsertChar('x'));
-        ui.apply_command(UiCommand::Lock);
+        fixtures::apply(&mut ui, UiCommand::Activate);
+        fixtures::apply(&mut ui, UiCommand::EditEntry);
+        fixtures::apply(&mut ui, UiCommand::InsertChar('x'));
+        fixtures::apply(&mut ui, UiCommand::Lock);
         assert_eq!(ui.screen(), UiScreen::Lock);
 
-        ui.apply_command(UiCommand::Activate);
-        ui.apply_command(UiCommand::EditEntry);
+        fixtures::apply(&mut ui, UiCommand::Activate);
+        fixtures::apply(&mut ui, UiCommand::EditEntry);
         let frame = ui.render();
 
         match frame.content {
