@@ -32,6 +32,7 @@ use shared::schema::{
     decode_host_request, decode_journal_operations, encode_device_response,
 };
 use shared::transfer::{ArtifactLengths, ArtifactStream};
+use shared::vault::VaultEntry;
 use zeroize::Zeroizing;
 
 /// Maximum payload size (in bytes) that a single postcard frame is allowed to occupy on the wire.
@@ -448,6 +449,14 @@ impl SyncContext {
 
     pub fn current_time_ms(&self) -> u64 {
         self.clock.current_time_ms()
+    }
+
+    pub fn journal_operations(&self) -> Vec<JournalOperation> {
+        self.journal_ops.clone()
+    }
+
+    pub fn vault_entries(&self) -> Vec<VaultEntry> {
+        postcard_from_bytes(self.vault_image.as_slice()).unwrap_or_default()
     }
 
     pub fn set_epoch_time_ms(&mut self, epoch_ms: u64) -> u64 {

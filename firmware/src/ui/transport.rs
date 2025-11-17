@@ -112,7 +112,7 @@ type WatchMutex = CriticalSectionRawMutex;
 const TRANSPORT_RECEIVER_LIMIT: usize = 4;
 
 static TRANSPORT_WATCH: Watch<WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT> =
-    Watch::new_with(default_transport());
+    Watch::new();
 
 pub type TransportReceiver =
     Receiver<'static, WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT>;
@@ -143,14 +143,12 @@ fn sender() -> TransportSender {
     TRANSPORT_WATCH.sender()
 }
 
-fn modify_transport(update: impl FnOnce(&mut TransportIndicators)) {
+fn modify_transport(update: impl Fn(&mut TransportIndicators)) {
     sender().send_if_modified(|state| {
-        let mut indicators = state.clone().unwrap_or_else(default_transport);
+        let indicators = state.get_or_insert_with(default_transport);
         let before = indicators.clone();
-        update(&mut indicators);
-        let changed = indicators != before;
-        *state = Some(indicators);
-        changed
+        update(indicators);
+        *indicators != before
     });
 }
 
