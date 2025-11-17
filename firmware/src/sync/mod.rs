@@ -1085,6 +1085,7 @@ impl SyncContext {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use futures::executor::block_on;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
     use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
@@ -1823,7 +1824,7 @@ mod tests {
         let key_record = crypto.record().expect("key record");
         let encoded_record = postcard_to_allocvec(&key_record).unwrap();
 
-        crate::storage::block_on(async {
+        block_on(async {
             map::store_item(
                 &mut flash,
                 range.clone(),
@@ -1897,7 +1898,7 @@ mod tests {
         });
 
         let mut ctx = fresh_context();
-        crate::storage::block_on(ctx.load_from_flash(&mut flash, range)).unwrap();
+        block_on(ctx.load_from_flash(&mut flash, range)).unwrap();
 
         assert_eq!(ctx.vault_image.as_slice(), b"vault-image");
         assert_eq!(ctx.recipients_manifest.as_slice(), b"recipients");
@@ -1924,7 +1925,7 @@ mod tests {
         let mut cache = NoCache::new();
         let mut buffer = vec![0u8; STORAGE_DATA_BUFFER_CAPACITY];
 
-        crate::storage::block_on(async {
+        block_on(async {
             map::store_item(
                 &mut flash,
                 range.clone(),
@@ -1948,7 +1949,7 @@ mod tests {
             .unwrap();
         });
 
-        let mut ctx = crate::storage::block_on(crate::storage::initialize_context_from_flash(
+        let mut ctx = block_on(crate::storage::initialize_context_from_flash(
             &mut flash, range,
         ))
         .expect("context from flash");
@@ -1979,7 +1980,7 @@ mod tests {
         let mut cache = NoCache::new();
         let mut buffer = vec![0u8; STORAGE_DATA_BUFFER_CAPACITY];
 
-        crate::storage::block_on(async {
+        block_on(async {
             map::store_item(
                 &mut flash,
                 range.clone(),
@@ -1992,7 +1993,7 @@ mod tests {
             .unwrap();
         });
 
-        let error = crate::storage::block_on(crate::storage::initialize_context_from_flash(
+        let error = block_on(crate::storage::initialize_context_from_flash(
             &mut flash,
             range.clone(),
         ))

@@ -20,8 +20,6 @@ pub use crypto::{
 pub use storage::BootFlash;
 pub use storage::StorageError;
 #[cfg(any(test, target_arch = "xtensa"))]
-pub use storage::block_on;
-#[cfg(any(test, target_arch = "xtensa"))]
 pub use storage::initialize_context_from_flash;
 
 #[cfg(target_arch = "xtensa")]
