@@ -103,4 +103,15 @@ mod tests {
 
         assert_eq!(clock.current_time_ms(), 0);
     }
+
+    #[test]
+    fn receiver_observes_latest_published_time() {
+        // Reset to a known value before publishing updates.
+        publish_time(0);
+
+        let mut receiver = time_receiver();
+        publish_time(42);
+
+        assert_eq!(receiver.try_get(), Some(42));
+    }
 }

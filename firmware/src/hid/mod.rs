@@ -170,8 +170,7 @@ pub mod runtime {
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
-    use crate::system;
-    use embassy_executor::Executor;
+    use embassy_executor::{Executor, SpawnError};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
@@ -185,6 +184,7 @@ pub mod runtime {
         timer::timg::TimerGroup,
     };
     use esp_storage::{FlashStorage, FlashStorageError};
+    use firmware::system;
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -216,6 +216,13 @@ pub mod runtime {
     type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     static mut USB_EP_OUT_BUFFER: [u8; 1024] = [0; 1024];
+
+    fn spawn_or_log(name: &str, result: Result<(), SpawnError>) {
+        if let Err(error) = result {
+            log::error!("Failed to spawn {name}: {error:?}");
+            panic!("failed to spawn {name}: {error:?}");
+        }
+    }
 
     pub fn main() -> ! {
         init_allocator();
@@ -270,38 +277,44 @@ pub mod runtime {
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
             let ble_actions = actions::action_receiver();
-            spawner
-                .spawn(super::tasks::ble_profile(ble_actions))
-                .expect("spawn BLE task");
-            spawner
-                .spawn(super::tasks::usb_device(usb_device))
-                .expect("spawn USB device task");
-            spawner
-                .spawn(super::tasks::time_broadcast())
-                .expect("spawn time broadcast task");
-            spawner.spawn(system::ui_task()).expect("spawn UI task");
-            spawner
-                .spawn(super::tasks::flash_restore_task(
+            spawn_or_log(
+                "BLE task",
+                spawner.spawn(super::tasks::ble_profile(ble_actions)),
+            );
+            spawn_or_log(
+                "USB device task",
+                spawner.spawn(super::tasks::usb_device(usb_device)),
+            );
+            spawn_or_log(
+                "time broadcast task",
+                spawner.spawn(super::tasks::time_broadcast()),
+            );
+            spawn_or_log("UI task", spawner.spawn(system::ui_task()));
+            spawn_or_log(
+                "flash restore task",
+                spawner.spawn(super::tasks::flash_restore_task(
                     flash,
                     &FLASH_RESTORE_SIGNAL,
                     FLASH_RESTORE_DELAY_MS,
-                ))
-                .expect("spawn flash restore task");
+                )),
+            );
             let frame_jobs = super::tasks::host_frame_receiver();
-            spawner
-                .spawn(super::tasks::frame_worker(
+            spawn_or_log(
+                "frame worker task",
+                spawner.spawn(super::tasks::frame_worker(
                     frame_jobs,
                     &FLASH_RESTORE_SIGNAL,
-                ))
-                .expect("spawn frame worker task");
-            spawner
-                .spawn(super::tasks::cdc_server(
+                )),
+            );
+            spawn_or_log(
+                "CDC task",
+                spawner.spawn(super::tasks::cdc_server(
                     buffered_receiver,
                     cdc_sender,
                     cdc_control,
                     usb_events,
-                ))
-                .expect("spawn CDC task");
+                )),
+            );
         });
     }
 }
@@ -325,8 +338,6 @@ mod tasks {
         channel::{Channel, Receiver, Sender},
         signal::Signal,
     };
-    use embassy_time::Timer;
-    use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
@@ -417,6 +428,33 @@ mod tasks {
     #[task]
     pub async fn frame_worker(
         mut jobs: HostFrameReceiver,
+        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
+    ) {
+        let mut boot_state = boot_signal.wait().await;
+        if let Err(error) = &boot_state {
+            log_boot_failure(error);
+        }
+
+        loop {
+            if let Some(updated) = boot_signal.try_take() {
+                if let Err(error) = &updated {
+                    log_boot_failure(error);
+                }
+                boot_state = updated;
+            }
+
+            let mut job = jobs.receive().await;
+            let response = match boot_state.as_mut() {
+                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
+                    .map_err(HostFrameError::Protocol),
+                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
+            };
+
+            job.response.signal(response);
+        }
+    }
+
+    #[task]
     pub async fn time_broadcast() {
         let mut receiver = time::time_receiver();
         let mut clock = CalibratedClock::new();
@@ -446,39 +484,6 @@ mod tasks {
                     }
                 }
             }
-        }
-    }
-
-    #[task]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn cdc_server(
-        mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut control: ControlChanged<'static>,
-        mut events: UsbEventReceiver,
-        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
-    ) {
-        let mut boot_state = boot_signal.wait().await;
-        if let Err(error) = &boot_state {
-            log_boot_failure(error);
-        }
-
-        loop {
-            if let Some(updated) = boot_signal.try_take() {
-                if let Err(error) = &updated {
-                    log_boot_failure(error);
-                }
-                boot_state = updated;
-            }
-
-            let mut job = jobs.receive().await;
-            let response = match boot_state.as_mut() {
-                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
-                    .map_err(HostFrameError::Protocol),
-                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
-            };
-
-            job.response.signal(response);
         }
     }
 
