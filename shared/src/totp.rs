@@ -1,9 +1,7 @@
 use alloc::{format, string::String, vec::Vec};
 
 use data_encoding::BASE32_NOPAD;
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
-use sha2::{Sha256, Sha512};
+use totp_embed::{Sha1, Sha256, Sha512, totp_custom};
 
 use crate::vault::{TotpAlgorithm, TotpConfig};
 
@@ -36,11 +34,19 @@ pub fn generate(config: &TotpConfig, unix_time_ms: u64) -> Result<TotpCode, Totp
     }
 
     let secret = normalize_secret(&config.secret).ok_or(TotpError::InvalidSecret)?;
-    let counter = unix_time_ms / 1_000 / config.period as u64;
-    let hash = hmac_digest(config.algorithm, &secret, counter)?;
-    let value = dynamic_truncate(&hash);
-    let modulo = 10u32.pow(config.digits as u32);
-    let code = format!("{:0width$}", value % modulo, width = config.digits as usize);
+    let digits = config.digits as u32;
+    let code_value = match config.algorithm {
+        TotpAlgorithm::Sha1 => {
+            totp_custom::<Sha1>(config.period as u64, digits, &secret, unix_time_ms / 1_000)
+        }
+        TotpAlgorithm::Sha256 => {
+            totp_custom::<Sha256>(config.period as u64, digits, &secret, unix_time_ms / 1_000)
+        }
+        TotpAlgorithm::Sha512 => {
+            totp_custom::<Sha512>(config.period as u64, digits, &secret, unix_time_ms / 1_000)
+        }
+    };
+    let code = format!("{:0width$}", code_value, width = digits as usize);
     let period_ms = config.period as u32 * 1_000;
     let elapsed = (unix_time_ms % period_ms as u64) as u32;
     let remaining = if elapsed == 0 {
@@ -63,38 +69,6 @@ fn normalize_secret(secret: &str) -> Option<Vec<u8>> {
         .map(|ch| ch.to_ascii_uppercase())
         .collect();
     BASE32_NOPAD.decode(normalized.as_bytes()).ok()
-}
-
-type HmacSha1 = Hmac<Sha1>;
-type HmacSha256 = Hmac<Sha256>;
-type HmacSha512 = Hmac<Sha512>;
-
-fn hmac_digest(algorithm: TotpAlgorithm, key: &[u8], counter: u64) -> Result<Vec<u8>, TotpError> {
-    let counter_bytes = counter.to_be_bytes();
-    match algorithm {
-        TotpAlgorithm::Sha1 => {
-            let mut mac = HmacSha1::new_from_slice(key).map_err(|_| TotpError::InvalidSecret)?;
-            mac.update(&counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
-        }
-        TotpAlgorithm::Sha256 => {
-            let mut mac = HmacSha256::new_from_slice(key).map_err(|_| TotpError::InvalidSecret)?;
-            mac.update(&counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
-        }
-        TotpAlgorithm::Sha512 => {
-            let mut mac = HmacSha512::new_from_slice(key).map_err(|_| TotpError::InvalidSecret)?;
-            mac.update(&counter_bytes);
-            Ok(mac.finalize().into_bytes().to_vec())
-        }
-    }
-}
-
-fn dynamic_truncate(hash: &[u8]) -> u32 {
-    let offset = (hash.last().cloned().unwrap_or(0) & 0x0F) as usize;
-    let slice = &hash[offset..offset + 4];
-    let value = u32::from_be_bytes(slice.try_into().unwrap());
-    value & 0x7FFF_FFFF
 }
 
 #[cfg(test)]
