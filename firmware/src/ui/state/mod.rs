@@ -148,6 +148,11 @@ impl UiRuntime {
         }
     }
 
+    /// Align time-aware widgets with the system clock.
+    pub fn sync_time(&mut self, now_ms: u64) {
+        self.totp.sync_time(now_ms);
+    }
+
     /// Advance time for the TOTP countdown.
     pub fn tick(&mut self, elapsed_ms: u32) {
         self.lock.tick(elapsed_ms);
@@ -284,6 +289,8 @@ pub(super) mod fixtures {
         fn snapshot(&self) -> TotpSnapshot {
             TotpSnapshot::empty(DEFAULT_TOTP_PERIOD)
         }
+
+        fn sync_time(&mut self, _now_ms: u64) {}
 
         fn tick(&mut self, _elapsed_ms: u32) {}
     }

@@ -81,6 +81,9 @@ pub trait TotpProvider {
     /// Snapshot of the active TOTP code and countdown.
     fn snapshot(&self) -> TotpSnapshot;
 
+    /// Synchronise the provider with the current wall-clock time.
+    fn sync_time(&mut self, now_ms: u64);
+
     /// Advance the countdown timer.
     fn tick(&mut self, elapsed_ms: u32);
 }

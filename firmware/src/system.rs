@@ -5,12 +5,14 @@ use embassy_sync::watch::{Receiver as WatchReceiver, Sender as WatchSender, Watc
 use static_cell::StaticCell;
 
 use crate::sync::SyncContext;
+#[cfg(target_arch = "xtensa")]
+use crate::time;
 use crate::totp::GlobalTotpProvider;
 use crate::ui::{Frame, KeyEvent, SyncVaultViewModel, UiCommand, UiEffect, UiRuntime, UiScreen};
 use zeroize::Zeroizing;
 
 #[cfg(target_arch = "xtensa")]
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 #[cfg(target_arch = "xtensa")]
 use embassy_time::{Duration, Ticker};
 
@@ -78,19 +80,27 @@ pub fn ui_effect_signal() -> &'static Signal<UiMutex, UiEffect> {
 #[embassy_executor::task]
 pub async fn ui_task() {
     let mut runtime = new_ui_runtime();
+    let mut time_rx = time::time_receiver();
+    if let Some(now_ms) = time_rx.try_get() {
+        runtime.sync_time(now_ms);
+    }
     publish_ui_state(&runtime);
 
     let receiver = ui_command_receiver();
     let mut ticker = Ticker::every(Duration::from_millis(UI_TICK_MS));
 
     loop {
-        match select(receiver.receive(), ticker.next()).await {
-            Either::First(message) => {
+        match select3(receiver.receive(), ticker.next(), time_rx.changed()).await {
+            Either3::First(message) => {
                 handle_ui_message(&mut runtime, message);
                 publish_ui_state(&runtime);
             }
-            Either::Second(_) => {
+            Either3::Second(_) => {
                 runtime.tick(UI_TICK_MS as u32);
+                publish_ui_state(&runtime);
+            }
+            Either3::Third(now_ms) => {
+                runtime.sync_time(now_ms);
                 publish_ui_state(&runtime);
             }
         }

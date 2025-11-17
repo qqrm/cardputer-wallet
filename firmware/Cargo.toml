@@ -33,6 +33,9 @@ shared = { path = "../shared", default-features = false, features = ["std"] }
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }
 sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 
+[target.'cfg(not(target_arch = "xtensa"))'.dependencies]
+embassy-time = { version = "0.5.0", default-features = false, features = ["std"] }
+
 [[bin]]
 name = "cardputer-firmware"
 path = "./src/bin/main.rs"
