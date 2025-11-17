@@ -33,6 +33,7 @@ shared = { path = "../shared", default-features = false, features = ["std"] }
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }
 sequential-storage = { version = "5.0.1", default-features = false, features = ["alloc", "_test"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+uuid = "1.10"
 
 [target.'cfg(not(target_arch = "xtensa"))'.dependencies]
 embassy-time = { version = "0.5.0", default-features = false, features = ["std"] }
