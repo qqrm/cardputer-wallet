@@ -742,9 +742,10 @@ fn handle_hello(
     ctx.reset_transfer_state();
 
     #[cfg(any(test, target_arch = "xtensa"))]
-    crate::hid::actions::publish(DeviceAction::StartSession {
+    crate::hid::actions::queue_for_ui(DeviceAction::StartSession {
         session_id: ctx.session_id,
-    });
+    })
+    .expect("queue BLE session start");
 
     Ok(DeviceResponse::Hello(HelloResponse {
         protocol_version: PROTOCOL_VERSION,
@@ -937,7 +938,7 @@ fn handle_ack(ack: &AckRequest, ctx: &mut SyncContext) -> Result<DeviceResponse,
         ctx.wipe_sensitive();
 
         #[cfg(any(test, target_arch = "xtensa"))]
-        crate::hid::actions::publish(DeviceAction::EndSession);
+        crate::hid::actions::queue_for_ui(DeviceAction::EndSession).expect("queue BLE session end");
 
         Ok(DeviceResponse::Ack(AckResponse {
             protocol_version: PROTOCOL_VERSION,

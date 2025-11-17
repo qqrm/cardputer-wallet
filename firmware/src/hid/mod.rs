@@ -7,17 +7,22 @@ pub mod actions {
     use crate::ui::transport::{self, TransportState};
     use alloc::{boxed::Box, vec::Vec};
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-    use embassy_sync::channel::{Channel, Receiver, Sender};
+    use embassy_sync::{
+        channel::{Channel, Receiver, Sender},
+        mpmc::{Channel as MpmcChannel, Receiver as MpmcReceiver, Sender as MpmcSender},
+    };
     use heapless::Vec as HeaplessVec;
 
     type QueueMutex = CriticalSectionRawMutex;
 
-    const ACTION_QUEUE_DEPTH: usize = 8;
+    pub const ACTION_QUEUE_DEPTH: usize = 8;
     pub const KEYBOARD_ROLLOVER: usize = 6;
     pub const HID_REPORT_SIZE: usize = KEYBOARD_ROLLOVER + 2;
     pub const MACRO_BUFFER_CAPACITY: usize = 32;
 
     static ACTION_CHANNEL: Channel<QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH> = Channel::new();
+    static UI_ACTION_CHANNEL: MpmcChannel<QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH> =
+        MpmcChannel::new();
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum DeviceAction {
@@ -126,6 +131,8 @@ pub mod actions {
 
     pub type ActionSender = Sender<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
     pub type ActionReceiver = Receiver<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
+    pub type UiActionSender = MpmcSender<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
+    pub type UiActionReceiver = MpmcReceiver<'static, QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH>;
 
     pub fn action_sender() -> ActionSender {
         ACTION_CHANNEL.sender()
@@ -135,7 +142,26 @@ pub mod actions {
         ACTION_CHANNEL.receiver()
     }
 
-    pub fn publish(action: DeviceAction) {
+    pub fn ui_action_sender() -> UiActionSender {
+        UI_ACTION_CHANNEL.sender()
+    }
+
+    pub fn ui_action_receiver() -> UiActionReceiver {
+        UI_ACTION_CHANNEL.receiver()
+    }
+
+    pub fn queue_for_ui(action: DeviceAction) -> Result<(), DeviceAction> {
+        if let DeviceAction::StartSession { .. } = &action {
+            transport::set_ble_state(TransportState::Connecting);
+        }
+        if let DeviceAction::EndSession = &action {
+            transport::set_ble_state(TransportState::Waiting);
+        }
+
+        ui_action_sender().try_send(action)
+    }
+
+    pub async fn publish(action: DeviceAction) {
         if let DeviceAction::StartSession { .. } = &action {
             transport::set_ble_state(TransportState::Connecting);
         }
@@ -143,7 +169,15 @@ pub mod actions {
             transport::set_ble_state(TransportState::Waiting);
         }
         let sender = action_sender();
-        let _ = sender.try_send(action);
+        sender.send(action).await;
+    }
+
+    #[embassy_executor::task]
+    pub async fn ui_actions_forwarder(mut receiver: UiActionReceiver) {
+        loop {
+            let action = receiver.receive().await;
+            publish(action).await;
+        }
     }
 
     #[cfg(test)]
@@ -151,16 +185,39 @@ pub mod actions {
         action_sender().clear();
         let receiver = action_receiver();
         while receiver.try_receive().is_ok() {}
+        let ui_receiver = ui_action_receiver();
+        while ui_receiver.try_receive().is_ok() {}
     }
 
     #[cfg(test)]
     pub fn drain() -> Vec<DeviceAction> {
-        let receiver = action_receiver();
         let mut collected = Vec::new();
+        let receiver = action_receiver();
         while let Ok(action) = receiver.try_receive() {
+            collected.push(action.clone());
+        }
+        let ui_receiver = ui_action_receiver();
+        while let Ok(action) = ui_receiver.try_receive() {
             collected.push(action);
         }
         collected
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn queue_reports_overflow() {
+            clear();
+
+            for session_id in 1..=ACTION_QUEUE_DEPTH as u32 {
+                queue_for_ui(DeviceAction::StartSession { session_id }).expect("queue action");
+            }
+
+            let overflow = queue_for_ui(DeviceAction::EndSession);
+            assert_eq!(overflow, Err(DeviceAction::EndSession));
+        }
     }
 }
 
@@ -270,6 +327,7 @@ pub mod runtime {
         let executor = EXECUTOR.init(Executor::new());
         executor.run(move |spawner| {
             let ble_actions = actions::action_receiver();
+            let ui_actions = actions::ui_action_receiver();
             spawner
                 .spawn(super::tasks::ble_profile(ble_actions))
                 .expect("spawn BLE task");
@@ -280,6 +338,9 @@ pub mod runtime {
                 .spawn(super::tasks::time_broadcast())
                 .expect("spawn time broadcast task");
             spawner.spawn(system::ui_task()).expect("spawn UI task");
+            spawner
+                .spawn(actions::ui_actions_forwarder(ui_actions))
+                .expect("spawn HID action forwarder");
             spawner
                 .spawn(super::tasks::flash_restore_task(
                     flash,
@@ -325,8 +386,8 @@ mod tasks {
         channel::{Channel, Receiver, Sender},
         signal::Signal,
     };
-    use embassy_time::Timer;
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+    use embassy_time::Timer;
     use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
@@ -417,6 +478,33 @@ mod tasks {
     #[task]
     pub async fn frame_worker(
         mut jobs: HostFrameReceiver,
+        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
+    ) {
+        let mut boot_state = boot_signal.wait().await;
+        if let Err(error) = &boot_state {
+            log_boot_failure(error);
+        }
+
+        loop {
+            if let Some(updated) = boot_signal.try_take() {
+                if let Err(error) = &updated {
+                    log_boot_failure(error);
+                }
+                boot_state = updated;
+            }
+
+            let mut job = jobs.receive().await;
+            let response = match boot_state.as_mut() {
+                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
+                    .map_err(HostFrameError::Protocol),
+                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
+            };
+
+            job.response.signal(response);
+        }
+    }
+
+    #[task]
     pub async fn time_broadcast() {
         let mut receiver = time::time_receiver();
         let mut clock = CalibratedClock::new();
@@ -446,39 +534,6 @@ mod tasks {
                     }
                 }
             }
-        }
-    }
-
-    #[task]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn cdc_server(
-        mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut control: ControlChanged<'static>,
-        mut events: UsbEventReceiver,
-        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
-    ) {
-        let mut boot_state = boot_signal.wait().await;
-        if let Err(error) = &boot_state {
-            log_boot_failure(error);
-        }
-
-        loop {
-            if let Some(updated) = boot_signal.try_take() {
-                if let Err(error) = &updated {
-                    log_boot_failure(error);
-                }
-                boot_state = updated;
-            }
-
-            let mut job = jobs.receive().await;
-            let response = match boot_state.as_mut() {
-                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
-                    .map_err(HostFrameError::Protocol),
-                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
-            };
-
-            job.response.signal(response);
         }
     }
 
