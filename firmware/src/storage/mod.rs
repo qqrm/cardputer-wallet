@@ -1,12 +1,6 @@
 //! Persistent storage glue for flash-backed bootstrapping and context persistence.
 #[cfg(any(test, target_arch = "xtensa"))]
-use alloc::boxed::Box;
-#[cfg(any(test, target_arch = "xtensa"))]
-use core::{
-    future::Future,
-    ops::Range,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-};
+use core::ops::Range;
 #[cfg(any(test, target_arch = "xtensa"))]
 use embedded_storage_async::nor_flash::NorFlash;
 use sequential_storage::Error as FlashStorageError;
@@ -54,31 +48,6 @@ where
 }
 
 #[cfg(any(test, target_arch = "xtensa"))]
-pub fn block_on<F: Future>(future: F) -> F::Output {
-    unsafe fn noop_clone(_: *const ()) -> RawWaker {
-        noop_raw_waker()
-    }
-
-    unsafe fn noop(_: *const ()) {}
-
-    fn noop_raw_waker() -> RawWaker {
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
-        RawWaker::new(core::ptr::null(), &VTABLE)
-    }
-
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-    let mut future = Box::pin(future);
-    let mut cx = Context::from_waker(&waker);
-
-    loop {
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => break output,
-            Poll::Pending => core::hint::spin_loop(),
-        }
-    }
-}
-
-#[cfg(any(test, target_arch = "xtensa"))]
 pub async fn initialize_context_from_flash<S>(
     flash: &mut S,
     range: Range<u32>,
@@ -93,24 +62,25 @@ where
 
 #[cfg(target_arch = "xtensa")]
 pub struct BootFlash<'d> {
-    storage: esp_storage::FlashStorage<'d>,
+    storage:
+        embassy_embedded_hal::adapter::blocking_async::BlockingAsync<esp_storage::FlashStorage<'d>>,
 }
 
 #[cfg(target_arch = "xtensa")]
 impl<'d> BootFlash<'d> {
     pub fn new(storage: esp_storage::FlashStorage<'d>) -> Self {
-        Self { storage }
+        Self {
+            storage: embassy_embedded_hal::adapter::blocking_async::BlockingAsync::new(storage),
+        }
     }
 
     pub fn flash_capacity(&self) -> usize {
-        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
-
-        BlockingReadNorFlash::capacity(&self.storage)
+        embedded_storage_async::nor_flash::ReadNorFlash::capacity(&self.storage)
     }
 
-    pub fn sequential_storage_range(&mut self) -> Option<Range<u32>> {
+    pub async fn sequential_storage_range(&mut self) -> Option<Range<u32>> {
         use core::str;
-        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
+        use embedded_storage_async::nor_flash::ReadNorFlash;
 
         const PARTITION_MAGIC: u16 = 0x50AA;
         const PARTITION_TABLE_OFFSET: u32 = 0x8000;
@@ -127,7 +97,8 @@ impl<'d> BootFlash<'d> {
         ];
 
         let mut table = [0u8; PARTITION_TABLE_SIZE];
-        if BlockingReadNorFlash::read(&mut self.storage, PARTITION_TABLE_OFFSET, &mut table)
+        if ReadNorFlash::read(&mut self.storage, PARTITION_TABLE_OFFSET, &mut table)
+            .await
             .is_err()
         {
             return None;
@@ -208,9 +179,7 @@ impl<'d> embedded_storage_async::nor_flash::ReadNorFlash for BootFlash<'d> {
     }
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        use embedded_storage::nor_flash::ReadNorFlash as BlockingReadNorFlash;
-
-        BlockingReadNorFlash::read(&mut self.storage, offset, bytes)
+        self.storage.read(offset, bytes).await
     }
 }
 
@@ -220,14 +189,10 @@ impl<'d> embedded_storage_async::nor_flash::NorFlash for BootFlash<'d> {
     const ERASE_SIZE: usize = esp_storage::FlashStorage::ERASE_SIZE as usize;
 
     async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
-
-        BlockingNorFlash::erase(&mut self.storage, from, to)
+        self.storage.erase(from, to).await
     }
 
     async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
-
-        BlockingNorFlash::write(&mut self.storage, offset, bytes)
+        self.storage.write(offset, bytes).await
     }
 }

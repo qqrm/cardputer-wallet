@@ -171,6 +171,7 @@ pub mod runtime {
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
     use embassy_executor::Executor;
+    use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
     use esp_hal::{
@@ -182,7 +183,7 @@ pub mod runtime {
         },
         timer::timg::TimerGroup,
     };
-    use esp_storage::FlashStorage;
+    use esp_storage::{FlashStorage, FlashStorageError};
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -203,10 +204,15 @@ pub mod runtime {
     static USB_CDC_STATE: StaticCell<cdc_acm::State<'static>> = StaticCell::new();
     static USB_EVENT_HANDLER: StaticCell<usb::UsbEventHandler> = StaticCell::new();
     static USB_RX_BUFFER: StaticCell<[u8; USB_MAX_PACKET_SIZE as usize]> = StaticCell::new();
+    static FLASH_RESTORE_SIGNAL: Signal<CriticalSectionRawMutex, BootContext> = Signal::new();
+    static FLASH_STORAGE: StaticCell<BootFlash<'static>> = StaticCell::new();
 
     const USB_MAX_PACKET_SIZE: u16 = 64;
     const USB_VID: u16 = 0x303A;
     const USB_PID: u16 = 0x4001;
+    const FLASH_RESTORE_DELAY_MS: u64 = 2_000;
+
+    type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
 
     static mut USB_EP_OUT_BUFFER: [u8; 1024] = [0; 1024];
 
@@ -220,13 +226,7 @@ pub mod runtime {
         let timer0 = timg0.timer0;
         esp_hal_embassy::init(timer0);
 
-        let mut flash = BootFlash::new(FlashStorage::new(peripherals.FLASH));
-        let boot_context = flash
-            .sequential_storage_range()
-            .ok_or_else(|| StorageError::Decode("sync flash partition not found".to_string()))
-            .and_then(|range| {
-                storage::block_on(storage::initialize_context_from_flash(&mut flash, range))
-            });
+        let flash = FLASH_STORAGE.init(BootFlash::new(FlashStorage::new(peripherals.FLASH)));
 
         let usb = Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
 
@@ -276,12 +276,19 @@ pub mod runtime {
                 .spawn(super::tasks::usb_device(usb_device))
                 .expect("spawn USB device task");
             spawner
+                .spawn(super::tasks::flash_restore_task(
+                    flash,
+                    &FLASH_RESTORE_SIGNAL,
+                    FLASH_RESTORE_DELAY_MS,
+                ))
+                .expect("spawn flash restore task");
+            spawner
                 .spawn(super::tasks::cdc_server(
                     buffered_receiver,
                     cdc_sender,
                     cdc_control,
                     usb_events,
-                    boot_context,
+                    &FLASH_RESTORE_SIGNAL,
                 ))
                 .expect("spawn CDC task");
         });
@@ -295,12 +302,14 @@ mod tasks {
         BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
     };
     use super::usb::{UsbEventReceiver, UsbTransportEvent};
-    use crate::storage::{self, StorageError};
+    use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::ui::transport::{self, TransportState};
     use alloc::{format, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
+    use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+    use embassy_time::Timer;
     use embassy_usb::{
         UsbDevice,
         class::cdc_acm::{BufferedReceiver, ControlChanged, Sender},
@@ -315,13 +324,39 @@ mod tasks {
         fn ets_printf(format: *const core::ffi::c_char, ...) -> i32;
     }
 
-    type BootContext = Result<SyncContext, StorageError<FlashStorageError>>;
-
     #[task]
     pub async fn usb_device(
         mut device: UsbDevice<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
     ) {
         device.run().await;
+    }
+
+    #[task]
+    pub async fn flash_restore_task(
+        flash: &'static mut BootFlash<'static>,
+        signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
+        retry_delay_ms: u64,
+    ) {
+        loop {
+            let boot_result = async {
+                let range = flash.sequential_storage_range().await.ok_or_else(|| {
+                    StorageError::Decode("sync flash partition not found".to_string())
+                })?;
+
+                storage::initialize_context_from_flash(flash, range).await
+            }
+            .await;
+
+            signal.signal(boot_result);
+
+            if matches!(boot_result, BootContext::Ok(_)) {
+                break;
+            }
+
+            if retry_delay_ms > 0 {
+                Timer::after_millis(retry_delay_ms).await;
+            }
+        }
     }
 
     #[task]
@@ -331,13 +366,10 @@ mod tasks {
         mut sender: Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         mut control: ControlChanged<'static>,
         mut events: UsbEventReceiver,
-        ctx: BootContext,
+        boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
     ) {
-        let (mut context, mut boot_error) = ctx
-            .map(|ctx| (ctx, None))
-            .unwrap_or_else(|error| (SyncContext::new(), Some(error)));
-
-        if let Some(error) = &boot_error {
+        let mut boot_state = boot_signal.wait().await;
+        if let Err(error) = &boot_state {
             log_boot_failure(error);
         }
 
@@ -345,6 +377,13 @@ mod tasks {
         let packet_size = receiver.max_packet_size() as usize;
         callbacks.waiting().await;
         loop {
+            if let Some(updated) = boot_signal.try_take() {
+                if let Err(error) = &updated {
+                    log_boot_failure(error);
+                }
+                boot_state = updated;
+            }
+
             if matches!(
                 wait_for_session(
                     &mut receiver,
@@ -360,6 +399,13 @@ mod tasks {
             }
 
             loop {
+                if let Some(updated) = boot_signal.try_take() {
+                    if let Err(error) = &updated {
+                        log_boot_failure(error);
+                    }
+                    boot_state = updated;
+                }
+
                 let read_future = read_frame(&mut receiver);
                 let event_future = events.receive();
                 let combined = select(read_future, event_future);
@@ -368,8 +414,8 @@ mod tasks {
                 match select(combined, control_future).await {
                     Either::First(Either::First(Ok((command, frame)))) => {
                         callbacks.connected().await;
-                        if let Some(error) = boot_error.take() {
-                            let payload = boot_failure_payload(&error);
+                        if let Err(error) = &boot_state {
+                            let payload = boot_failure_payload(error);
                             if let Err(err) = write_frame(
                                 &mut sender,
                                 packet_size,
@@ -385,7 +431,12 @@ mod tasks {
                             continue;
                         }
 
-                        match process_host_frame(command, &frame, &mut context) {
+                        let context = match boot_state.as_mut() {
+                            Ok(ctx) => ctx,
+                            Err(_) => unreachable!(),
+                        };
+
+                        match process_host_frame(command, &frame, context) {
                             Ok((response_command, response)) => {
                                 if let Err(err) = write_frame(
                                     &mut sender,
