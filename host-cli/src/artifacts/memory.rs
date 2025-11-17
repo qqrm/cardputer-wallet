@@ -1,18 +1,13 @@
 use shared::error::SharedError;
 use shared::schema::{JournalFrame, VaultArtifact, VaultChunk};
+use shared::transfer::ArtifactCollector;
 
 use super::TransferArtifactStore;
 
 /// Minimal in-memory artifact store used for unit tests.
 #[derive(Default)]
 pub struct MemoryArtifactStore {
-    vault: Vec<u8>,
-    recipients: Vec<u8>,
-    signature: Vec<u8>,
-    recipients_expected: bool,
-    recipients_seen: bool,
-    signature_expected: bool,
-    signature_seen: bool,
+    collector: ArtifactCollector,
     pub logs: Vec<String>,
     pub journal_entries: Vec<String>,
 }
@@ -25,63 +20,21 @@ impl MemoryArtifactStore {
 
 impl TransferArtifactStore for MemoryArtifactStore {
     fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
-        let expected = hash != [0u8; 32];
-        match artifact {
-            VaultArtifact::Vault => {
-                let _ = expected;
-            }
-            VaultArtifact::Recipients => {
-                self.recipients_expected = expected;
-            }
-            VaultArtifact::Signature => {
-                self.signature_expected = expected;
-            }
-        }
+        self.collector.set_expected_hash(artifact, hash);
     }
 
     fn set_recipients_expected(&mut self, expected: bool) {
-        self.recipients_expected = expected;
+        self.collector.set_recipients_expected(expected);
     }
 
     fn set_signature_expected(&mut self, expected: bool) {
-        self.signature_expected = expected;
+        self.collector.set_signature_expected(expected);
     }
 
     fn record_vault_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, SharedError> {
-        let should_continue = match chunk.artifact {
-            VaultArtifact::Vault => {
-                self.vault.extend_from_slice(&chunk.data);
-                if chunk.is_last {
-                    let needs_recipients = self.recipients_expected && !self.recipients_seen;
-                    let needs_signature = self.signature_expected && !self.signature_seen;
-                    needs_recipients || needs_signature
-                } else {
-                    true
-                }
-            }
-            VaultArtifact::Recipients => {
-                if chunk.sequence == 1 {
-                    self.recipients.clear();
-                }
-                self.recipients_seen = true;
-                self.recipients.extend_from_slice(&chunk.data);
-                if chunk.is_last {
-                    self.signature_expected && !self.signature_seen
-                } else {
-                    true
-                }
-            }
-            VaultArtifact::Signature => {
-                if chunk.sequence == 1 {
-                    self.signature.clear();
-                }
-                self.signature_seen = true;
-                self.signature.extend_from_slice(&chunk.data);
-                !chunk.is_last
-            }
-        };
-
-        Ok(should_continue)
+        self.collector
+            .record_chunk(chunk)
+            .map_err(|err| SharedError::Transport(format!("failed to record vault chunk: {err}")))
     }
 
     fn record_journal_frame(&mut self, frame: &JournalFrame) {
@@ -99,25 +52,26 @@ impl TransferArtifactStore for MemoryArtifactStore {
     }
 
     fn vault_bytes(&self) -> &[u8] {
-        &self.vault
+        self.collector.vault_bytes()
     }
 
     fn recipients_bytes(&self) -> Option<&[u8]> {
-        self.recipients_seen.then_some(self.recipients.as_slice())
+        self.collector.recipients_bytes()
     }
 
     fn signature_bytes(&self) -> Option<&[u8]> {
-        self.signature_seen.then_some(self.signature.as_slice())
+        self.collector.signature_bytes()
     }
 
     fn signature_expected(&self) -> bool {
-        self.signature_expected
+        self.collector.signature_expected()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::checksum::accumulate_checksum;
     use shared::schema::{JournalFrame, VaultChunk};
 
     #[test]
@@ -133,7 +87,7 @@ mod tests {
             remaining_bytes: 0,
             device_chunk_size: 5,
             data: b"vault".to_vec(),
-            checksum: 0,
+            checksum: accumulate_checksum(0, b"vault"),
             is_last: true,
             artifact: VaultArtifact::Vault,
         };
@@ -150,7 +104,7 @@ mod tests {
             remaining_bytes: 0,
             device_chunk_size: 10,
             data: b"recipients".to_vec(),
-            checksum: 0,
+            checksum: accumulate_checksum(0, b"recipients"),
             is_last: true,
             artifact: VaultArtifact::Recipients,
         };
@@ -167,7 +121,7 @@ mod tests {
             remaining_bytes: 0,
             device_chunk_size: 9,
             data: b"signature".to_vec(),
-            checksum: 0,
+            checksum: accumulate_checksum(0, b"signature"),
             is_last: true,
             artifact: VaultArtifact::Signature,
         };
