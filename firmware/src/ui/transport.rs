@@ -1,5 +1,6 @@
 use alloc::{format, string::String};
-use core::sync::atomic::{AtomicU8, Ordering};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::watch::{Receiver, Sender, Watch};
 
 /// High-level transport channels surfaced in the UI status row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,32 +107,60 @@ impl TransportIndicators {
     }
 }
 
-static USB_STATE: AtomicU8 = AtomicU8::new(TransportState::Offline.as_u8());
-static BLE_STATE: AtomicU8 = AtomicU8::new(TransportState::Offline.as_u8());
+type WatchMutex = CriticalSectionRawMutex;
+
+const TRANSPORT_RECEIVER_LIMIT: usize = 4;
+
+static TRANSPORT_WATCH: Watch<WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT> =
+    Watch::new_with(default_transport());
+
+pub type TransportReceiver =
+    Receiver<'static, WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT>;
+pub type TransportSender =
+    Sender<'static, WatchMutex, TransportIndicators, TRANSPORT_RECEIVER_LIMIT>;
 
 /// Update the cached USB status indicator.
 pub fn set_usb_state(state: TransportState) {
-    USB_STATE.store(state.as_u8(), Ordering::Relaxed);
+    modify_transport(|indicators| indicators.usb = TransportStatus::new(TransportKind::Usb, state));
 }
 
 /// Update the cached BLE status indicator.
 pub fn set_ble_state(state: TransportState) {
-    BLE_STATE.store(state.as_u8(), Ordering::Relaxed);
-}
-
-fn load_state(atom: &AtomicU8) -> TransportState {
-    TransportState::from_u8(atom.load(Ordering::Relaxed))
+    modify_transport(|indicators| indicators.ble = TransportStatus::new(TransportKind::Ble, state));
 }
 
 /// Snapshot the current transport status for rendering.
 pub fn snapshot() -> TransportIndicators {
-    TransportIndicators::new(load_state(&USB_STATE), load_state(&BLE_STATE))
+    TRANSPORT_WATCH.try_get().unwrap_or_else(default_transport)
+}
+
+/// Subscribe to transport updates.
+pub fn receiver() -> Option<TransportReceiver> {
+    TRANSPORT_WATCH.receiver()
+}
+
+fn sender() -> TransportSender {
+    TRANSPORT_WATCH.sender()
+}
+
+fn modify_transport(update: impl FnOnce(&mut TransportIndicators)) {
+    sender().send_if_modified(|state| {
+        let mut indicators = state.clone().unwrap_or_else(default_transport);
+        let before = indicators.clone();
+        update(&mut indicators);
+        let changed = indicators != before;
+        *state = Some(indicators);
+        changed
+    });
+}
+
+fn default_transport() -> TransportIndicators {
+    TransportIndicators::new(TransportState::Offline, TransportState::Offline)
 }
 
 #[cfg(test)]
 pub fn reset() {
-    set_usb_state(TransportState::Offline);
-    set_ble_state(TransportState::Offline);
+    sender().send(default_transport());
 }
 
 #[cfg(test)]

@@ -97,6 +97,9 @@ impl TotpProvider for SharedTotp {
     }
 }
 
+/// Global TOTP provider shared between UI and HID flows.
+pub type GlobalTotpProvider = SharedTotp;
+
 fn to_snapshot(config: &TotpConfig, code: &TotpCode) -> TotpSnapshot {
     let period = cmp::min(config.period, u8::MAX as u16) as u8;
     TotpSnapshot {

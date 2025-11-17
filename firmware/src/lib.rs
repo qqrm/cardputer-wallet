@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod hid;
 pub mod storage;
 pub mod sync;
+pub mod system;
 pub mod totp;
 pub mod ui;
 
