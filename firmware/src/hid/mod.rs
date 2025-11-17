@@ -287,13 +287,19 @@ pub mod runtime {
                     FLASH_RESTORE_DELAY_MS,
                 ))
                 .expect("spawn flash restore task");
+            let frame_jobs = super::tasks::host_frame_receiver();
+            spawner
+                .spawn(super::tasks::frame_worker(
+                    frame_jobs,
+                    &FLASH_RESTORE_SIGNAL,
+                ))
+                .expect("spawn frame worker task");
             spawner
                 .spawn(super::tasks::cdc_server(
                     buffered_receiver,
                     cdc_sender,
                     cdc_control,
                     usb_events,
-                    &FLASH_RESTORE_SIGNAL,
                 ))
                 .expect("spawn CDC task");
         });
@@ -311,14 +317,20 @@ mod tasks {
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
-    use alloc::{format, vec::Vec};
+    use alloc::{format, sync::Arc, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
+    use embassy_sync::{
+        blocking_mutex::raw::CriticalSectionRawMutex,
+        channel::{Channel, Receiver, Sender},
+        signal::Signal,
+    };
+    use embassy_time::Timer;
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
-        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender},
+        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender as CdcSender},
         driver::EndpointError,
     };
     use trouble_host::types::capabilities::IoCapabilities;
@@ -328,6 +340,43 @@ mod tasks {
     #[cfg(target_arch = "xtensa")]
     extern "C" {
         fn ets_printf(format: *const core::ffi::c_char, ...) -> i32;
+    }
+
+    const HOST_FRAME_QUEUE_DEPTH: usize = 4;
+    const FRAME_RESPONSE_BACKOFF_MS: u64 = 10;
+
+    type HostFrameResult = Result<(shared::cdc::CdcCommand, Vec<u8>), HostFrameError>;
+    type HostFrameSignal = Signal<CriticalSectionRawMutex, HostFrameResult>;
+    type HostFrameSender =
+        Sender<'static, CriticalSectionRawMutex, HostFrameJob, HOST_FRAME_QUEUE_DEPTH>;
+    type HostFrameReceiver =
+        Receiver<'static, CriticalSectionRawMutex, HostFrameJob, HOST_FRAME_QUEUE_DEPTH>;
+
+    static HOST_FRAME_CHANNEL: Channel<
+        CriticalSectionRawMutex,
+        HostFrameJob,
+        HOST_FRAME_QUEUE_DEPTH,
+    > = Channel::new();
+
+    #[derive(Debug)]
+    struct HostFrameJob {
+        command: shared::cdc::CdcCommand,
+        frame: Vec<u8>,
+        response: Arc<HostFrameSignal>,
+    }
+
+    #[derive(Debug)]
+    enum HostFrameError {
+        Boot(Vec<u8>),
+        Protocol(sync::ProtocolError),
+    }
+
+    fn host_frame_sender() -> HostFrameSender {
+        HOST_FRAME_CHANNEL.sender()
+    }
+
+    pub fn host_frame_receiver() -> HostFrameReceiver {
+        HOST_FRAME_CHANNEL.receiver()
     }
 
     #[task]
@@ -366,6 +415,8 @@ mod tasks {
     }
 
     #[task]
+    pub async fn frame_worker(
+        mut jobs: HostFrameReceiver,
     pub async fn time_broadcast() {
         let mut receiver = time::time_receiver();
         let mut clock = CalibratedClock::new();
@@ -412,9 +463,6 @@ mod tasks {
             log_boot_failure(error);
         }
 
-        let callbacks = TransportCallbacks::new();
-        let packet_size = receiver.max_packet_size() as usize;
-        callbacks.waiting().await;
         loop {
             if let Some(updated) = boot_signal.try_take() {
                 if let Err(error) = &updated {
@@ -423,6 +471,30 @@ mod tasks {
                 boot_state = updated;
             }
 
+            let mut job = jobs.receive().await;
+            let response = match boot_state.as_mut() {
+                Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
+                    .map_err(HostFrameError::Protocol),
+                Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
+            };
+
+            job.response.signal(response);
+        }
+    }
+
+    #[task]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cdc_server(
+        mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        mut sender: CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        mut control: ControlChanged<'static>,
+        mut events: UsbEventReceiver,
+    ) {
+        let frame_jobs = host_frame_sender();
+        let callbacks = TransportCallbacks::new();
+        let packet_size = receiver.max_packet_size() as usize;
+        callbacks.waiting().await;
+        loop {
             if matches!(
                 wait_for_session(
                     &mut receiver,
@@ -438,13 +510,6 @@ mod tasks {
             }
 
             loop {
-                if let Some(updated) = boot_signal.try_take() {
-                    if let Err(error) = &updated {
-                        log_boot_failure(error);
-                    }
-                    boot_state = updated;
-                }
-
                 let read_future = read_frame(&mut receiver);
                 let event_future = events.receive();
                 let combined = select(read_future, event_future);
@@ -453,9 +518,18 @@ mod tasks {
                 match select(combined, control_future).await {
                     Either::First(Either::First(Ok((command, frame)))) => {
                         callbacks.connected().await;
-                        if let Err(error) = &boot_state {
-                            let payload = boot_failure_payload(error);
-                            if let Err(err) = write_frame(
+                        let response_signal = Arc::new(HostFrameSignal::new());
+                        let send_result = frame_jobs
+                            .send(HostFrameJob {
+                                command,
+                                frame,
+                                response: response_signal.clone(),
+                            })
+                            .await;
+
+                        if send_result.is_err() {
+                            let payload = encode_nack_payload(sync::ProtocolError::Transport);
+                            if let Err(write_err) = write_frame(
                                 &mut sender,
                                 packet_size,
                                 shared::cdc::CdcCommand::Nack,
@@ -463,20 +537,24 @@ mod tasks {
                             )
                             .await
                             {
-                                if handle_frame_error(err, &callbacks).await {
+                                if handle_frame_error(write_err, &callbacks).await {
                                     break;
                                 }
                             }
+                            callbacks.error().await;
                             continue;
                         }
 
-                        let context = match boot_state.as_mut() {
-                            Ok(ctx) => ctx,
-                            Err(_) => unreachable!(),
-                        };
-
-                        match process_host_frame(command, &frame, context) {
-                            Ok((response_command, response)) => {
+                        match wait_for_frame_response(
+                            response_signal.as_ref(),
+                            &mut events,
+                            &mut control,
+                            &callbacks,
+                            &receiver,
+                        )
+                        .await
+                        {
+                            Ok(Ok((response_command, response))) => {
                                 if let Err(err) = write_frame(
                                     &mut sender,
                                     packet_size,
@@ -490,7 +568,21 @@ mod tasks {
                                     }
                                 }
                             }
-                            Err(err) => {
+                            Ok(Err(HostFrameError::Boot(payload))) => {
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    shared::cdc::CdcCommand::Nack,
+                                    &payload,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(Err(HostFrameError::Protocol(err))) => {
                                 let payload = encode_nack_payload(err);
                                 if let Err(err) = write_frame(
                                     &mut sender,
@@ -505,6 +597,7 @@ mod tasks {
                                     }
                                 }
                             }
+                            Err(SessionControl::Drop) => break,
                         }
                     }
                     Either::First(Either::First(Err(FrameIoError::Protocol(err)))) => {
@@ -542,6 +635,45 @@ mod tasks {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    async fn wait_for_frame_response(
+        response: &HostFrameSignal,
+        events: &mut UsbEventReceiver,
+        control: &mut ControlChanged<'static>,
+        callbacks: &TransportCallbacks,
+        receiver: &BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+    ) -> Result<HostFrameResult, SessionControl> {
+        loop {
+            let response_future = response.wait();
+            let event_future = events.receive();
+            let control_future = control.control_changed();
+            let timeout_future = Timer::after_millis(FRAME_RESPONSE_BACKOFF_MS);
+
+            match select(
+                select(response_future, event_future),
+                select(control_future, timeout_future),
+            )
+            .await
+            {
+                Either::First(Either::First(result)) => return Ok(result),
+                Either::First(Either::Second(event)) => {
+                    if matches!(
+                        handle_usb_event(event, callbacks, receiver).await,
+                        SessionControl::Drop
+                    ) {
+                        return Err(SessionControl::Drop);
+                    }
+                }
+                Either::Second(Either::First(())) => {
+                    if !receiver.dtr() {
+                        callbacks.waiting().await;
+                        return Err(SessionControl::Drop);
+                    }
+                }
+                Either::Second(Either::Second(())) => {}
             }
         }
     }
@@ -620,7 +752,7 @@ mod tasks {
 
     async fn wait_for_session(
         receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         control: &mut ControlChanged<'static>,
         events: &mut UsbEventReceiver,
         callbacks: &TransportCallbacks,
@@ -720,7 +852,7 @@ mod tasks {
     }
 
     async fn write_frame(
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
         command: shared::cdc::CdcCommand,
         payload: &[u8],
@@ -749,7 +881,7 @@ mod tasks {
     }
 
     async fn write_all(
-        sender: &mut Sender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
+        sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
         mut data: &[u8],
     ) -> Result<(), FrameIoError> {
