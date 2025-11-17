@@ -300,8 +300,9 @@ pub mod runtime {
             );
             let frame_jobs = super::tasks::host_frame_receiver();
             let frame_responses = super::tasks::host_frame_response_sender();
-            spawner
-                .spawn(super::tasks::frame_worker(
+            spawn_or_log(
+                "frame worker task",
+                spawner.spawn(super::tasks::frame_worker(
                     frame_jobs,
                     frame_responses,
                     &FLASH_RESTORE_SIGNAL,

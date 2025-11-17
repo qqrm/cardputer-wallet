@@ -45,20 +45,6 @@ pub enum TransportState {
 }
 
 impl TransportState {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => TransportState::Waiting,
-            2 => TransportState::Connecting,
-            3 => TransportState::Connected,
-            4 => TransportState::Error,
-            _ => TransportState::Offline,
-        }
-    }
-
-    const fn as_u8(self) -> u8 {
-        self as u8
-    }
-
     fn description(self) -> &'static str {
         match self {
             TransportState::Offline => "offline",

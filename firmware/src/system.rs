@@ -1,20 +1,31 @@
-use alloc::{boxed::Box, string::String, vec::Vec};
+#[cfg(any(test, target_arch = "xtensa"))]
+use alloc::{boxed::Box, format, string::String, string::ToString, vec::Vec};
 
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::{Channel, Receiver as ChannelReceiver, Sender as ChannelSender};
+use embassy_sync::once_lock::OnceLock;
 use embassy_sync::signal::Signal;
-use embassy_sync::watch::{Receiver as WatchReceiver, Sender as WatchSender, Watch};
-use static_cell::StaticCell;
+use embassy_sync::watch::{Receiver as WatchReceiver, Watch};
+
+#[cfg(any(test, target_arch = "xtensa"))]
+use embassy_sync::watch::Sender as WatchSender;
 
 use crate::sync::SyncContext;
 #[cfg(target_arch = "xtensa")]
 use crate::time;
+use crate::ui::{Frame, KeyEvent, UiCommand, UiEffect, UiScreen};
+
+#[cfg(any(test, target_arch = "xtensa"))]
 use crate::totp::GlobalTotpProvider;
-use crate::ui::{
-    EntrySummary, Frame, JournalAction, JournalEntryView, KeyEvent, UiCommand, UiEffect, UiRuntime,
-    UiScreen, VaultViewModel,
-};
-use shared::vault::{EntryUpdate, JournalOperation, VaultEntry};
+#[cfg(any(test, target_arch = "xtensa"))]
+use crate::ui::{EntrySummary, JournalAction, JournalEntryView, UiRuntime, VaultViewModel};
+
+#[cfg(any(test, target_arch = "xtensa"))]
+use shared::schema::JournalOperation;
+#[cfg(any(test, target_arch = "xtensa"))]
+use shared::vault::VaultEntry;
+
+#[cfg(any(test, target_arch = "xtensa"))]
 use zeroize::Zeroizing;
 
 #[cfg(target_arch = "xtensa")]
@@ -26,23 +37,28 @@ type UiMutex = CriticalSectionRawMutex;
 
 const UI_CHANNEL_DEPTH: usize = 8;
 const UI_STATE_SUBSCRIBERS: usize = 4;
+
+#[cfg(target_arch = "xtensa")]
 const UI_TICK_MS: u64 = 50;
 
-static SYNC_CONTEXT: StaticCell<Mutex<UiMutex, SyncContext>> = StaticCell::new();
+static SYNC_CONTEXT: OnceLock<Mutex<UiMutex, SyncContext>> = OnceLock::new();
 static UI_COMMANDS: Channel<UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH> = Channel::new();
 static UI_FRAMES: Watch<UiMutex, Frame, UI_STATE_SUBSCRIBERS> = Watch::new();
 static UI_SCREENS: Watch<UiMutex, UiScreen, UI_STATE_SUBSCRIBERS> = Watch::new_with(UiScreen::Lock);
 static UI_EFFECTS: Signal<UiMutex, UiEffect> = Signal::new();
 
+#[cfg(any(test, target_arch = "xtensa"))]
 #[derive(Default)]
 struct SyncVaultViewModel;
 
+#[cfg(any(test, target_arch = "xtensa"))]
 impl SyncVaultViewModel {
     fn from_system() -> Self {
         Self
     }
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 impl VaultViewModel for SyncVaultViewModel {
     fn entries(&self) -> Vec<EntrySummary> {
         sync_context()
@@ -61,32 +77,45 @@ impl VaultViewModel for SyncVaultViewModel {
     }
 
     fn journal(&self) -> Vec<JournalEntryView> {
+        let entries = sync_context().lock(|ctx| ctx.vault_entries());
         sync_context()
             .lock(|ctx| ctx.journal_operations())
             .into_iter()
-            .map(to_journal_entry)
+            .map(|operation| to_journal_entry(&entries, operation))
             .collect()
     }
 }
 
-fn to_journal_entry(operation: JournalOperation) -> JournalEntryView {
+#[cfg(any(test, target_arch = "xtensa"))]
+fn to_journal_entry(entries: &[VaultEntry], operation: JournalOperation) -> JournalEntryView {
     let (entry_id, action, description) = match operation {
-        JournalOperation::Add { entry } => (
-            entry.id.to_string(),
+        JournalOperation::Add { entry_id } => (
+            entry_id.clone(),
             JournalAction::Add,
-            Some(entry_title(&entry)),
+            find_entry_title(entries, &entry_id),
         ),
-        JournalOperation::Update { id, changes } => (
-            id.to_string(),
+        JournalOperation::UpdateField {
+            entry_id, field, ..
+        } => (
+            entry_id.clone(),
             JournalAction::Update,
-            describe_update(&changes),
+            Some(format!("update {field}")),
         ),
-        JournalOperation::Delete { id } => (id.to_string(), JournalAction::Delete, None),
+        JournalOperation::Delete { entry_id } => (entry_id, JournalAction::Delete, None),
     };
 
     JournalEntryView::new(entry_id, action, description, None)
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
+fn find_entry_title(entries: &[VaultEntry], entry_id: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry.id.to_string() == entry_id)
+        .map(entry_title)
+}
+
+#[cfg(any(test, target_arch = "xtensa"))]
 fn to_entry_summary(entry: VaultEntry) -> EntrySummary {
     EntrySummary {
         id: entry.id.to_string(),
@@ -98,50 +127,12 @@ fn to_entry_summary(entry: VaultEntry) -> EntrySummary {
     }
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn entry_title(entry: &VaultEntry) -> String {
     entry.title.clone()
 }
 
-fn describe_update(changes: &EntryUpdate) -> Option<String> {
-    let mut fields: Vec<&str> = Vec::new();
-    if changes.title.is_some() {
-        fields.push("title");
-    }
-    if changes.service.is_some() {
-        fields.push("service");
-    }
-    if changes.domains.is_some() {
-        fields.push("domains");
-    }
-    if changes.username.is_some() {
-        fields.push("username");
-    }
-    if changes.password.is_some() {
-        fields.push("password");
-    }
-    if changes.totp.is_some() {
-        fields.push("totp");
-    }
-    if changes.tags.is_some() {
-        fields.push("tags");
-    }
-    if changes.r#macro.is_some() {
-        fields.push("macro");
-    }
-    if changes.updated_at.is_some() {
-        fields.push("updated_at");
-    }
-    if changes.used_at.is_some() {
-        fields.push("used_at");
-    }
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(format!("update {}", fields.join(", ")))
-    }
-}
-
+#[cfg(any(test, target_arch = "xtensa"))]
 fn new_ui_runtime() -> UiRuntime {
     UiRuntime::new(
         Box::new(SyncVaultViewModel::from_system()),
@@ -150,27 +141,35 @@ fn new_ui_runtime() -> UiRuntime {
 }
 
 pub fn sync_context() -> &'static Mutex<UiMutex, SyncContext> {
-    SYNC_CONTEXT.init_with(|| Mutex::new(SyncContext::new()))
+    SYNC_CONTEXT.get_or_init(|| Mutex::new(SyncContext::new()))
 }
 
 pub fn replace_sync_context(new_ctx: SyncContext) {
-    sync_context().lock_mut(|ctx| *ctx = new_ctx);
+    unsafe {
+        sync_context().lock_mut(|ctx| *ctx = new_ctx);
+    }
 }
 
 pub type UiCommandSender = ChannelSender<'static, UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH>;
 pub type UiCommandReceiver = ChannelReceiver<'static, UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH>;
 pub type UiFrameReceiver = WatchReceiver<'static, UiMutex, Frame, UI_STATE_SUBSCRIBERS>;
 pub type UiScreenReceiver = WatchReceiver<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBERS>;
+
+#[cfg(any(test, target_arch = "xtensa"))]
 type UiFrameSender = WatchSender<'static, UiMutex, Frame, UI_STATE_SUBSCRIBERS>;
+#[cfg(any(test, target_arch = "xtensa"))]
 type UiScreenSender = WatchSender<'static, UiMutex, UiScreen, UI_STATE_SUBSCRIBERS>;
 
 #[cfg(any(test, feature = "ui-tests", target_arch = "xtensa"))]
-const _: () = {
+fn assert_ui_channel_types_send() {
     fn assert_send_static<T: Send + 'static>() {}
 
     assert_send_static::<UiCommandReceiver>();
     assert_send_static::<UiFrameReceiver>();
-};
+}
+
+#[cfg(any(test, feature = "ui-tests", target_arch = "xtensa"))]
+const _: fn() = assert_ui_channel_types_send;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiTaskMessage {
@@ -229,6 +228,7 @@ pub async fn ui_task() {
     }
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn handle_ui_message(runtime: &mut UiRuntime, message: UiTaskMessage) {
     let effect = match message {
         UiTaskMessage::Key(event) => runtime.handle_key_event(event),
@@ -238,6 +238,7 @@ fn handle_ui_message(runtime: &mut UiRuntime, message: UiTaskMessage) {
     dispatch_ui_effect(runtime, effect);
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn dispatch_ui_effect(runtime: &mut UiRuntime, effect: UiEffect) {
     match effect {
         UiEffect::UnlockRequested { pin } => {
@@ -250,14 +251,17 @@ fn dispatch_ui_effect(runtime: &mut UiRuntime, effect: UiEffect) {
     }
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn handle_unlock_request(runtime: &mut UiRuntime, pin: String) {
-    let mut pin_bytes = Zeroizing::new(pin.into_bytes());
-    let (result, status) = sync_context().lock_mut(|ctx| {
-        let now = ctx.current_time_ms();
-        let result = ctx.unlock_with_pin(pin_bytes.as_slice(), now);
-        let status = ctx.pin_lock_status(now);
-        (result, status)
-    });
+    let pin_bytes = Zeroizing::new(pin.into_bytes());
+    let (result, status) = unsafe {
+        sync_context().lock_mut(|ctx| {
+            let now = ctx.current_time_ms();
+            let result = ctx.unlock_with_pin(pin_bytes.as_slice(), now);
+            let status = ctx.pin_lock_status(now);
+            (result, status)
+        })
+    };
 
     match result {
         Ok(()) => runtime.register_unlock_success(status),
@@ -265,15 +269,18 @@ fn handle_unlock_request(runtime: &mut UiRuntime, pin: String) {
     }
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn publish_ui_state(runtime: &UiRuntime) {
     frame_sender().send(runtime.render());
     screen_sender().send(runtime.screen());
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn frame_sender() -> UiFrameSender {
     UI_FRAMES.sender()
 }
 
+#[cfg(any(test, target_arch = "xtensa"))]
 fn screen_sender() -> UiScreenSender {
     UI_SCREENS.sender()
 }
@@ -282,17 +289,19 @@ fn screen_sender() -> UiScreenSender {
 mod tests {
     use super::*;
     use crate::crypto::PIN_WIPE_THRESHOLD;
-    use crate::ui::{input::UiCommand, render::ViewContent};
+    use crate::ui::{UiCommand, ViewContent};
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
     fn setup_context(pin: &str) -> UiRuntime {
         replace_sync_context(SyncContext::new());
-        sync_context().lock_mut(|ctx| {
-            let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
-            ctx.test_configure_pin(pin.as_bytes(), &mut rng)
-                .expect("configure pin");
-        });
+        unsafe {
+            sync_context().lock_mut(|ctx| {
+                let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
+                ctx.test_configure_pin(pin.as_bytes(), &mut rng)
+                    .expect("configure pin");
+            });
+        }
 
         let runtime = new_ui_runtime();
         publish_ui_state(&runtime);
@@ -346,10 +355,12 @@ mod tests {
             if let Some(remaining) = lock.backoff_remaining_ms {
                 saw_backoff = true;
                 assert!(lock.prompt.contains("Try again"));
-                sync_context().lock_mut(|ctx| {
-                    let now = ctx.current_time_ms();
-                    ctx.test_set_current_time_ms(now.saturating_add(remaining + 1));
-                });
+                unsafe {
+                    sync_context().lock_mut(|ctx| {
+                        let now = ctx.current_time_ms();
+                        ctx.test_set_current_time_ms(now.saturating_add(remaining + 1));
+                    });
+                }
             }
 
             if lock.wipe_required {
