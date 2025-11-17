@@ -339,26 +339,63 @@ pub(super) mod fixtures {
         }
     }
 
-    fn handle_effects(ui: &mut UiRuntime, effect: UiEffect, force_unlock: bool) {
-        match effect {
-            UiEffect::UnlockRequested { .. } => ui.register_unlock_success(unlocked_status()),
-            _ if force_unlock && ui.screen() == UiScreen::Lock => {
-                ui.register_unlock_success(unlocked_status())
+    pub(super) struct SystemAdapter {
+        unlock_status: PinLockStatus,
+        unlock_response: Result<(), PinUnlockError>,
+    }
+
+    impl SystemAdapter {
+        pub(super) fn new() -> Self {
+            Self {
+                unlock_status: unlocked_status(),
+                unlock_response: Ok(()),
             }
-            _ => {}
+        }
+
+        pub(super) fn with_unlock_status(mut self, status: PinLockStatus) -> Self {
+            self.unlock_status = status;
+            self
+        }
+
+        pub(super) fn with_unlock_error(mut self, error: PinUnlockError) -> Self {
+            self.unlock_response = Err(error);
+            self
+        }
+
+        pub(super) fn dispatch(&self, ui: &mut UiRuntime, effect: UiEffect) {
+            match effect {
+                UiEffect::UnlockRequested { .. } => match &self.unlock_response {
+                    Ok(()) => ui.register_unlock_success(self.unlock_status),
+                    Err(error) => ui.register_unlock_failure(self.unlock_status, error),
+                },
+                _ => {}
+            }
         }
     }
 
-    pub(super) fn apply(ui: &mut UiRuntime, command: UiCommand) {
-        let effect = ui.apply_command(command);
-        let force_unlock = matches!(command, UiCommand::Activate);
-        handle_effects(ui, effect, force_unlock);
+    impl Default for SystemAdapter {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
-    pub(super) fn press(ui: &mut UiRuntime, key: PhysicalKey) {
+    pub(super) fn apply(ui: &mut UiRuntime, adapter: &SystemAdapter, command: UiCommand) {
+        let effect = ui.apply_command(command);
+        adapter.dispatch(ui, effect);
+    }
+
+    pub(super) fn press(ui: &mut UiRuntime, adapter: &SystemAdapter, key: PhysicalKey) {
         let effect = ui.handle_key_event(KeyEvent::pressed(key));
-        let force_unlock = matches!(key, PhysicalKey::Enter);
-        handle_effects(ui, effect, force_unlock);
+        adapter.dispatch(ui, effect);
+    }
+
+    pub(super) const TEST_PIN: &str = "123456";
+
+    pub(super) fn submit_pin(ui: &mut UiRuntime, adapter: &SystemAdapter, pin: &str) {
+        for digit in pin.chars() {
+            apply(ui, adapter, UiCommand::InsertChar(digit));
+        }
+        apply(ui, adapter, UiCommand::Activate);
     }
 }
 
@@ -371,15 +408,16 @@ mod tests {
     fn relock_clears_home_search_and_selection() {
         let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
         let mut ui = fixtures::build_runtime(vault);
+        let adapter = fixtures::SystemAdapter::default();
 
-        fixtures::apply(&mut ui, UiCommand::Activate);
-        fixtures::apply(&mut ui, UiCommand::InsertChar('a'));
-        fixtures::apply(&mut ui, UiCommand::InsertChar('l'));
-        fixtures::apply(&mut ui, UiCommand::MoveSelectionDown);
-        fixtures::apply(&mut ui, UiCommand::Lock);
+        fixtures::submit_pin(&mut ui, &adapter, fixtures::TEST_PIN);
+        fixtures::apply(&mut ui, &adapter, UiCommand::InsertChar('a'));
+        fixtures::apply(&mut ui, &adapter, UiCommand::InsertChar('l'));
+        fixtures::apply(&mut ui, &adapter, UiCommand::MoveSelectionDown);
+        fixtures::apply(&mut ui, &adapter, UiCommand::Lock);
         assert_eq!(ui.screen(), UiScreen::Lock);
 
-        fixtures::apply(&mut ui, UiCommand::Activate);
+        fixtures::submit_pin(&mut ui, &adapter, fixtures::TEST_PIN);
         let frame = ui.render();
 
         match frame.content {
@@ -395,15 +433,16 @@ mod tests {
     fn relock_drops_edit_buffers() {
         let vault = fixtures::MemoryVault::new(fixtures::sample_entries());
         let mut ui = fixtures::build_runtime(vault);
+        let adapter = fixtures::SystemAdapter::default();
 
-        fixtures::apply(&mut ui, UiCommand::Activate);
-        fixtures::apply(&mut ui, UiCommand::EditEntry);
-        fixtures::apply(&mut ui, UiCommand::InsertChar('x'));
-        fixtures::apply(&mut ui, UiCommand::Lock);
+        fixtures::submit_pin(&mut ui, &adapter, fixtures::TEST_PIN);
+        fixtures::apply(&mut ui, &adapter, UiCommand::EditEntry);
+        fixtures::apply(&mut ui, &adapter, UiCommand::InsertChar('x'));
+        fixtures::apply(&mut ui, &adapter, UiCommand::Lock);
         assert_eq!(ui.screen(), UiScreen::Lock);
 
-        fixtures::apply(&mut ui, UiCommand::Activate);
-        fixtures::apply(&mut ui, UiCommand::EditEntry);
+        fixtures::submit_pin(&mut ui, &adapter, fixtures::TEST_PIN);
+        fixtures::apply(&mut ui, &adapter, UiCommand::EditEntry);
         let frame = ui.render();
 
         match frame.content {
