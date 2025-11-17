@@ -45,11 +45,19 @@ impl SyncVaultViewModel {
 
 impl VaultViewModel for SyncVaultViewModel {
     fn entries(&self) -> Vec<EntrySummary> {
-        Vec::new()
+        sync_context()
+            .lock(|ctx| ctx.vault_entries())
+            .into_iter()
+            .map(to_entry_summary)
+            .collect()
     }
 
-    fn entry(&self, _id: &str) -> Option<EntrySummary> {
-        None
+    fn entry(&self, id: &str) -> Option<EntrySummary> {
+        sync_context()
+            .lock(|ctx| ctx.vault_entries())
+            .into_iter()
+            .find(|entry| entry.id.to_string() == id)
+            .map(|entry| to_entry_summary(entry))
     }
 
     fn journal(&self) -> Vec<JournalEntryView> {
@@ -77,6 +85,17 @@ fn to_journal_entry(operation: JournalOperation) -> JournalEntryView {
     };
 
     JournalEntryView::new(entry_id, action, description, None)
+}
+
+fn to_entry_summary(entry: VaultEntry) -> EntrySummary {
+    EntrySummary {
+        id: entry.id.to_string(),
+        title: entry.title,
+        username: entry.username,
+        last_used: entry.used_at.unwrap_or(entry.updated_at),
+        totp: entry.totp.map(|_| String::from("totp")),
+        note: entry.r#macro,
+    }
 }
 
 fn entry_title(entry: &VaultEntry) -> String {
