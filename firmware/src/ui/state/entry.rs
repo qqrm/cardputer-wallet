@@ -576,15 +576,17 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{input::PhysicalKey, render::ViewContent};
+    use crate::ui::{input::UiCommand, render::ViewContent};
 
     #[test]
     fn recent_selection_moves_with_arrows() {
         let vault =
             super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
         let mut ui = super::super::fixtures::build_runtime(vault);
-        super::super::fixtures::press(&mut ui, PhysicalKey::Enter);
-        super::super::fixtures::press(&mut ui, PhysicalKey::ArrowDown);
+        let adapter = super::super::fixtures::SystemAdapter::default();
+
+        super::super::fixtures::submit_pin(&mut ui, &adapter, super::super::fixtures::TEST_PIN);
+        super::super::fixtures::apply(&mut ui, &adapter, UiCommand::MoveSelectionDown);
         let frame = ui.render();
         match frame.content {
             ViewContent::Home(home) => {
@@ -606,7 +608,9 @@ mod tests {
         entries[2].last_used = String::from("2024-01-10");
         let vault = super::super::fixtures::MemoryVault::new(entries);
         let mut ui = super::super::fixtures::build_runtime(vault);
-        super::super::fixtures::press(&mut ui, PhysicalKey::Enter);
+        let adapter = super::super::fixtures::SystemAdapter::default();
+
+        super::super::fixtures::submit_pin(&mut ui, &adapter, super::super::fixtures::TEST_PIN);
         ui.home.search_query = String::from("al");
         let frame = ui.render();
         match frame.content {

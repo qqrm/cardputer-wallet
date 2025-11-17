@@ -1,3 +1,4 @@
+use alloc::string::ToString;
 use alloc::{format, string::String};
 
 use shared::{schema::JournalOperation, vault::VaultEntry};

@@ -23,8 +23,6 @@ use crate::ui::{
 };
 
 #[cfg(any(test, target_arch = "xtensa"))]
-use shared::schema::JournalOperation;
-#[cfg(any(test, target_arch = "xtensa"))]
 use shared::vault::VaultEntry;
 
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -75,7 +73,7 @@ impl VaultViewModel for SyncVaultViewModel {
             .lock(|ctx| ctx.vault_entries())
             .into_iter()
             .find(|entry| entry.id.to_string() == id)
-            .map(|entry| to_entry_summary(entry))
+            .map(to_entry_summary)
     }
 
     fn journal(&self) -> Vec<JournalEntryView> {
