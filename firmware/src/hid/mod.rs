@@ -170,6 +170,7 @@ type BootContext =
 
 #[cfg(target_arch = "xtensa")]
 pub mod runtime {
+    use super::BootContext;
     use super::actions;
     use super::usb;
     use crate::storage::{self, BootFlash, StorageError};
@@ -325,6 +326,7 @@ pub mod runtime {
 
 #[cfg(target_arch = "xtensa")]
 mod tasks {
+    use super::BootContext;
     use super::actions;
     use super::ble::{
         BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
