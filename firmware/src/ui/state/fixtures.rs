@@ -1,6 +1,4 @@
-#![cfg(test)]
-
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use super::{
     DEFAULT_TOTP_PERIOD, EntrySummary, TotpProvider, UiCommand, UiEffect, UiRuntime, VaultViewModel,
@@ -185,12 +183,11 @@ impl SystemAdapter {
     }
 
     pub(super) fn dispatch(&self, ui: &mut UiRuntime, effect: UiEffect) {
-        match effect {
-            UiEffect::UnlockRequested { .. } => match &self.unlock_response {
+        if let UiEffect::UnlockRequested { .. } = effect {
+            match &self.unlock_response {
                 Ok(()) => ui.register_unlock_success(self.unlock_status),
                 Err(error) => ui.register_unlock_failure(self.unlock_status, error),
-            },
-            _ => {}
+            }
         }
     }
 }
@@ -218,4 +215,41 @@ pub(super) fn submit_pin(ui: &mut UiRuntime, adapter: &SystemAdapter, pin: &str)
         apply(ui, adapter, UiCommand::InsertChar(digit));
     }
     apply(ui, adapter, UiCommand::Activate);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_entries_in_oldest_first_order() {
+        let entries = generate_entries(EntryFixtureConfig {
+            count: 3,
+            date_order: DateOrder::OldestFirst,
+            include_totp: false,
+        });
+
+        assert_eq!(entries[0].last_used, "2024-01-01");
+        assert_eq!(entries[1].last_used, "2024-01-02");
+        assert_eq!(entries[2].last_used, "2024-01-03");
+    }
+
+    #[test]
+    fn system_adapter_builders_override_unlock_flow() {
+        let adapter = SystemAdapter::new()
+            .with_unlock_status(PinLockStatus {
+                consecutive_failures: 2,
+                total_failures: 5,
+                backoff_remaining_ms: Some(500),
+                wipe_required: true,
+            })
+            .with_unlock_error(PinUnlockError::Backoff { remaining_ms: 500 });
+
+        assert_eq!(adapter.unlock_status.backoff_remaining_ms, Some(500));
+        assert!(adapter.unlock_status.wipe_required);
+        assert!(matches!(
+            adapter.unlock_response,
+            Err(PinUnlockError::Backoff { remaining_ms: 500 })
+        ));
+    }
 }

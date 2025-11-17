@@ -96,8 +96,11 @@ mod tests {
         let entries = super::super::fixtures::sample_entries();
         let vault = super::super::fixtures::MemoryVault::with_journal(entries, journal);
         let mut ui = super::super::fixtures::build_runtime(vault);
-        super::super::fixtures::press(&mut ui, crate::ui::input::PhysicalKey::Enter);
-        super::super::fixtures::press(&mut ui, crate::ui::input::PhysicalKey::Sync);
+        let adapter = super::super::fixtures::SystemAdapter::default();
+
+        super::super::fixtures::submit_pin(&mut ui, &adapter, super::super::fixtures::TEST_PIN);
+        super::super::fixtures::press(&mut ui, &adapter, crate::ui::input::PhysicalKey::Enter);
+        super::super::fixtures::press(&mut ui, &adapter, crate::ui::input::PhysicalKey::Sync);
         let frame = ui.render();
         match frame.content {
             crate::ui::render::ViewContent::Sync(sync) => {

@@ -62,13 +62,14 @@ impl UiRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::input::PhysicalKey;
+    use crate::ui::input::UiCommand;
 
     #[test]
     fn hint_bar_reflects_active_screen() {
         let vault =
             super::super::fixtures::MemoryVault::new(super::super::fixtures::sample_entries());
         let mut ui = super::super::fixtures::build_runtime(vault);
+        let adapter = super::super::fixtures::SystemAdapter::default();
 
         fn assert_hint(ui: &UiRuntime, expected: &str) {
             let frame = ui.render();
@@ -83,15 +84,15 @@ mod tests {
         }
 
         assert_hint(&ui, "Unlock");
-        super::super::fixtures::press(&mut ui, PhysicalKey::Enter);
+        super::super::fixtures::submit_pin(&mut ui, &adapter, super::super::fixtures::TEST_PIN);
         assert_hint(&ui, "Open");
-        super::super::fixtures::press(&mut ui, PhysicalKey::Enter);
+        super::super::fixtures::apply(&mut ui, &adapter, UiCommand::Activate);
         assert_hint(&ui, "Edit");
-        super::super::fixtures::press(&mut ui, PhysicalKey::Edit);
+        super::super::fixtures::apply(&mut ui, &adapter, UiCommand::EditEntry);
         assert_hint(&ui, "Save");
-        super::super::fixtures::press(&mut ui, PhysicalKey::Settings);
+        super::super::fixtures::apply(&mut ui, &adapter, UiCommand::OpenSettings);
         assert_hint(&ui, "Select");
-        super::super::fixtures::press(&mut ui, PhysicalKey::Sync);
+        super::super::fixtures::apply(&mut ui, &adapter, UiCommand::StartSync);
         assert_hint(&ui, "Lock");
     }
 }
