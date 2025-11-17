@@ -12,6 +12,7 @@ use crate::crypto::{
 #[cfg(any(test, target_arch = "xtensa"))]
 use crate::hid::actions::DeviceAction;
 use crate::storage::StorageError;
+use crate::time::{self, CalibratedClock};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
@@ -172,7 +173,7 @@ pub struct SyncContext {
     device_name: String,
     firmware_version: String,
     vault_generation: u64,
-    current_time_ms: u64,
+    clock: CalibratedClock,
 }
 
 impl Default for SyncContext {
@@ -205,7 +206,7 @@ impl SyncContext {
             device_name: String::from("Cardputer Wallet"),
             firmware_version: String::from(env!("CARGO_PKG_VERSION")),
             vault_generation: 0,
-            current_time_ms: 0,
+            clock: CalibratedClock::new(),
         }
     }
 
@@ -408,12 +409,10 @@ impl SyncContext {
 
     pub fn unlock_with_pin(&mut self, pin: &[u8], now_ms: u64) -> Result<(), PinUnlockError> {
         if self.pin_lock.wipe_pending() {
-            self.current_time_ms = now_ms;
             return Err(PinUnlockError::WipeRequired);
         }
 
         if let Some(remaining) = self.pin_lock.remaining_backoff(now_ms) {
-            self.current_time_ms = now_ms;
             return Err(PinUnlockError::Backoff {
                 remaining_ms: remaining,
             });
@@ -422,11 +421,9 @@ impl SyncContext {
         match self.crypto.unlock_vault_key(pin) {
             Ok(()) => {
                 self.pin_lock.register_success();
-                self.current_time_ms = now_ms;
                 Ok(())
             }
             Err(err) => {
-                self.current_time_ms = now_ms;
                 if matches!(err, KeyError::CryptoFailure) {
                     self.pin_lock.register_failure(now_ms);
                     if self.pin_lock.wipe_pending() {
@@ -450,7 +447,13 @@ impl SyncContext {
     }
 
     pub fn current_time_ms(&self) -> u64 {
-        self.current_time_ms
+        self.clock.current_time_ms()
+    }
+
+    pub fn set_epoch_time_ms(&mut self, epoch_ms: u64) -> u64 {
+        let now = self.clock.set_time_ms(epoch_ms);
+        time::publish_time(now);
+        now
     }
 
     /// Register a journal operation that should be emitted on the next pull.
@@ -754,7 +757,7 @@ fn handle_status(
         protocol_version: PROTOCOL_VERSION,
         vault_generation: ctx.vault_generation,
         pending_operations: ctx.journal_ops.len() as u32,
-        current_time_ms: ctx.current_time_ms,
+        current_time_ms: ctx.current_time_ms(),
     }))
 }
 
@@ -766,7 +769,7 @@ fn handle_set_time(
         return Err(ProtocolError::UnsupportedProtocol(request.protocol_version));
     }
 
-    ctx.current_time_ms = request.epoch_millis;
+    ctx.set_epoch_time_ms(request.epoch_millis);
 
     Ok(DeviceResponse::Ack(AckResponse {
         protocol_version: PROTOCOL_VERSION,
@@ -784,7 +787,7 @@ fn handle_get_time(
 
     Ok(DeviceResponse::Time(TimeResponse {
         protocol_version: PROTOCOL_VERSION,
-        epoch_millis: ctx.current_time_ms,
+        epoch_millis: ctx.current_time_ms(),
     }))
 }
 
@@ -1074,7 +1077,7 @@ impl SyncContext {
     }
 
     pub fn test_set_current_time_ms(&mut self, now_ms: u64) {
-        self.current_time_ms = now_ms;
+        self.set_epoch_time_ms(now_ms);
     }
 }
 
@@ -1719,7 +1722,7 @@ mod tests {
         ctx.record_operation(JournalOperation::Add {
             entry_id: String::from("status-entry"),
         });
-        ctx.current_time_ms = 1_234_567;
+        ctx.set_epoch_time_ms(1_234_567);
         ctx.vault_generation = 9;
 
         let request = HostRequest::Status(StatusRequest {

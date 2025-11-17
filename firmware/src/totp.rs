@@ -80,6 +80,10 @@ impl TotpProvider for SharedTotp {
         self.snapshot.clone()
     }
 
+    fn sync_time(&mut self, now_ms: u64) {
+        SharedTotp::sync_time(self, now_ms);
+    }
+
     fn tick(&mut self, elapsed_ms: u32) {
         if elapsed_ms == 0 {
             return;
