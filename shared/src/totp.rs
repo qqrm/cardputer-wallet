@@ -16,15 +16,25 @@ pub struct TotpCode {
 }
 
 /// Errors returned while generating a TOTP value.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TotpError {
-    #[error("secret is not valid base32")]
     InvalidSecret,
-    #[error("digits must be 6 or 8")]
     UnsupportedDigits,
-    #[error("period must be greater than zero")]
     InvalidPeriod,
 }
+
+impl core::fmt::Display for TotpError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TotpError::InvalidSecret => write!(f, "secret is not valid base32"),
+            TotpError::UnsupportedDigits => write!(f, "digits must be 6 or 8"),
+            TotpError::InvalidPeriod => write!(f, "period must be greater than zero"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for TotpError {}
 
 /// Generate a RFC 6238 compliant TOTP code for the provided configuration.
 pub fn generate(config: &TotpConfig, unix_time_ms: u64) -> Result<TotpCode, TotpError> {
