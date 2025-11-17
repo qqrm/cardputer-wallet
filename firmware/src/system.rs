@@ -1,3 +1,5 @@
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::{Channel, Receiver as ChannelReceiver, Sender as ChannelSender};
 use embassy_sync::signal::Signal;
@@ -8,7 +10,11 @@ use crate::sync::SyncContext;
 #[cfg(target_arch = "xtensa")]
 use crate::time;
 use crate::totp::GlobalTotpProvider;
-use crate::ui::{Frame, KeyEvent, SyncVaultViewModel, UiCommand, UiEffect, UiRuntime, UiScreen};
+use crate::ui::{
+    EntrySummary, Frame, JournalAction, JournalEntryView, KeyEvent, UiCommand, UiEffect, UiRuntime,
+    UiScreen, VaultViewModel,
+};
+use shared::vault::{EntryUpdate, JournalOperation, VaultEntry};
 use zeroize::Zeroizing;
 
 #[cfg(target_arch = "xtensa")]
@@ -28,6 +34,95 @@ static UI_FRAMES: Watch<UiMutex, Frame, UI_STATE_SUBSCRIBERS> = Watch::new();
 static UI_SCREENS: Watch<UiMutex, UiScreen, UI_STATE_SUBSCRIBERS> = Watch::new_with(UiScreen::Lock);
 static UI_EFFECTS: Signal<UiMutex, UiEffect> = Signal::new();
 
+#[derive(Default)]
+struct SyncVaultViewModel;
+
+impl SyncVaultViewModel {
+    fn from_system() -> Self {
+        Self
+    }
+}
+
+impl VaultViewModel for SyncVaultViewModel {
+    fn entries(&self) -> Vec<EntrySummary> {
+        Vec::new()
+    }
+
+    fn entry(&self, _id: &str) -> Option<EntrySummary> {
+        None
+    }
+
+    fn journal(&self) -> Vec<JournalEntryView> {
+        sync_context()
+            .lock(|ctx| ctx.journal_operations())
+            .into_iter()
+            .map(to_journal_entry)
+            .collect()
+    }
+}
+
+fn to_journal_entry(operation: JournalOperation) -> JournalEntryView {
+    let (entry_id, action, description) = match operation {
+        JournalOperation::Add { entry } => (
+            entry.id.to_string(),
+            JournalAction::Add,
+            Some(entry_title(&entry)),
+        ),
+        JournalOperation::Update { id, changes } => (
+            id.to_string(),
+            JournalAction::Update,
+            describe_update(&changes),
+        ),
+        JournalOperation::Delete { id } => (id.to_string(), JournalAction::Delete, None),
+    };
+
+    JournalEntryView::new(entry_id, action, description, None)
+}
+
+fn entry_title(entry: &VaultEntry) -> String {
+    entry.title.clone()
+}
+
+fn describe_update(changes: &EntryUpdate) -> Option<String> {
+    let mut fields: Vec<&str> = Vec::new();
+    if changes.title.is_some() {
+        fields.push("title");
+    }
+    if changes.service.is_some() {
+        fields.push("service");
+    }
+    if changes.domains.is_some() {
+        fields.push("domains");
+    }
+    if changes.username.is_some() {
+        fields.push("username");
+    }
+    if changes.password.is_some() {
+        fields.push("password");
+    }
+    if changes.totp.is_some() {
+        fields.push("totp");
+    }
+    if changes.tags.is_some() {
+        fields.push("tags");
+    }
+    if changes.r#macro.is_some() {
+        fields.push("macro");
+    }
+    if changes.updated_at.is_some() {
+        fields.push("updated_at");
+    }
+    if changes.used_at.is_some() {
+        fields.push("used_at");
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(format!("update {}", fields.join(", ")))
+    }
+}
+
 fn new_ui_runtime() -> UiRuntime {
     UiRuntime::new(
         Box::new(SyncVaultViewModel::from_system()),
@@ -40,7 +135,7 @@ pub fn sync_context() -> &'static Mutex<UiMutex, SyncContext> {
 }
 
 pub fn replace_sync_context(new_ctx: SyncContext) {
-    sync_context().lock(|ctx| *ctx = new_ctx);
+    sync_context().lock_mut(|ctx| *ctx = new_ctx);
 }
 
 pub type UiCommandSender = ChannelSender<'static, UiMutex, UiTaskMessage, UI_CHANNEL_DEPTH>;
@@ -130,7 +225,7 @@ fn dispatch_ui_effect(runtime: &mut UiRuntime, effect: UiEffect) {
 
 fn handle_unlock_request(runtime: &mut UiRuntime, pin: String) {
     let mut pin_bytes = Zeroizing::new(pin.into_bytes());
-    let (result, status) = sync_context().lock(|ctx| {
+    let (result, status) = sync_context().lock_mut(|ctx| {
         let now = ctx.current_time_ms();
         let result = ctx.unlock_with_pin(pin_bytes.as_slice(), now);
         let status = ctx.pin_lock_status(now);
@@ -166,7 +261,7 @@ mod tests {
 
     fn setup_context(pin: &str) -> UiRuntime {
         replace_sync_context(SyncContext::new());
-        sync_context().lock(|ctx| {
+        sync_context().lock_mut(|ctx| {
             let mut rng = ChaCha20Rng::from_seed([0xAA; 32]);
             ctx.test_configure_pin(pin.as_bytes(), &mut rng)
                 .expect("configure pin");
@@ -224,7 +319,7 @@ mod tests {
             if let Some(remaining) = lock.backoff_remaining_ms {
                 saw_backoff = true;
                 assert!(lock.prompt.contains("Try again"));
-                sync_context().lock(|ctx| {
+                sync_context().lock_mut(|ctx| {
                     let now = ctx.current_time_ms();
                     ctx.test_set_current_time_ms(now.saturating_add(remaining + 1));
                 });

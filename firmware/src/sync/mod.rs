@@ -450,6 +450,10 @@ impl SyncContext {
         self.clock.current_time_ms()
     }
 
+    pub fn journal_operations(&self) -> Vec<JournalOperation> {
+        self.journal_ops.clone()
+    }
+
     pub fn set_epoch_time_ms(&mut self, epoch_ms: u64) -> u64 {
         let now = self.clock.set_time_ms(epoch_ms);
         time::publish_time(now);
