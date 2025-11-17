@@ -299,10 +299,11 @@ pub mod runtime {
                 )),
             );
             let frame_jobs = super::tasks::host_frame_receiver();
-            spawn_or_log(
-                "frame worker task",
-                spawner.spawn(super::tasks::frame_worker(
+            let frame_responses = super::tasks::host_frame_response_sender();
+            spawner
+                .spawn(super::tasks::frame_worker(
                     frame_jobs,
+                    frame_responses,
                     &FLASH_RESTORE_SIGNAL,
                 )),
             );
@@ -330,7 +331,7 @@ mod tasks {
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
-    use alloc::{format, sync::Arc, vec::Vec};
+    use alloc::{format, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
     use embassy_sync::{
@@ -348,20 +349,25 @@ mod tasks {
 
     use esp_storage::FlashStorageError;
 
+    #[cfg(any(test, feature = "ui-tests"))]
+    use core::sync::atomic::{AtomicU64, Ordering};
+
     #[cfg(target_arch = "xtensa")]
     extern "C" {
         fn ets_printf(format: *const core::ffi::c_char, ...) -> i32;
     }
 
     const HOST_FRAME_QUEUE_DEPTH: usize = 4;
-    const FRAME_RESPONSE_BACKOFF_MS: u64 = 10;
 
     type HostFrameResult = Result<(shared::cdc::CdcCommand, Vec<u8>), HostFrameError>;
-    type HostFrameSignal = Signal<CriticalSectionRawMutex, HostFrameResult>;
     type HostFrameSender =
         Sender<'static, CriticalSectionRawMutex, HostFrameJob, HOST_FRAME_QUEUE_DEPTH>;
     type HostFrameReceiver =
         Receiver<'static, CriticalSectionRawMutex, HostFrameJob, HOST_FRAME_QUEUE_DEPTH>;
+    type HostFrameResponseSender =
+        Sender<'static, CriticalSectionRawMutex, HostFrameResult, HOST_FRAME_QUEUE_DEPTH>;
+    type HostFrameResponseReceiver =
+        Receiver<'static, CriticalSectionRawMutex, HostFrameResult, HOST_FRAME_QUEUE_DEPTH>;
 
     static HOST_FRAME_CHANNEL: Channel<
         CriticalSectionRawMutex,
@@ -369,11 +375,16 @@ mod tasks {
         HOST_FRAME_QUEUE_DEPTH,
     > = Channel::new();
 
+    static HOST_FRAME_RESPONSE_CHANNEL: Channel<
+        CriticalSectionRawMutex,
+        HostFrameResult,
+        HOST_FRAME_QUEUE_DEPTH,
+    > = Channel::new();
+
     #[derive(Debug)]
     struct HostFrameJob {
         command: shared::cdc::CdcCommand,
         frame: Vec<u8>,
-        response: Arc<HostFrameSignal>,
     }
 
     #[derive(Debug)]
@@ -382,12 +393,38 @@ mod tasks {
         Protocol(sync::ProtocolError),
     }
 
+    #[cfg(any(test, feature = "ui-tests"))]
+    static SLOW_FLASH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
     fn host_frame_sender() -> HostFrameSender {
         HOST_FRAME_CHANNEL.sender()
     }
 
     pub fn host_frame_receiver() -> HostFrameReceiver {
         HOST_FRAME_CHANNEL.receiver()
+    }
+
+    pub fn host_frame_response_sender() -> HostFrameResponseSender {
+        HOST_FRAME_RESPONSE_CHANNEL.sender()
+    }
+
+    fn host_frame_response_receiver() -> HostFrameResponseReceiver {
+        HOST_FRAME_RESPONSE_CHANNEL.receiver()
+    }
+
+    #[cfg(any(test, feature = "ui-tests"))]
+    pub fn set_flash_delay_ms(delay_ms: u64) {
+        SLOW_FLASH_DELAY_MS.store(delay_ms, Ordering::Relaxed);
+    }
+
+    async fn maybe_simulate_flash_delay() {
+        #[cfg(any(test, feature = "ui-tests"))]
+        {
+            let delay_ms = SLOW_FLASH_DELAY_MS.load(Ordering::Relaxed);
+            if delay_ms > 0 {
+                Timer::after_millis(delay_ms).await;
+            }
+        }
     }
 
     #[task]
@@ -428,6 +465,7 @@ mod tasks {
     #[task]
     pub async fn frame_worker(
         mut jobs: HostFrameReceiver,
+        responses: HostFrameResponseSender,
         boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
     ) {
         let mut boot_state = boot_signal.wait().await;
@@ -443,14 +481,16 @@ mod tasks {
                 boot_state = updated;
             }
 
-            let mut job = jobs.receive().await;
+            let job = jobs.receive().await;
+            maybe_simulate_flash_delay().await;
+
             let response = match boot_state.as_mut() {
                 Ok(ctx) => process_host_frame(job.command, &job.frame, ctx)
                     .map_err(HostFrameError::Protocol),
                 Err(error) => Err(HostFrameError::Boot(boot_failure_payload(error))),
             };
 
-            job.response.signal(response);
+            let _ = responses.send(response).await;
         }
     }
 
@@ -496,6 +536,7 @@ mod tasks {
         mut events: UsbEventReceiver,
     ) {
         let frame_jobs = host_frame_sender();
+        let mut frame_responses = host_frame_response_receiver();
         let callbacks = TransportCallbacks::new();
         let packet_size = receiver.max_packet_size() as usize;
         callbacks.waiting().await;
@@ -516,23 +557,23 @@ mod tasks {
 
             loop {
                 let read_future = read_frame(&mut receiver);
+                let response_future = frame_responses.receive();
                 let event_future = events.receive();
-                let combined = select(read_future, event_future);
                 let control_future = control.control_changed();
 
-                match select(combined, control_future).await {
+                match select(
+                    select(read_future, response_future),
+                    select(event_future, control_future),
+                )
+                .await
+                {
                     Either::First(Either::First(Ok((command, frame)))) => {
                         callbacks.connected().await;
-                        let response_signal = Arc::new(HostFrameSignal::new());
-                        let send_result = frame_jobs
-                            .send(HostFrameJob {
-                                command,
-                                frame,
-                                response: response_signal.clone(),
-                            })
-                            .await;
-
-                        if send_result.is_err() {
+                        if frame_jobs
+                            .send(HostFrameJob { command, frame })
+                            .await
+                            .is_err()
+                        {
                             let payload = encode_nack_payload(sync::ProtocolError::Transport);
                             if let Err(write_err) = write_frame(
                                 &mut sender,
@@ -547,62 +588,6 @@ mod tasks {
                                 }
                             }
                             callbacks.error().await;
-                            continue;
-                        }
-
-                        match wait_for_frame_response(
-                            response_signal.as_ref(),
-                            &mut events,
-                            &mut control,
-                            &callbacks,
-                            &receiver,
-                        )
-                        .await
-                        {
-                            Ok(Ok((response_command, response))) => {
-                                if let Err(err) = write_frame(
-                                    &mut sender,
-                                    packet_size,
-                                    response_command,
-                                    &response,
-                                )
-                                .await
-                                {
-                                    if handle_frame_error(err, &callbacks).await {
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(Err(HostFrameError::Boot(payload))) => {
-                                if let Err(err) = write_frame(
-                                    &mut sender,
-                                    packet_size,
-                                    shared::cdc::CdcCommand::Nack,
-                                    &payload,
-                                )
-                                .await
-                                {
-                                    if handle_frame_error(err, &callbacks).await {
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(Err(HostFrameError::Protocol(err))) => {
-                                let payload = encode_nack_payload(err);
-                                if let Err(err) = write_frame(
-                                    &mut sender,
-                                    packet_size,
-                                    shared::cdc::CdcCommand::Nack,
-                                    &payload,
-                                )
-                                .await
-                                {
-                                    if handle_frame_error(err, &callbacks).await {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(SessionControl::Drop) => break,
                         }
                     }
                     Either::First(Either::First(Err(FrameIoError::Protocol(err)))) => {
@@ -625,7 +610,55 @@ mod tasks {
                             break;
                         }
                     }
-                    Either::First(Either::Second(event)) => {
+                    Either::First(Either::Second(response)) => {
+                        callbacks.connected().await;
+                        match response {
+                            Ok((response_command, response)) => {
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    response_command,
+                                    &response,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(HostFrameError::Boot(payload)) => {
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    shared::cdc::CdcCommand::Nack,
+                                    &payload,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(HostFrameError::Protocol(err)) => {
+                                let payload = encode_nack_payload(err);
+                                if let Err(err) = write_frame(
+                                    &mut sender,
+                                    packet_size,
+                                    shared::cdc::CdcCommand::Nack,
+                                    &payload,
+                                )
+                                .await
+                                {
+                                    if handle_frame_error(err, &callbacks).await {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Either::Second(Either::First(event)) => {
                         if matches!(
                             handle_usb_event(event, &callbacks, &receiver).await,
                             SessionControl::Drop
@@ -633,52 +666,13 @@ mod tasks {
                             break;
                         }
                     }
-                    Either::Second(()) => {
+                    Either::Second(Either::Second(())) => {
                         if !receiver.dtr() {
                             callbacks.waiting().await;
                             break;
                         }
                     }
                 }
-            }
-        }
-    }
-
-    async fn wait_for_frame_response(
-        response: &HostFrameSignal,
-        events: &mut UsbEventReceiver,
-        control: &mut ControlChanged<'static>,
-        callbacks: &TransportCallbacks,
-        receiver: &BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-    ) -> Result<HostFrameResult, SessionControl> {
-        loop {
-            let response_future = response.wait();
-            let event_future = events.receive();
-            let control_future = control.control_changed();
-            let timeout_future = Timer::after_millis(FRAME_RESPONSE_BACKOFF_MS);
-
-            match select(
-                select(response_future, event_future),
-                select(control_future, timeout_future),
-            )
-            .await
-            {
-                Either::First(Either::First(result)) => return Ok(result),
-                Either::First(Either::Second(event)) => {
-                    if matches!(
-                        handle_usb_event(event, callbacks, receiver).await,
-                        SessionControl::Drop
-                    ) {
-                        return Err(SessionControl::Drop);
-                    }
-                }
-                Either::Second(Either::First(())) => {
-                    if !receiver.dtr() {
-                        callbacks.waiting().await;
-                        return Err(SessionControl::Drop);
-                    }
-                }
-                Either::Second(Either::Second(())) => {}
             }
         }
     }
