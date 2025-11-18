@@ -1,3 +1,4 @@
+#[cfg(test)]
 use alloc::boxed::Box;
 use heapless::Deque;
 use trouble_host::IoCapabilities;

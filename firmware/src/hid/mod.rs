@@ -5,7 +5,9 @@ pub mod ble;
 #[cfg(any(test, target_arch = "xtensa"))]
 pub mod actions {
     use crate::ui::transport::{self, TransportState};
-    use alloc::{boxed::Box, vec::Vec};
+    use alloc::boxed::Box;
+    #[cfg(test)]
+    use alloc::vec::Vec;
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
     use heapless::Vec as HeaplessVec;
@@ -174,16 +176,16 @@ const USB_MAX_PACKET_SIZE: u16 = 64;
 #[cfg(target_arch = "xtensa")]
 pub mod runtime {
     use super::BootContext;
+    use super::USB_MAX_PACKET_SIZE;
     use super::actions;
     use super::usb;
-    use crate::storage::{self, BootFlash, StorageError};
-    use crate::sync::{self, SyncContext};
+    use crate::storage::BootFlash;
     use crate::system;
     use core::future::pending;
     use embassy_executor::{SpawnError, Spawner};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
-    use esp_alloc::EspHeap;
+    use esp_alloc::{EspHeap, HeapRegion, MemoryCapability};
     use esp_hal::{
         Config,
         clock::CpuClock,
@@ -193,7 +195,7 @@ pub mod runtime {
         },
         timer::timg::TimerGroup,
     };
-    use esp_storage::{FlashStorage, FlashStorageError};
+    use esp_storage::FlashStorage;
     use static_cell::StaticCell;
 
     #[global_allocator]
@@ -202,7 +204,13 @@ pub mod runtime {
     fn init_allocator() {
         const HEAP_SIZE: usize = 96 * 1024;
         static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-        unsafe { ALLOCATOR.init(HEAP.as_mut_ptr(), HEAP.len()) };
+        unsafe {
+            ALLOCATOR.add_region(HeapRegion::new(
+                HEAP.as_mut_ptr(),
+                HEAP.len(),
+                MemoryCapability::Internal.into(),
+            ));
+        };
     }
 
     static USB_CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
@@ -325,6 +333,7 @@ pub mod runtime {
 #[cfg(target_arch = "xtensa")]
 mod tasks {
     use super::BootContext;
+    use super::USB_MAX_PACKET_SIZE;
     use super::actions;
     use super::ble::{
         BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
@@ -454,9 +463,10 @@ mod tasks {
             }
             .await;
 
+            let restore_ok = boot_result.is_ok();
             signal.signal(boot_result);
 
-            if matches!(boot_result, BootContext::Ok(_)) {
+            if restore_ok {
                 break;
             }
 
@@ -468,7 +478,7 @@ mod tasks {
 
     #[task]
     pub async fn frame_worker(
-        mut jobs: HostFrameReceiver,
+        jobs: HostFrameReceiver,
         responses: HostFrameResponseSender,
         boot_signal: &'static Signal<CriticalSectionRawMutex, BootContext>,
     ) {
@@ -936,7 +946,7 @@ mod tasks {
     }
 
     #[task]
-    pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
+    pub async fn ble_profile(receiver: actions::ActionReceiver) {
         let profile = profile::TroubleProfile::new("Cardputer HID").expect("init BLE profile");
         let mut backend = BleHid::new(profile, IoCapabilities::KeyboardDisplay);
         let mut queue = HidCommandQueue::<HID_COMMAND_QUEUE_DEPTH>::new();
