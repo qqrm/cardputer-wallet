@@ -628,7 +628,7 @@ impl SyncContext {
                     VaultArtifact::Signature => self.signature.as_slice(),
                 },
             );
-            let chunk = pending.chunk().clone();
+            let chunk = pending.chunk();
             let response = DeviceResponse::VaultChunk(chunk.clone());
             let encoded_len = match encode_device_response(&response) {
                 Ok(bytes) => bytes.len(),

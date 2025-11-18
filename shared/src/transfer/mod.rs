@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::cmp;
 
@@ -68,12 +69,12 @@ impl ArtifactStream {
     }
 
     pub fn prepare_chunk<'a, F>(
-        &'a self,
+        &self,
         sequence: u32,
         payload_limit: usize,
         device_chunk_size: u32,
         mut view: F,
-    ) -> PendingChunk
+    ) -> PendingChunk<'a>
     where
         F: FnMut(VaultArtifact) -> &'a [u8],
     {
@@ -94,20 +95,16 @@ impl ArtifactStream {
         let available = buffer.len().saturating_sub(offset);
         let chunk_size = cmp::min(payload_limit, available);
         let slice_end = offset + chunk_size;
-        let payload = if chunk_size == 0 {
-            Vec::new()
-        } else {
-            buffer[offset..slice_end].to_vec()
-        };
+        let payload = Cow::Borrowed(&buffer[offset..slice_end]);
         let remaining = buffer.len().saturating_sub(slice_end) as u64;
         let checksum = accumulate_checksum(0, &payload);
-        let chunk = VaultChunk {
+        let chunk = PendingVaultChunk {
             protocol_version: PROTOCOL_VERSION,
             sequence,
             total_size: buffer.len() as u64,
             remaining_bytes: remaining,
             device_chunk_size,
-            data: payload,
+            payload,
             checksum,
             is_last: remaining == 0,
             artifact,
@@ -125,7 +122,7 @@ impl ArtifactStream {
         }
     }
 
-    pub fn commit_chunk(&mut self, pending: PendingChunk) -> VaultChunk {
+    pub fn commit_chunk(&mut self, pending: PendingChunk<'_>) -> VaultChunk {
         match pending.artifact {
             VaultArtifact::Vault => {
                 self.vault_offset = pending.slice_end;
@@ -169,7 +166,7 @@ impl ArtifactStream {
             };
         }
 
-        chunk
+        chunk.into_chunk()
     }
 }
 
@@ -179,21 +176,68 @@ impl Default for ArtifactStream {
     }
 }
 
-pub struct PendingChunk {
-    chunk: VaultChunk,
+pub struct PendingChunk<'a> {
+    chunk: PendingVaultChunk<'a>,
     artifact: VaultArtifact,
     slice_end: usize,
     has_recipients: bool,
     has_signature: bool,
 }
 
-impl PendingChunk {
-    pub fn chunk(&self) -> &VaultChunk {
-        &self.chunk
+impl PendingChunk<'_> {
+    pub fn payload(&self) -> &[u8] {
+        &self.chunk.payload
+    }
+
+    pub fn chunk(&self) -> VaultChunk {
+        self.chunk.to_chunk()
     }
 
     pub fn into_chunk(self) -> VaultChunk {
-        self.chunk
+        self.chunk.into_chunk()
+    }
+}
+
+#[derive(Clone)]
+struct PendingVaultChunk<'a> {
+    protocol_version: u16,
+    sequence: u32,
+    total_size: u64,
+    remaining_bytes: u64,
+    device_chunk_size: u32,
+    payload: Cow<'a, [u8]>,
+    checksum: u32,
+    is_last: bool,
+    artifact: VaultArtifact,
+}
+
+impl PendingVaultChunk<'_> {
+    fn to_chunk(&self) -> VaultChunk {
+        VaultChunk {
+            protocol_version: self.protocol_version,
+            sequence: self.sequence,
+            total_size: self.total_size,
+            remaining_bytes: self.remaining_bytes,
+            device_chunk_size: self.device_chunk_size,
+            data: self.payload.clone().into_owned(),
+            checksum: self.checksum,
+            is_last: self.is_last,
+            artifact: self.artifact,
+        }
+    }
+
+    fn into_chunk(self) -> VaultChunk {
+        VaultChunk {
+            protocol_version: self.protocol_version,
+            sequence: self.sequence,
+            total_size: self.total_size,
+            remaining_bytes: self.remaining_bytes,
+            device_chunk_size: self.device_chunk_size,
+            data: self.payload.into_owned(),
+            checksum: self.checksum,
+            is_last: self.is_last,
+            artifact: self.artifact,
+        }
     }
 }
 
@@ -526,5 +570,46 @@ mod tests {
             err,
             TransferError::MetadataMismatch("remaining_bytes")
         ));
+    }
+
+    #[test]
+    fn prepare_chunk_borrows_empty_payload() {
+        let mut stream = ArtifactStream::new();
+        let data = b"vault-bytes";
+        stream.reset(ArtifactLengths {
+            vault: data.len(),
+            recipients: 0,
+            signature: 0,
+        });
+
+        let pending = stream.prepare_chunk(1, 0, 64, |_| data);
+
+        assert!(pending.payload().is_empty());
+        assert!(matches!(pending.chunk.payload, Cow::Borrowed(_)));
+        assert_eq!(pending.chunk.remaining_bytes, data.len() as u64);
+
+        let chunk = stream.commit_chunk(pending);
+        assert_eq!(chunk.data.len(), 0);
+        assert_eq!(chunk.total_size, data.len() as u64);
+        assert_eq!(chunk.remaining_bytes, data.len() as u64);
+    }
+
+    #[test]
+    fn commit_chunk_advances_offsets_for_borrowed_payload() {
+        let mut stream = ArtifactStream::new();
+        let data = b"abcdef";
+        stream.reset(ArtifactLengths {
+            vault: data.len(),
+            recipients: 0,
+            signature: 0,
+        });
+
+        let pending = stream.prepare_chunk(1, 2, 64, |_| data);
+        let chunk = stream.commit_chunk(pending);
+
+        assert_eq!(chunk.data, b"ab");
+        assert_eq!(chunk.remaining_bytes, (data.len() - 2) as u64);
+        assert_eq!(stream.vault_offset, 2);
+        assert!(matches!(stream.stage, TransferStage::Vault));
     }
 }
