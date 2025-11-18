@@ -629,7 +629,7 @@ impl SyncContext {
                 },
             );
             let (chunk, commit) = pending.into_chunk();
-            let mut response = DeviceResponse::VaultChunk(chunk);
+            let response = DeviceResponse::VaultChunk(chunk);
             let encoded_len = match encode_device_response(&response) {
                 Ok(bytes) => bytes.len(),
                 Err(_) => {
