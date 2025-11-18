@@ -111,7 +111,7 @@ fn decode_request(frame: &[u8]) -> Result<HostRequest, ProtocolError> {
     decode_host_request(frame).map_err(|err| ProtocolError::Decode(err.to_string()))
 }
 
-pub(crate) fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_response(response: &DeviceResponse) -> Result<Vec<u8>, ProtocolError> {
     encode_device_response(response).map_err(|err| ProtocolError::Encode(err.to_string()))
 }
 
