@@ -57,7 +57,7 @@ embassy-futures = { version = "0.1.2", default-features = false }
 embassy-time = { version = "0.5.0", features = ["log"] }
 embassy-embedded-hal = { version = "0.5.0", default-features = false }
 embedded-io = "0.7.1"
-embedded-io-async = "0.7.0"
+embedded-io-async = "0.6.1"
 embassy-usb = { version = "0.5.1", default-features = false }
 embassy-usb-driver = { version = "0.2.0", default-features = false }
 bt-hci = "0.6.0"
@@ -65,3 +65,4 @@ static_cell = "2.1"
 trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"] }
 esp-storage = { version = "0.8", default-features = false, features = ["critical-section", "esp32s3"] }
 nb = "1.1"
+embedded-storage = { version = "0.3", default-features = false }

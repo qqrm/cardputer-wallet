@@ -3,6 +3,8 @@
 use core::ops::Range;
 #[cfg(target_arch = "xtensa")]
 use embedded_storage::nor_flash::NorFlash as BlockingNorFlash;
+#[cfg(target_arch = "xtensa")]
+use embedded_storage::nor_flash::ReadNorFlash;
 #[cfg(any(test, target_arch = "xtensa"))]
 use embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash;
 use sequential_storage::Error as FlashStorageError;
