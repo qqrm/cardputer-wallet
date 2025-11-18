@@ -11,6 +11,8 @@ pub mod actions {
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::channel::{Channel, Receiver, Sender};
     use heapless::Vec as HeaplessVec;
+    #[cfg(test)]
+    use std::sync::Mutex;
 
     type QueueMutex = CriticalSectionRawMutex;
 
@@ -20,6 +22,8 @@ pub mod actions {
     pub const MACRO_BUFFER_CAPACITY: usize = 32;
 
     static ACTION_CHANNEL: Channel<QueueMutex, DeviceAction, ACTION_QUEUE_DEPTH> = Channel::new();
+    #[cfg(test)]
+    static ACTION_GUARD: Mutex<()> = Mutex::new(());
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum DeviceAction {
@@ -138,6 +142,9 @@ pub mod actions {
     }
 
     pub fn publish(action: DeviceAction) {
+        #[cfg(test)]
+        let _guard = ACTION_GUARD.lock().unwrap();
+
         if let DeviceAction::StartSession { .. } = &action {
             transport::set_ble_state(TransportState::Connecting);
         }
@@ -150,6 +157,7 @@ pub mod actions {
 
     #[cfg(test)]
     pub fn clear() {
+        let _guard = ACTION_GUARD.lock().unwrap();
         action_sender().clear();
         let receiver = action_receiver();
         while receiver.try_receive().is_ok() {}
@@ -157,6 +165,7 @@ pub mod actions {
 
     #[cfg(test)]
     pub fn drain() -> Vec<DeviceAction> {
+        let _guard = ACTION_GUARD.lock().unwrap();
         let receiver = action_receiver();
         let mut collected = Vec::new();
         while let Ok(action) = receiver.try_receive() {
