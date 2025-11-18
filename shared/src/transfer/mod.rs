@@ -13,58 +13,238 @@ pub struct ArtifactLengths {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransferStage {
-    Vault,
-    Recipients,
-    Signature,
-    Complete,
+struct ArtifactSpec {
+    expected: bool,
+    hash: Option<[u8; 32]>,
 }
 
-impl TransferStage {
-    fn first_with_lengths(lengths: ArtifactLengths) -> Self {
-        if lengths.vault > 0 {
-            TransferStage::Vault
-        } else if lengths.recipients > 0 {
-            TransferStage::Recipients
-        } else if lengths.signature > 0 {
-            TransferStage::Signature
-        } else {
-            TransferStage::Complete
+impl ArtifactSpec {
+    const fn new(expected: bool) -> Self {
+        Self {
+            expected,
+            hash: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactManifest {
+    vault: ArtifactSpec,
+    recipients: ArtifactSpec,
+    signature: ArtifactSpec,
+}
+
+impl ArtifactManifest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_lengths(lengths: ArtifactLengths) -> Self {
+        let mut manifest = ArtifactManifest {
+            vault: ArtifactSpec::new(lengths.vault > 0),
+            ..ArtifactManifest::new()
+        };
+        manifest.set_expected(VaultArtifact::Recipients, lengths.recipients > 0);
+        manifest.set_expected(VaultArtifact::Signature, lengths.signature > 0);
+        manifest
+    }
+
+    pub fn set_expected(&mut self, artifact: VaultArtifact, expected: bool) {
+        if matches!(artifact, VaultArtifact::Vault) {
+            return;
+        }
+
+        self.spec_mut(artifact).expected = expected;
+    }
+
+    pub fn set_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
+        let spec = self.spec_mut(artifact);
+        spec.hash = (hash != [0u8; 32]).then_some(hash);
+        if matches!(artifact, VaultArtifact::Vault) {
+            return;
+        }
+
+        spec.expected |= spec.hash.is_some();
+    }
+
+    pub fn hash(&self, artifact: VaultArtifact) -> Option<[u8; 32]> {
+        self.spec(artifact).hash
+    }
+
+    pub fn expected(&self, artifact: VaultArtifact) -> bool {
+        self.spec(artifact).expected
+    }
+
+    fn spec(&self, artifact: VaultArtifact) -> &ArtifactSpec {
+        match artifact {
+            VaultArtifact::Vault => &self.vault,
+            VaultArtifact::Recipients => &self.recipients,
+            VaultArtifact::Signature => &self.signature,
+        }
+    }
+
+    fn spec_mut(&mut self, artifact: VaultArtifact) -> &mut ArtifactSpec {
+        match artifact {
+            VaultArtifact::Vault => &mut self.vault,
+            VaultArtifact::Recipients => &mut self.recipients,
+            VaultArtifact::Signature => &mut self.signature,
+        }
+    }
+
+    fn sequence(&self) -> impl Iterator<Item = VaultArtifact> + '_ {
+        [
+            VaultArtifact::Vault,
+            VaultArtifact::Recipients,
+            VaultArtifact::Signature,
+        ]
+        .into_iter()
+        .filter(|artifact| self.expected(*artifact))
+    }
+
+    fn first(&self) -> Option<VaultArtifact> {
+        self.sequence().next()
+    }
+
+    fn next_after(&self, artifact: VaultArtifact) -> Option<VaultArtifact> {
+        let mut iter = self.sequence();
+        while let Some(current) = iter.next() {
+            if current == artifact {
+                return iter.next();
+            }
+        }
+
+        None
+    }
+}
+
+impl Default for ArtifactManifest {
+    fn default() -> Self {
+        Self {
+            vault: ArtifactSpec::new(true),
+            recipients: ArtifactSpec::new(false),
+            signature: ArtifactSpec::new(false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TransferState {
+    Waiting(VaultArtifact),
+    Completed,
+}
+
+impl TransferState {
+    fn new(manifest: &ArtifactManifest) -> Self {
+        manifest
+            .first()
+            .map(TransferState::Waiting)
+            .unwrap_or(TransferState::Completed)
+    }
+
+    fn artifact_or_default(&self, last_artifact: VaultArtifact) -> VaultArtifact {
+        match self {
+            TransferState::Waiting(artifact) => *artifact,
+            TransferState::Completed => last_artifact,
+        }
+    }
+
+    fn ensure_expected(
+        &self,
+        manifest: &ArtifactManifest,
+        artifact: VaultArtifact,
+    ) -> Result<(), TransferError> {
+        match self {
+            TransferState::Waiting(expected) if *expected == artifact => Ok(()),
+            TransferState::Waiting(_) if manifest.expected(artifact) => {
+                Err(TransferError::OutOfOrder(artifact))
+            }
+            TransferState::Waiting(_) => Err(TransferError::UnexpectedArtifact(artifact)),
+            TransferState::Completed => Err(TransferError::UnexpectedArtifact(artifact)),
+        }
+    }
+
+    fn advance(
+        self,
+        manifest: &ArtifactManifest,
+        artifact: VaultArtifact,
+        chunk_complete: bool,
+    ) -> Self {
+        if !chunk_complete {
+            return TransferState::Waiting(artifact);
+        }
+
+        manifest
+            .next_after(artifact)
+            .map(TransferState::Waiting)
+            .unwrap_or(TransferState::Completed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ArtifactOffsets {
+    vault: usize,
+    recipients: usize,
+    signature: usize,
+}
+
+impl ArtifactOffsets {
+    fn offset(&self, artifact: VaultArtifact) -> usize {
+        match artifact {
+            VaultArtifact::Vault => self.vault,
+            VaultArtifact::Recipients => self.recipients,
+            VaultArtifact::Signature => self.signature,
+        }
+    }
+
+    fn update(&mut self, artifact: VaultArtifact, next_offset: usize) {
+        match artifact {
+            VaultArtifact::Vault => self.vault = next_offset,
+            VaultArtifact::Recipients => self.recipients = next_offset,
+            VaultArtifact::Signature => self.signature = next_offset,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ArtifactStream {
-    vault_offset: usize,
-    recipients_offset: usize,
-    signature_offset: usize,
-    stage: TransferStage,
+    offsets: ArtifactOffsets,
+    manifest: ArtifactManifest,
+    state: TransferState,
     last_artifact: VaultArtifact,
 }
 
 impl ArtifactStream {
     pub const fn new() -> Self {
         Self {
-            vault_offset: 0,
-            recipients_offset: 0,
-            signature_offset: 0,
-            stage: TransferStage::Complete,
+            offsets: ArtifactOffsets {
+                vault: 0,
+                recipients: 0,
+                signature: 0,
+            },
+            manifest: ArtifactManifest {
+                vault: ArtifactSpec {
+                    expected: true,
+                    hash: None,
+                },
+                recipients: ArtifactSpec {
+                    expected: false,
+                    hash: None,
+                },
+                signature: ArtifactSpec {
+                    expected: false,
+                    hash: None,
+                },
+            },
+            state: TransferState::Completed,
             last_artifact: VaultArtifact::Vault,
         }
     }
 
     pub fn reset(&mut self, lengths: ArtifactLengths) {
-        self.vault_offset = 0;
-        self.recipients_offset = 0;
-        self.signature_offset = 0;
-        self.stage = TransferStage::first_with_lengths(lengths);
-        self.last_artifact = match self.stage {
-            TransferStage::Vault => VaultArtifact::Vault,
-            TransferStage::Recipients => VaultArtifact::Recipients,
-            TransferStage::Signature => VaultArtifact::Signature,
-            TransferStage::Complete => VaultArtifact::Vault,
-        };
+        self.offsets = ArtifactOffsets::default();
+        self.manifest = ArtifactManifest::from_lengths(lengths);
+        self.state = TransferState::new(&self.manifest);
+        self.last_artifact = self.manifest.first().unwrap_or(VaultArtifact::Vault);
     }
 
     pub fn prepare_chunk<'a, F>(
@@ -77,19 +257,10 @@ impl ArtifactStream {
     where
         F: FnMut(VaultArtifact) -> &'a [u8],
     {
-        let artifact = match self.stage {
-            TransferStage::Vault => VaultArtifact::Vault,
-            TransferStage::Recipients => VaultArtifact::Recipients,
-            TransferStage::Signature => VaultArtifact::Signature,
-            TransferStage::Complete => self.last_artifact,
-        };
+        let artifact = self.state.artifact_or_default(self.last_artifact);
 
         let buffer = view(artifact);
-        let offset = match artifact {
-            VaultArtifact::Vault => self.vault_offset,
-            VaultArtifact::Recipients => self.recipients_offset,
-            VaultArtifact::Signature => self.signature_offset,
-        };
+        let offset = self.offsets.offset(artifact);
 
         let available = buffer.len().saturating_sub(offset);
         let chunk_size = cmp::min(payload_limit, available);
@@ -113,61 +284,21 @@ impl ArtifactStream {
             artifact,
         };
 
-        let has_recipients = !view(VaultArtifact::Recipients).is_empty();
-        let has_signature = !view(VaultArtifact::Signature).is_empty();
-
         PendingChunk {
             chunk,
             artifact,
             slice_end,
-            has_recipients,
-            has_signature,
         }
     }
 
     pub fn commit_chunk(&mut self, pending: PendingChunk) -> VaultChunk {
-        match pending.artifact {
-            VaultArtifact::Vault => {
-                self.vault_offset = pending.slice_end;
-            }
-            VaultArtifact::Recipients => {
-                self.recipients_offset = pending.slice_end;
-            }
-            VaultArtifact::Signature => {
-                self.signature_offset = pending.slice_end;
-            }
-        }
+        self.offsets.update(pending.artifact, pending.slice_end);
 
         self.last_artifact = pending.artifact;
         let chunk = pending.chunk;
-
-        if chunk.is_last {
-            self.stage = match pending.artifact {
-                VaultArtifact::Vault => {
-                    if pending.has_recipients {
-                        TransferStage::Recipients
-                    } else if pending.has_signature {
-                        TransferStage::Signature
-                    } else {
-                        TransferStage::Complete
-                    }
-                }
-                VaultArtifact::Recipients => {
-                    if pending.has_signature {
-                        TransferStage::Signature
-                    } else {
-                        TransferStage::Complete
-                    }
-                }
-                VaultArtifact::Signature => TransferStage::Complete,
-            };
-        } else {
-            self.stage = match pending.artifact {
-                VaultArtifact::Vault => TransferStage::Vault,
-                VaultArtifact::Recipients => TransferStage::Recipients,
-                VaultArtifact::Signature => TransferStage::Signature,
-            };
-        }
+        self.state = self
+            .state
+            .advance(&self.manifest, pending.artifact, chunk.is_last);
 
         chunk
     }
@@ -183,8 +314,6 @@ pub struct PendingChunk {
     chunk: VaultChunk,
     artifact: VaultArtifact,
     slice_end: usize,
-    has_recipients: bool,
-    has_signature: bool,
 }
 
 impl PendingChunk {
@@ -238,17 +367,13 @@ impl core::fmt::Display for TransferError {
 }
 
 pub struct ArtifactCollector {
+    manifest: ArtifactManifest,
+    state: TransferState,
     vault: Vec<u8>,
     recipients: Vec<u8>,
     signature: Vec<u8>,
-    vault_hash: Option<[u8; 32]>,
-    recipients_hash: Option<[u8; 32]>,
-    signature_hash: Option<[u8; 32]>,
-    recipients_expected: bool,
-    signature_expected: bool,
     recipients_seen: bool,
     signature_seen: bool,
-    stage: TransferStage,
 }
 
 impl ArtifactCollector {
@@ -256,62 +381,44 @@ impl ArtifactCollector {
         Self::default()
     }
 
-    pub fn set_recipients_expected(&mut self, expected: bool) {
-        self.recipients_expected = expected;
-    }
-
-    pub fn set_signature_expected(&mut self, expected: bool) {
-        self.signature_expected = expected;
-    }
-
-    pub fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
-        let hash_option = if hash != [0u8; 32] { Some(hash) } else { None };
-
-        match artifact {
-            VaultArtifact::Vault => {
-                self.vault_hash = hash_option;
-            }
-            VaultArtifact::Recipients => {
-                self.recipients_hash = hash_option;
-                self.recipients_expected = hash_option.is_some();
-            }
-            VaultArtifact::Signature => {
-                self.signature_hash = hash_option;
-                self.signature_expected = hash_option.is_some();
-            }
+    pub fn with_manifest(manifest: ArtifactManifest) -> Self {
+        let state = TransferState::new(&manifest);
+        Self {
+            manifest,
+            state,
+            vault: Vec::new(),
+            recipients: Vec::new(),
+            signature: Vec::new(),
+            recipients_seen: false,
+            signature_seen: false,
         }
     }
 
+    pub fn set_recipients_expected(&mut self, expected: bool) {
+        self.manifest
+            .set_expected(VaultArtifact::Recipients, expected);
+    }
+
+    pub fn set_signature_expected(&mut self, expected: bool) {
+        self.manifest
+            .set_expected(VaultArtifact::Signature, expected);
+    }
+
+    pub fn set_expected_hash(&mut self, artifact: VaultArtifact, hash: [u8; 32]) {
+        self.manifest.set_hash(artifact, hash);
+    }
+
     pub fn record_chunk(&mut self, chunk: &VaultChunk) -> Result<bool, TransferError> {
+        self.state.ensure_expected(&self.manifest, chunk.artifact)?;
+
         match chunk.artifact {
             VaultArtifact::Vault => {
-                if !matches!(self.stage, TransferStage::Vault | TransferStage::Complete) {
-                    return Err(TransferError::OutOfOrder(VaultArtifact::Vault));
-                }
-                self.stage = TransferStage::Vault;
                 Self::ingest_chunk(&mut self.vault, chunk)?;
                 if chunk.is_last {
                     self.verify_hash(VaultArtifact::Vault)?;
-                    self.stage = if self.recipients_expected {
-                        TransferStage::Recipients
-                    } else if self.signature_expected {
-                        TransferStage::Signature
-                    } else {
-                        TransferStage::Complete
-                    };
                 }
             }
             VaultArtifact::Recipients => {
-                if !self.recipients_expected {
-                    return Err(TransferError::UnexpectedArtifact(VaultArtifact::Recipients));
-                }
-                if !matches!(
-                    self.stage,
-                    TransferStage::Recipients | TransferStage::Complete
-                ) {
-                    return Err(TransferError::OutOfOrder(VaultArtifact::Recipients));
-                }
-                self.stage = TransferStage::Recipients;
                 if chunk.sequence == 1 {
                     self.recipients.clear();
                 }
@@ -319,24 +426,9 @@ impl ArtifactCollector {
                 self.recipients_seen = true;
                 if chunk.is_last {
                     self.verify_hash(VaultArtifact::Recipients)?;
-                    self.stage = if self.signature_expected {
-                        TransferStage::Signature
-                    } else {
-                        TransferStage::Complete
-                    };
                 }
             }
             VaultArtifact::Signature => {
-                if !self.signature_expected {
-                    return Err(TransferError::UnexpectedArtifact(VaultArtifact::Signature));
-                }
-                if !matches!(
-                    self.stage,
-                    TransferStage::Signature | TransferStage::Complete
-                ) {
-                    return Err(TransferError::OutOfOrder(VaultArtifact::Signature));
-                }
-                self.stage = TransferStage::Signature;
                 if chunk.sequence == 1 {
                     self.signature.clear();
                 }
@@ -344,13 +436,15 @@ impl ArtifactCollector {
                 self.signature_seen = true;
                 if chunk.is_last {
                     self.verify_hash(VaultArtifact::Signature)?;
-                    self.stage = TransferStage::Complete;
                 }
             }
         }
 
-        let transfer_complete = matches!(self.stage, TransferStage::Complete) && chunk.is_last;
-        Ok(!transfer_complete)
+        self.state = self
+            .state
+            .advance(&self.manifest, chunk.artifact, chunk.is_last);
+
+        Ok(!matches!(self.state, TransferState::Completed))
     }
 
     pub fn vault_bytes(&self) -> &[u8] {
@@ -366,7 +460,7 @@ impl ArtifactCollector {
     }
 
     pub fn recipients_expected(&self) -> bool {
-        self.recipients_expected
+        self.manifest.expected(VaultArtifact::Recipients)
     }
 
     pub fn recipients_seen(&self) -> bool {
@@ -374,7 +468,7 @@ impl ArtifactCollector {
     }
 
     pub fn signature_expected(&self) -> bool {
-        self.signature_expected
+        self.manifest.expected(VaultArtifact::Signature)
     }
 
     pub fn signature_seen(&self) -> bool {
@@ -413,11 +507,7 @@ impl ArtifactCollector {
     }
 
     fn verify_hash(&self, artifact: VaultArtifact) -> Result<(), TransferError> {
-        let expected = match artifact {
-            VaultArtifact::Vault => self.vault_hash,
-            VaultArtifact::Recipients => self.recipients_hash,
-            VaultArtifact::Signature => self.signature_hash,
-        };
+        let expected = self.manifest.hash(artifact);
 
         let Some(expected_hash) = expected else {
             return Ok(());
@@ -444,19 +534,7 @@ impl ArtifactCollector {
 
 impl Default for ArtifactCollector {
     fn default() -> Self {
-        Self {
-            vault: Vec::new(),
-            recipients: Vec::new(),
-            signature: Vec::new(),
-            vault_hash: None,
-            recipients_hash: None,
-            signature_hash: None,
-            recipients_expected: false,
-            signature_expected: false,
-            recipients_seen: false,
-            signature_seen: false,
-            stage: TransferStage::Vault,
-        }
+        Self::with_manifest(ArtifactManifest::new())
     }
 }
 
@@ -525,6 +603,85 @@ mod tests {
         assert!(matches!(
             err,
             TransferError::MetadataMismatch("remaining_bytes")
+        ));
+    }
+
+    #[test]
+    fn collector_rejects_unexpected_artifact() {
+        let mut collector = ArtifactCollector::new();
+        let chunk = make_chunk(VaultArtifact::Recipients, b"recips", 1, true);
+        let err = collector
+            .record_chunk(&chunk)
+            .expect_err("should reject unexpected recipients chunk");
+        assert!(matches!(
+            err,
+            TransferError::UnexpectedArtifact(VaultArtifact::Recipients)
+        ));
+    }
+
+    #[test]
+    fn collector_rejects_skipped_recipients() {
+        let mut collector = ArtifactCollector::new();
+        collector.set_recipients_expected(true);
+        collector.set_signature_expected(true);
+
+        let vault_chunk = make_chunk(VaultArtifact::Vault, b"vault", 1, true);
+        assert!(
+            collector
+                .record_chunk(&vault_chunk)
+                .expect("should record vault chunk")
+        );
+
+        let signature_chunk = make_chunk(VaultArtifact::Signature, b"sig", 1, true);
+        let err = collector
+            .record_chunk(&signature_chunk)
+            .expect_err("should require recipients before signature");
+        assert!(matches!(
+            err,
+            TransferError::OutOfOrder(VaultArtifact::Signature)
+        ));
+    }
+
+    #[test]
+    fn collector_reports_missing_expected_artifact() {
+        let mut collector = ArtifactCollector::new();
+        collector.set_signature_expected(true);
+        collector.set_expected_hash(VaultArtifact::Signature, [1; 32]);
+
+        let vault_chunk = make_chunk(VaultArtifact::Vault, b"vault", 1, true);
+        assert!(
+            collector
+                .record_chunk(&vault_chunk)
+                .expect("should record vault chunk")
+        );
+
+        let signature_chunk = make_chunk(VaultArtifact::Signature, b"", 1, true);
+        let err = collector
+            .record_chunk(&signature_chunk)
+            .expect_err("should require signature payload");
+        assert!(matches!(
+            err,
+            TransferError::MissingArtifact(VaultArtifact::Signature)
+        ));
+    }
+
+    #[test]
+    fn collector_rejects_additional_chunks_after_completion() {
+        let mut collector = ArtifactCollector::new();
+        let vault_chunk = make_chunk(VaultArtifact::Vault, b"vault", 1, true);
+        assert!(
+            !collector
+                .record_chunk(&vault_chunk)
+                .expect("should finish after vault")
+        );
+
+        let extra_chunk = make_chunk(VaultArtifact::Vault, b"v", 1, true);
+        let err = collector
+            .record_chunk(&extra_chunk)
+            .expect_err("should reject trailing chunk");
+        assert!(matches!(
+            err,
+            TransferError::UnexpectedArtifact(VaultArtifact::Vault)
         ));
     }
 }
