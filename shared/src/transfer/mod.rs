@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::cmp;
 
@@ -253,7 +254,7 @@ impl ArtifactStream {
         payload_limit: usize,
         device_chunk_size: u32,
         mut view: F,
-    ) -> PendingChunk
+    ) -> PendingChunk<'a>
     where
         F: FnMut(VaultArtifact) -> &'a [u8],
     {
@@ -265,40 +266,35 @@ impl ArtifactStream {
         let available = buffer.len().saturating_sub(offset);
         let chunk_size = cmp::min(payload_limit, available);
         let slice_end = offset + chunk_size;
-        let payload = if chunk_size == 0 {
-            Vec::new()
+        let payload = Cow::Borrowed(if chunk_size == 0 {
+            &[] as &[u8]
         } else {
-            buffer[offset..slice_end].to_vec()
-        };
+            &buffer[offset..slice_end]
+        });
         let remaining = buffer.len().saturating_sub(slice_end) as u64;
-        let checksum = accumulate_checksum(0, &payload);
-        let chunk = VaultChunk {
-            protocol_version: PROTOCOL_VERSION,
+        let checksum = accumulate_checksum(0, payload.as_ref());
+        let is_last = remaining == 0;
+
+        PendingChunk {
+            payload,
             sequence,
             total_size: buffer.len() as u64,
             remaining_bytes: remaining,
             device_chunk_size,
-            data: payload,
             checksum,
-            is_last: remaining == 0,
-            artifact,
-        };
-
-        PendingChunk {
-            chunk,
+            is_last,
             artifact,
             slice_end,
         }
     }
 
-    pub fn commit_chunk(&mut self, pending: PendingChunk) -> VaultChunk {
-        self.offsets.update(pending.artifact, pending.slice_end);
+    pub fn commit_chunk(&mut self, chunk: VaultChunk, commit: PendingCommit) -> VaultChunk {
+        self.offsets.update(commit.artifact, commit.slice_end);
 
-        self.last_artifact = pending.artifact;
-        let chunk = pending.chunk;
+        self.last_artifact = commit.artifact;
         self.state = self
             .state
-            .advance(&self.manifest, pending.artifact, chunk.is_last);
+            .advance(&self.manifest, commit.artifact, commit.is_last);
 
         chunk
     }
@@ -310,20 +306,54 @@ impl Default for ArtifactStream {
     }
 }
 
-pub struct PendingChunk {
-    chunk: VaultChunk,
+pub struct PendingChunk<'a> {
+    payload: Cow<'a, [u8]>,
+    sequence: u32,
+    total_size: u64,
+    remaining_bytes: u64,
+    device_chunk_size: u32,
+    checksum: u32,
+    is_last: bool,
     artifact: VaultArtifact,
     slice_end: usize,
 }
 
-impl PendingChunk {
-    pub fn chunk(&self) -> &VaultChunk {
-        &self.chunk
+impl<'a> PendingChunk<'a> {
+    pub fn artifact(&self) -> VaultArtifact {
+        self.artifact
     }
 
-    pub fn into_chunk(self) -> VaultChunk {
-        self.chunk
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_ref()
     }
+
+    pub fn into_chunk(self) -> (VaultChunk, PendingCommit) {
+        let chunk = VaultChunk {
+            protocol_version: PROTOCOL_VERSION,
+            sequence: self.sequence,
+            total_size: self.total_size,
+            remaining_bytes: self.remaining_bytes,
+            device_chunk_size: self.device_chunk_size,
+            data: self.payload.into_owned(),
+            checksum: self.checksum,
+            is_last: self.is_last,
+            artifact: self.artifact,
+        };
+
+        let commit = PendingCommit {
+            artifact: self.artifact,
+            slice_end: self.slice_end,
+            is_last: self.is_last,
+        };
+
+        (chunk, commit)
+    }
+}
+
+pub struct PendingCommit {
+    artifact: VaultArtifact,
+    slice_end: usize,
+    is_last: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -541,6 +571,32 @@ impl Default for ArtifactCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_chunk_borrows_empty_payload() {
+        let mut stream = ArtifactStream::new();
+        stream.reset(ArtifactLengths {
+            vault: 3,
+            recipients: 0,
+            signature: 0,
+        });
+
+        let payload = b"abc";
+        let pending = stream.prepare_chunk(1, 0, 8, |_| payload);
+
+        assert!(matches!(&pending.payload, Cow::Borrowed(_)));
+        assert_eq!(pending.artifact(), VaultArtifact::Vault);
+        assert_eq!(pending.payload(), &[]);
+
+        let (chunk, commit) = pending.into_chunk();
+        assert_eq!(chunk.total_size, payload.len() as u64);
+        assert_eq!(chunk.remaining_bytes, payload.len() as u64);
+        assert!(!chunk.is_last);
+        assert!(chunk.data.is_empty());
+
+        let chunk = stream.commit_chunk(chunk, commit);
+        assert!(chunk.data.is_empty());
+    }
 
     fn make_chunk(
         artifact: VaultArtifact,
