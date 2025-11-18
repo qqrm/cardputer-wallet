@@ -89,7 +89,7 @@ impl BleHid {
         }
     }
 
-    fn start_session(&mut self, session_id: u32) -> Result<HidResponse, HidError> {
+    pub(crate) fn start_session(&mut self, session_id: u32) -> Result<HidResponse, HidError> {
         match self.state {
             BleSessionState::Idle => {
                 self.state = BleSessionState::Connected(session_id);
@@ -113,7 +113,7 @@ impl BleHid {
         }
     }
 
-    fn end_session(&mut self) -> Result<HidResponse, HidError> {
+    pub(crate) fn end_session(&mut self) -> Result<HidResponse, HidError> {
         match self.state {
             BleSessionState::Idle => Err(HidError::NoActiveSession),
             BleSessionState::Connected(session) => {
@@ -126,7 +126,7 @@ impl BleHid {
         }
     }
 
-    fn send_report(
+    pub(crate) fn send_report(
         &mut self,
         session_id: u32,
         report: &KeyboardReport,
@@ -136,11 +136,15 @@ impl BleHid {
         Ok(HidResponse::ReportSent { session_id })
     }
 
-    fn send_hold(&mut self, session_id: u32, hold: &KeyHold) -> Result<HidResponse, HidError> {
+    pub(crate) fn send_hold(
+        &mut self,
+        session_id: u32,
+        hold: &KeyHold,
+    ) -> Result<HidResponse, HidError> {
         self.send_report(session_id, &hold.report)
     }
 
-    fn stream_macro(
+    pub(crate) fn stream_macro(
         &mut self,
         session_id: u32,
         buffer: &MacroBuffer,

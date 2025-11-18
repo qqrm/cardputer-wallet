@@ -178,9 +178,7 @@ mod tasks {
     use super::BootContext;
     use super::USB_MAX_PACKET_SIZE;
     use super::actions;
-    use super::ble::{
-        BleHid, HID_COMMAND_QUEUE_DEPTH, HidCommandQueue, HidError, HidResponse, profile,
-    };
+    use super::ble::{BleHid, HidError, HidResponse, profile};
     use super::usb::{UsbEventReceiver, UsbTransportEvent};
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, process_host_frame};
@@ -197,10 +195,13 @@ mod tasks {
     use embassy_time::{Duration, Ticker, Timer};
     use embassy_usb::{
         UsbDevice,
-        class::cdc_acm::{BufferedReceiver, ControlChanged, Sender as CdcSender},
+        class::cdc_acm::{BufferedReceiver, Sender as CdcSender},
         driver::EndpointError,
     };
-    use embedded_io_async::{Read, Write};
+    use embedded_io_async::Read;
+    use shared::cdc::FRAME_HEADER_SIZE;
+    use shared::cdc::transport::{FrameTransportError, decode_frame, decode_frame_header};
+    use shared::schema::PROTOCOL_VERSION;
     use trouble_host::IoCapabilities;
 
     use esp_storage::FlashStorageError;
@@ -356,78 +357,66 @@ mod tasks {
         let mut receiver = time::time_receiver();
         let mut clock = CalibratedClock::new();
 
-        let mut current_time = receiver.try_get().unwrap_or(0);
-        if current_time > 0 {
+        if let Some(current_time) = receiver.try_get() {
             clock.set_time_ms(current_time);
-        } else {
-            current_time = clock.current_time_ms();
         }
 
         loop {
-            let next_time = receiver.receive().await;
+            let next_time = receiver.changed().await;
             clock.set_time_ms(next_time);
-
-            let (unix_timestamp_ms, uptime_ms) = clock.sample();
-            transport::broadcast_time(unix_timestamp_ms, uptime_ms);
         }
     }
 
     #[task]
     pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
-        if let Some(transport) = transport::ble_transport() {
-            transport.set_ble_state(TransportState::Waiting);
-        }
+        transport::set_ble_state(TransportState::Waiting);
 
         let mut ticker = Ticker::every(Duration::from_millis(5));
 
-        let mut hid = match BleHid::new(receiver.try_receive()) {
-            Ok(hid) => hid,
+        let profile = match profile::TroubleProfile::new("Cardputer") {
+            Ok(profile) => profile,
             Err(error) => {
-                if let Some(transport) = transport::ble_transport() {
-                    transport.set_ble_state(TransportState::Disabled);
-                }
-                log::error!("Failed to initialize BLE HID: {error:?}");
+                transport::set_ble_state(TransportState::Error);
+                log::error!("Failed to initialize BLE HID profile: {error:?}");
                 return;
             }
         };
 
+        let mut hid = BleHid::new(profile, IoCapabilities::KeyboardDisplay);
+
         loop {
-            embassy_futures::select::select_biased!(
-                _ = ticker.next() => {
+            match select(ticker.next(), receiver.receive()).await {
+                Either::First(_) => {
                     if let Err(error) = hid.poll() {
                         if let HidError::Coded(code) = error {
                             log::error!("BLE HID error: {code:?}");
                         }
-                        if let Some(transport) = transport::ble_transport() {
-                            transport.set_ble_state(TransportState::Error);
-                        }
+                        transport::set_ble_state(TransportState::Error);
                         break;
                     }
-                },
-                action = receiver.receive() => {
+                }
+                Either::Second(action) => {
                     if process_action(&mut hid, action).is_err() {
-                        if let Some(transport) = transport::ble_transport() {
-                            transport.set_ble_state(TransportState::Error);
-                        }
+                        transport::set_ble_state(TransportState::Error);
                         break;
                     }
-                },
-            );
+                }
+            }
         }
     }
 
-    fn process_action(hid: &mut BleHid<'_>, action: actions::DeviceAction) -> Result<(), HidError> {
+    fn process_action(hid: &mut BleHid, action: actions::DeviceAction) -> Result<(), HidError> {
         match action {
             actions::DeviceAction::StartSession { session_id } => hid.start_session(session_id),
             actions::DeviceAction::EndSession => hid.end_session(),
             actions::DeviceAction::SendReport { session_id, report } => {
-                hid.send_report(session_id, &report.to_bytes())
+                hid.send_report(session_id, &report)
             }
             actions::DeviceAction::HoldKeys { session_id, hold } => {
-                hid.hold_keys(session_id, hold.duration_ms, &hold.report.to_bytes())
+                hid.send_hold(session_id, &hold)
             }
             actions::DeviceAction::StreamMacro { session_id, buffer } => {
-                hid.stream_macro(session_id, buffer.iter())
+                hid.stream_macro(session_id, &buffer)
             }
         }
     }
@@ -436,114 +425,63 @@ mod tasks {
     pub async fn cdc_server(
         mut receiver: BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         mut sender: CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
-        mut control: cdc_acm::Control<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         mut events: UsbEventReceiver,
-        mut ble_actions: HidCommandQueue,
         frame_jobs: HostFrameSender,
         frame_responses: HostFrameResponseReceiver,
     ) {
-        let mut max_packet_size = USB_MAX_PACKET_SIZE as usize;
-        let mut features = IoCapabilities::all();
+        let max_packet_size = USB_MAX_PACKET_SIZE as usize;
         loop {
-            let next = select(
-                |_| async {
-                    loop {
-                        let (command, frame) =
-                            match receive_frame(&mut receiver, max_packet_size).await {
-                                Ok(result) => result,
-                                Err(FrameIoError::UsbError(error)) => {
-                                    log::error!("Failed to read from CDC endpoint: {error:?}");
-                                    continue;
-                                }
-                                Err(FrameIoError::Protocol(error)) => {
-                                    log::warn!("Failed to parse CDC frame: {error:?}");
-                                    continue;
-                                }
-                            };
+            let inbound_or_response = select(
+                receive_frame(&mut receiver, max_packet_size),
+                frame_responses.receive(),
+            )
+            .await;
 
-                        if command.supports_ble_profile() && features.contains(IoCapabilities::BLE)
-                        {
-                            let response =
-                                match process_ble_command(&mut ble_actions, command, &frame) {
-                                    Ok(success) => success,
-                                    Err(error) => error,
-                                };
-
-                            if send(&mut sender, response).await.is_err() {
-                                break;
-                            }
-                        } else if frame_jobs.try_send(HostFrameJob { command, frame }).is_ok() {
-                            break;
-                        }
+            match select(inbound_or_response, events.receive()).await {
+                Either::First(Either::First(Ok(job))) => {
+                    let sent = frame_jobs.send(job).await;
+                    if sent.is_err() {
+                        log::warn!("Failed to enqueue host frame");
                     }
-                },
-                |_| async {
-                    loop {
-                        match frame_responses.receive().await {
-                            Ok((_, payload)) => {
-                                if send(&mut sender, payload).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(HostFrameError::Boot(bytes)) => {
-                                if send(&mut sender, bytes).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(HostFrameError::Protocol(error)) => {
-                                let response = sync::encode_response(
-                                    &shared::schema::DeviceResponse::Nack(error.as_nack()),
-                                );
-
-                                if let Ok(response) = response {
-                                    if send(&mut sender, response).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                |_| async {
-                    loop {
-                        match events.receive().await {
-                            UsbTransportEvent::Enabled => {
-                                log::info!("usb enabled");
-                            }
-                            UsbTransportEvent::Disabled => {
-                                log::info!("usb disabled");
-                            }
-                            UsbTransportEvent::Suspended => {
-                                log::info!("usb suspended");
-                            }
-                            UsbTransportEvent::Resumed => {
-                                log::info!("usb resumed");
-                            }
-                        }
-                    }
-                },
-                |_| async {
-                    loop {
-                        match control.wait().await {
-                            ControlChanged::LineState(state) => {
-                                log::debug!("cdc state: {:?}", state);
-                            }
-                            ControlChanged::LineCoding(line) => {
-                                log::debug!("cdc coding: {:?}", line);
-                            }
-                            ControlChanged::ControlLine(line) => {
-                                max_packet_size = line.max_packet_size as usize;
-                            }
-                        }
-                    }
-                },
-            );
-
-            match next {
-                Either::First(Either::First(_)) | Either::Second(_) => {}
-                Either::First(Either::Second(_)) => {
-                    log::info!("CDC consumer task exited, restarting");
                 }
+                Either::First(Either::First(Err(FrameIoError::UsbError(error)))) => {
+                    log::error!("Failed to read from CDC endpoint: {error:?}");
+                }
+                Either::First(Either::First(Err(FrameIoError::Protocol(error)))) => {
+                    log::warn!("Failed to parse CDC frame: {error:?}");
+                    let nack = sync::encode_response(&shared::schema::DeviceResponse::Nack(
+                        error.as_nack(),
+                    ));
+
+                    if let Ok(response) = nack {
+                        let _ = send(&mut sender, response).await;
+                    }
+                }
+                Either::First(Either::Second(Ok((_, payload)))) => {
+                    if send(&mut sender, payload).await.is_err() {
+                        log::warn!("CDC disconnected while sending response");
+                    }
+                }
+                Either::First(Either::Second(Err(HostFrameError::Boot(bytes)))) => {
+                    if send(&mut sender, bytes).await.is_err() {
+                        log::warn!("CDC disconnected while sending boot error");
+                    }
+                }
+                Either::First(Either::Second(Err(HostFrameError::Protocol(error)))) => {
+                    let response = sync::encode_response(&shared::schema::DeviceResponse::Nack(
+                        error.as_nack(),
+                    ));
+
+                    if let Ok(response) = response {
+                        let _ = send(&mut sender, response).await;
+                    }
+                }
+                Either::Second(event) => match event {
+                    UsbTransportEvent::Enabled => log::info!("usb enabled"),
+                    UsbTransportEvent::Disabled => log::info!("usb disabled"),
+                    UsbTransportEvent::Suspended => log::info!("usb suspended"),
+                    UsbTransportEvent::Resumed => log::info!("usb resumed"),
+                },
             }
         }
     }
@@ -552,8 +490,14 @@ mod tasks {
         log::error!("[cdc] failed to restore state: {error:?}");
     }
 
+    fn storage_protocol_error(error: &StorageError<FlashStorageError>) -> sync::ProtocolError {
+        sync::ProtocolError::Decode(error.to_string())
+    }
+
     fn boot_failure_payload(error: &StorageError<FlashStorageError>) -> Vec<u8> {
-        match sync::encode_response(&shared::schema::DeviceResponse::Nack(error.as_nack())) {
+        match sync::encode_response(&shared::schema::DeviceResponse::Nack(
+            storage_protocol_error(error).as_nack(),
+        )) {
             Ok(encoded) => encoded,
             Err(encode_err) => {
                 let fatal = encode_err.as_nack();
@@ -574,93 +518,62 @@ mod tasks {
         receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
     ) -> Result<HostFrameResult, FrameIoError> {
-        let mut buf = [0u8; FRAME_MAX_SIZE as usize];
+        let mut header = [0u8; FRAME_HEADER_SIZE];
         let mut offset = 0usize;
 
-        loop {
-            match receiver.read(&mut buf[offset..]).await {
-                Ok(read) => {
-                    offset += read;
-
-                    match sync::decode_frame(&buf[..offset]) {
-                        Ok((header, frame)) => {
-                            if frame.len() > FRAME_MAX_SIZE as usize {
-                                return Err(FrameIoError::Protocol(
-                                    sync::ProtocolError::FrameTooLarge,
-                                ));
-                            }
-
-                            let (command, len) = match sync::decode_header(&header) {
-                                Ok(value) => value,
-                                Err(error) => return Err(FrameIoError::Protocol(error)),
-                            };
-
-                            if frame.len() != len as usize {
-                                return Err(FrameIoError::Protocol(
-                                    sync::ProtocolError::FrameLengthMismatch,
-                                ));
-                            }
-
-                            return Ok(Ok((command, frame)));
-                        }
-                        Err(sync::ProtocolError::IncompleteFrame { next_length }) => {
-                            if offset + next_length as usize > packet_size {
-                                return Err(FrameIoError::Protocol(
-                                    sync::ProtocolError::FrameTooLarge,
-                                ));
-                            }
-
-                            continue;
-                        }
-                        Err(error) => return Err(FrameIoError::Protocol(error)),
-                    }
-                }
-                Err(error) => return Err(FrameIoError::UsbError(error)),
-            }
+        while offset < FRAME_HEADER_SIZE {
+            let written = receiver
+                .read(&mut header[offset..])
+                .await
+                .map_err(FrameIoError::UsbError)?;
+            offset += written;
         }
+
+        let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
+        header_bytes.copy_from_slice(&header);
+
+        let frame_header =
+            decode_frame_header(PROTOCOL_VERSION, FRAME_MAX_SIZE as usize, header_bytes)
+                .map_err(|err| FrameIoError::Protocol(err.into()))?;
+
+        if frame_header.length as usize > packet_size {
+            return Err(FrameIoError::Protocol(
+                FrameTransportError::PayloadTooLarge {
+                    actual: frame_header.length as usize,
+                    limit: packet_size,
+                }
+                .into(),
+            ));
+        }
+
+        let mut payload = vec![0u8; frame_header.length as usize];
+        let mut received = 0usize;
+        while received < payload.len() {
+            let read = receiver
+                .read(&mut payload[received..])
+                .await
+                .map_err(FrameIoError::UsbError)?;
+            received += read;
+        }
+
+        decode_frame(&frame_header, &payload).map_err(|err| FrameIoError::Protocol(err.into()))?;
+
+        Ok(Ok((frame_header.command, payload)))
     }
 
     async fn send(
         sender: &mut CdcSender<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         data: Vec<u8>,
     ) -> Result<(), EndpointError> {
-        let mut offset = 0;
-        let mut remaining = data.len();
+        let mut offset = 0usize;
 
-        while remaining > 0 {
-            let chunk_len = USB_MAX_PACKET_SIZE.min(remaining as u16) as usize;
-
-            match sender.write(&data[..chunk_len]).await {
-                Ok(written) if written > 0 => {
-                    offset += written;
-                    remaining = remaining.saturating_sub(written);
-                }
-                _ => {
-                    log::warn!("CDC disconnected: failed to send frame");
-                    return Err(EndpointError::BufferOverflow);
-                }
-            }
+        while offset < data.len() {
+            let end = core::cmp::min(offset + USB_MAX_PACKET_SIZE as usize, data.len());
+            sender.write_packet(&data[offset..end]).await?;
+            offset = end;
         }
 
         Ok(())
-    }
-
-    fn process_ble_command(
-        actions: &mut HidCommandQueue,
-        command: shared::cdc::CdcCommand,
-        frame: &[u8],
-    ) -> Result<Vec<u8>, Vec<u8>> {
-        if let Err(error) = sync::send_ble_command(actions, command, frame) {
-            let fatal = sync::ProtocolError::BleSend(error);
-            let nack =
-                sync::encode_response(&shared::schema::DeviceResponse::Nack(fatal.as_nack()));
-
-            if let Ok(response) = nack {
-                return Err(response);
-            }
-        }
-
-        Ok(shared::schema::AcknowledgedResponse {}.to_bytes())
     }
 }
 
@@ -770,7 +683,7 @@ pub mod runtime {
         let cdc = cdc_acm::CdcAcmClass::new(&mut builder, cdc_state, USB_MAX_PACKET_SIZE);
         let usb_device = builder.build();
 
-        let (cdc_sender, cdc_receiver, cdc_control) = cdc.split_with_control();
+        let (cdc_sender, cdc_receiver) = cdc.split();
         let buffered_receiver =
             cdc_receiver.into_buffered(USB_RX_BUFFER.init([0u8; USB_MAX_PACKET_SIZE as usize]));
         let usb_events = usb::event_receiver();
@@ -812,8 +725,9 @@ pub mod runtime {
             spawner.spawn(super::tasks::cdc_server(
                 buffered_receiver,
                 cdc_sender,
-                cdc_control,
                 usb_events,
+                frame_jobs,
+                frame_responses,
             )),
         );
 
