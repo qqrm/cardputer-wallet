@@ -1,5 +1,4 @@
-use alloc::vec;
-use alloc::vec::Vec;
+use alloc::{format, string::ToString, vec, vec::Vec};
 use core::ops::Range;
 
 use crate::crypto::KeyRecord;
@@ -7,9 +6,9 @@ use crate::storage::StorageError;
 use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use sequential_storage::{cache::NoCache, map};
-use shared::journal::JournalOperation;
 use shared::schema::{
-    DeviceErrorCode, NackResponse, PROTOCOL_VERSION, VaultArtifact, decode_journal_operations,
+    DeviceErrorCode, JournalOperation, NackResponse, PROTOCOL_VERSION, VaultArtifact,
+    decode_journal_operations,
 };
 use zeroize::Zeroizing;
 

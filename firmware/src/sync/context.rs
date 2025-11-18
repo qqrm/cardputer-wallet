@@ -3,7 +3,8 @@ use core::ops::Range;
 
 use crate::crypto::{CryptoMaterial, PinLockState};
 use crate::time::{self, CalibratedClock};
-use shared::journal::{FrameTracker, JournalOperation};
+use shared::journal::FrameTracker;
+use shared::schema::JournalOperation;
 use shared::transfer::{ArtifactLengths, ArtifactStream};
 use shared::vault::VaultEntry;
 use zeroize::Zeroizing;
@@ -190,7 +191,7 @@ impl SyncContext {
 
     #[cfg(any(test, feature = "ui-tests"))]
     pub fn test_transfer_range(&self) -> Range<u32> {
-        0..self.transfer.total_size() as u32
+        0..(self.vault_image.len() + self.recipients_manifest.len() + self.signature.len()) as u32
     }
 }
 

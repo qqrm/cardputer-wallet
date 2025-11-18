@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{format, string::String, vec::Vec};
 
 use crate::crypto::{KeyError, PinLockStatus, PinUnlockError};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};

@@ -1,4 +1,4 @@
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{format, string::String, string::ToString, vec::Vec};
 use core::cmp;
 
 #[cfg(any(test, target_arch = "xtensa"))]
@@ -9,10 +9,10 @@ use shared::checksum::accumulate_checksum;
 use shared::journal::JournalHasher;
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
-    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
-    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
-    decode_host_request, encode_device_response,
+    HelloResponse, HostRequest, JournalFrame, NackResponse, PROTOCOL_VERSION, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_host_request,
+    encode_device_response,
 };
 
 use super::SyncContext;
