@@ -628,8 +628,8 @@ impl SyncContext {
                     VaultArtifact::Signature => self.signature.as_slice(),
                 },
             );
-            let chunk = pending.chunk().clone();
-            let response = DeviceResponse::VaultChunk(chunk.clone());
+            let (chunk, commit) = pending.into_chunk();
+            let response = DeviceResponse::VaultChunk(chunk);
             let encoded_len = match encode_device_response(&response) {
                 Ok(bytes) => bytes.len(),
                 Err(_) => {
@@ -641,16 +641,22 @@ impl SyncContext {
             };
 
             if encoded_len <= frame_budget {
+                let DeviceResponse::VaultChunk(chunk) = response else {
+                    unreachable!("response must be a vault chunk");
+                };
                 if chunk_size == 0 && chunk.remaining_bytes > 0 {
                     return Err(ProtocolError::HostBufferTooSmall {
                         required: encoded_len + FRAME_HEADER_SIZE,
                         provided: host_buffer_size,
                     });
                 }
-                return Ok(self.transfer.commit_chunk(pending));
+                return Ok(self.transfer.commit_chunk(chunk, commit));
             }
 
             if chunk_size == 0 {
+                let DeviceResponse::VaultChunk(chunk) = response else {
+                    unreachable!("response must be a vault chunk");
+                };
                 if chunk.remaining_bytes > 0 || frame_budget < encoded_len {
                     return Err(ProtocolError::HostBufferTooSmall {
                         required: encoded_len + FRAME_HEADER_SIZE,
@@ -658,9 +664,12 @@ impl SyncContext {
                     });
                 }
 
-                return Ok(self.transfer.commit_chunk(pending));
+                return Ok(self.transfer.commit_chunk(chunk, commit));
             }
 
+            let DeviceResponse::VaultChunk(chunk) = response else {
+                unreachable!("response must be a vault chunk");
+            };
             let overhead = encoded_len.saturating_sub(chunk.data.len());
             if overhead >= frame_budget {
                 chunk_size = 0;
