@@ -10,13 +10,26 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    env:
+      RUST_TOOLCHAIN: stable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache Rust toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.rustup/update-hashes
+          key: ${{ runner.os }}-rustup-${{ env.RUST_TOOLCHAIN }}
+          restore-keys: |
+            ${{ runner.os }}-rustup-
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
 
       - name: Run cargo fmt
