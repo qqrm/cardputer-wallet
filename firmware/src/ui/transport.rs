@@ -117,7 +117,7 @@ pub fn set_ble_state(state: TransportState) {
 
 /// Snapshot the current transport status for rendering.
 pub fn snapshot() -> TransportIndicators {
-    TRANSPORT_WATCH.try_get().unwrap_or_else(default_transport)
+    ensure_cached_state()
 }
 
 /// Subscribe to transport updates.
@@ -127,6 +127,14 @@ pub fn receiver() -> Option<TransportReceiver> {
 
 fn sender() -> TransportSender {
     TRANSPORT_WATCH.sender()
+}
+
+fn ensure_cached_state() -> TransportIndicators {
+    TRANSPORT_WATCH.try_get().unwrap_or_else(|| {
+        let default = default_transport();
+        sender().send(default.clone());
+        default
+    })
 }
 
 fn modify_transport(update: impl Fn(&mut TransportIndicators)) {
