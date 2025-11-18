@@ -31,7 +31,8 @@ use crate::constants::{
     VAULT_NONCE_SIZE,
 };
 use crate::transport::{
-    handle_device_response, print_ack, read_device_response, send_host_request,
+    CliResponseAdapter, DeviceResponseAdapter, RecordingResponseAdapter, handle_device_response,
+    print_ack, read_device_response, send_host_request,
 };
 
 pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
@@ -62,6 +63,9 @@ where
 
     push_vault_artifacts(transport, store)?;
 
+    let mut cli_adapter = CliResponseAdapter;
+    let mut recording_adapter = RecordingResponseAdapter::new(None, None);
+
     for frame in plan.frames.into_iter() {
         let sequence = frame.sequence;
         let operation_count = frame.operations.len();
@@ -81,7 +85,13 @@ where
         let response = read_device_response(transport)?;
         let DeviceResponse::Ack(message) = response else {
             let description = format!("{response:?}");
-            handle_device_response(response, None, None)?;
+            handle_device_response(
+                response,
+                &mut [
+                    &mut cli_adapter as &mut dyn DeviceResponseAdapter,
+                    &mut recording_adapter,
+                ],
+            )?;
             return Err(SharedError::Transport(format!(
                 "unexpected device response while pushing operations: {description}"
             )));
@@ -104,6 +114,9 @@ where
         (VaultArtifact::Recipients, "recipients manifest"),
         (VaultArtifact::Signature, "vault signature"),
     ];
+
+    let mut cli_adapter = CliResponseAdapter;
+    let mut recording_adapter = RecordingResponseAdapter::new(None, None);
 
     let mut sequence = 1u32;
 
@@ -162,7 +175,13 @@ where
                     )));
                 }
                 let description = format!("{response:?}");
-                handle_device_response(response, None, None)?;
+                handle_device_response(
+                    response,
+                    &mut [
+                        &mut cli_adapter as &mut dyn DeviceResponseAdapter,
+                        &mut recording_adapter,
+                    ],
+                )?;
                 return Err(SharedError::Transport(format!(
                     "unexpected device response while pushing {label}: {description}"
                 )));

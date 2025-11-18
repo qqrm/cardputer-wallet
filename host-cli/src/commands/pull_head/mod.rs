@@ -3,7 +3,8 @@ use shared::schema::{HostRequest, PROTOCOL_VERSION, PullHeadRequest};
 
 use crate::commands::DeviceTransport;
 use crate::transport::{
-    handle_device_response, print_head, read_device_response, send_host_request,
+    CliResponseAdapter, DeviceResponseAdapter, RecordingResponseAdapter, handle_device_response,
+    print_head, read_device_response, send_host_request,
 };
 
 pub fn run<P>(port: &mut P) -> Result<(), SharedError>
@@ -16,13 +17,21 @@ where
 
     send_host_request(port, &request)?;
     let response = read_device_response(port)?;
+    let mut cli_adapter = CliResponseAdapter;
+    let mut recording_adapter = RecordingResponseAdapter::new(None, None);
     match response {
         shared::schema::DeviceResponse::Head(head) => {
             print_head(&head);
             Ok(())
         }
         other => {
-            handle_device_response(other, None, None)?;
+            handle_device_response(
+                other,
+                &mut [
+                    &mut cli_adapter as &mut dyn DeviceResponseAdapter,
+                    &mut recording_adapter,
+                ],
+            )?;
             Err(SharedError::Transport(
                 "unexpected device response while fetching head metadata".into(),
             ))

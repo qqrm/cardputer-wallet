@@ -15,7 +15,8 @@ use crate::commands::signature::compute_signature_message;
 use crate::commands::{DeviceTransport, RepoArtifactStore, print_repo_banner};
 use crate::constants::{CONFIG_FILE, HOST_BUFFER_SIZE, MAX_CHUNK_SIZE, SIGNATURE_SIZE};
 use crate::transport::{
-    handle_device_response, print_head, read_device_response, send_host_request,
+    CliResponseAdapter, DeviceResponseAdapter, RecordingResponseAdapter, handle_device_response,
+    print_head, read_device_response, send_host_request,
 };
 
 pub fn run<T, S>(transport: &mut T, store: &mut S, args: &RepoArgs) -> Result<(), SharedError>
@@ -36,9 +37,17 @@ where
     println!("Requested head metadata. Awaiting response…");
 
     let mut artifacts = PullArtifacts::default();
+    let mut cli_adapter = CliResponseAdapter;
     let head_response = read_device_response(transport)?;
     let DeviceResponse::Head(head) = head_response else {
-        handle_device_response(head_response, None, Some(&mut artifacts))?;
+        let mut recording_adapter = RecordingResponseAdapter::new(None, Some(&mut artifacts));
+        handle_device_response(
+            head_response,
+            &mut [
+                &mut cli_adapter as &mut dyn DeviceResponseAdapter,
+                &mut recording_adapter,
+            ],
+        )?;
         return Err(SharedError::Transport(
             "unexpected device response while fetching head metadata".into(),
         ));
@@ -77,8 +86,15 @@ where
 
     while should_continue {
         let response = read_device_response(transport)?;
-        should_continue =
-            handle_device_response(response, Some(&mut state_tracker), Some(&mut artifacts))?;
+        let mut recording_adapter =
+            RecordingResponseAdapter::new(Some(&mut state_tracker), Some(&mut artifacts));
+        should_continue = handle_device_response(
+            response,
+            &mut [
+                &mut cli_adapter as &mut dyn DeviceResponseAdapter,
+                &mut recording_adapter,
+            ],
+        )?;
         if should_continue {
             send_host_request(transport, &request)?;
         }
