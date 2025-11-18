@@ -85,7 +85,7 @@ pub enum ProtocolError {
 
 #[cfg_attr(not(target_arch = "xtensa"), allow(dead_code))]
 impl ProtocolError {
-    fn as_nack(&self) -> NackResponse {
+    pub fn as_nack(&self) -> NackResponse {
         let (code, message) = match self {
             ProtocolError::FrameTooLarge(len) => (
                 DeviceErrorCode::ResourceExhausted,

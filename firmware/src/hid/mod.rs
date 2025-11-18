@@ -169,6 +169,9 @@ type BootContext =
     Result<crate::sync::SyncContext, crate::storage::StorageError<esp_storage::FlashStorageError>>;
 
 #[cfg(target_arch = "xtensa")]
+const USB_MAX_PACKET_SIZE: u16 = 64;
+
+#[cfg(target_arch = "xtensa")]
 pub mod runtime {
     use super::BootContext;
     use super::actions;
@@ -176,7 +179,8 @@ pub mod runtime {
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, SyncContext};
     use crate::system;
-    use embassy_executor::{SpawnError, raw::Executor};
+    use core::future::pending;
+    use embassy_executor::{SpawnError, Spawner};
     use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
     use embassy_usb::{Builder as UsbBuilder, class::cdc_acm};
     use esp_alloc::EspHeap;
@@ -198,11 +202,9 @@ pub mod runtime {
     fn init_allocator() {
         const HEAP_SIZE: usize = 96 * 1024;
         static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-        unsafe { ALLOCATOR.init(HEAP.as_ptr() as usize, HEAP.len()) };
+        unsafe { ALLOCATOR.init(HEAP.as_mut_ptr(), HEAP.len()) };
     }
 
-    static EXECUTOR: StaticCell<Executor> = StaticCell::new();
-    static USB_DRIVER: StaticCell<UsbDriver<'static>> = StaticCell::new();
     static USB_CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     static USB_BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     static USB_MSOS_DESCRIPTOR: StaticCell<[u8; 0]> = StaticCell::new();
@@ -213,7 +215,6 @@ pub mod runtime {
     static FLASH_RESTORE_SIGNAL: Signal<CriticalSectionRawMutex, BootContext> = Signal::new();
     static FLASH_STORAGE: StaticCell<BootFlash<'static>> = StaticCell::new();
 
-    const USB_MAX_PACKET_SIZE: u16 = 64;
     const USB_VID: u16 = 0x303A;
     const USB_PID: u16 = 0x4001;
     const FLASH_RESTORE_DELAY_MS: u64 = 2_000;
@@ -227,25 +228,23 @@ pub mod runtime {
         }
     }
 
-    pub fn main() -> ! {
+    #[esp_rtos::main]
+    pub async fn main(spawner: Spawner) {
         init_allocator();
 
         let mut peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
         let mut timg0 = TimerGroup::new(peripherals.TIMG0);
         timg0.wdt.disable();
 
-        let timer0 = timg0.timer0;
-        esp_hal_embassy::init(timer0);
-
         let flash = FLASH_STORAGE.init(BootFlash::new(FlashStorage::new(peripherals.FLASH)));
 
         let usb = Usb::new(peripherals.USB0, peripherals.GPIO20, peripherals.GPIO19);
 
-        let driver = USB_DRIVER.init(UsbDriver::new(
+        let driver = UsbDriver::new(
             usb,
             unsafe { &mut USB_EP_OUT_BUFFER },
             UsbDriverConfig::default(),
-        ));
+        );
 
         let mut config = embassy_usb::Config::new(USB_VID, USB_PID);
         config.manufacturer = Some("Cardputer");
@@ -277,50 +276,49 @@ pub mod runtime {
             cdc_receiver.into_buffered(USB_RX_BUFFER.init([0u8; USB_MAX_PACKET_SIZE as usize]));
         let usb_events = usb::event_receiver();
 
-        let executor = EXECUTOR.init(Executor::new());
-        executor.run(move |spawner| {
-            let ble_actions = actions::action_receiver();
-            spawn_or_log(
-                "BLE task",
-                spawner.spawn(super::tasks::ble_profile(ble_actions)),
-            );
-            spawn_or_log(
-                "USB device task",
-                spawner.spawn(super::tasks::usb_device(usb_device)),
-            );
-            spawn_or_log(
-                "time broadcast task",
-                spawner.spawn(super::tasks::time_broadcast()),
-            );
-            spawn_or_log("UI task", spawner.spawn(system::ui_task()));
-            spawn_or_log(
-                "flash restore task",
-                spawner.spawn(super::tasks::flash_restore_task(
-                    flash,
-                    &FLASH_RESTORE_SIGNAL,
-                    FLASH_RESTORE_DELAY_MS,
-                )),
-            );
-            let frame_jobs = super::tasks::host_frame_receiver();
-            let frame_responses = super::tasks::host_frame_response_sender();
-            spawn_or_log(
-                "frame worker task",
-                spawner.spawn(super::tasks::frame_worker(
-                    frame_jobs,
-                    frame_responses,
-                    &FLASH_RESTORE_SIGNAL,
-                )),
-            );
-            spawn_or_log(
-                "CDC task",
-                spawner.spawn(super::tasks::cdc_server(
-                    buffered_receiver,
-                    cdc_sender,
-                    cdc_control,
-                    usb_events,
-                )),
-            );
-        });
+        let ble_actions = actions::action_receiver();
+        spawn_or_log(
+            "BLE task",
+            spawner.spawn(super::tasks::ble_profile(ble_actions)),
+        );
+        spawn_or_log(
+            "USB device task",
+            spawner.spawn(super::tasks::usb_device(usb_device)),
+        );
+        spawn_or_log(
+            "time broadcast task",
+            spawner.spawn(super::tasks::time_broadcast()),
+        );
+        spawn_or_log("UI task", spawner.spawn(system::ui_task()));
+        spawn_or_log(
+            "flash restore task",
+            spawner.spawn(super::tasks::flash_restore_task(
+                flash,
+                &FLASH_RESTORE_SIGNAL,
+                FLASH_RESTORE_DELAY_MS,
+            )),
+        );
+        let frame_jobs = super::tasks::host_frame_receiver();
+        let frame_responses = super::tasks::host_frame_response_sender();
+        spawn_or_log(
+            "frame worker task",
+            spawner.spawn(super::tasks::frame_worker(
+                frame_jobs,
+                frame_responses,
+                &FLASH_RESTORE_SIGNAL,
+            )),
+        );
+        spawn_or_log(
+            "CDC task",
+            spawner.spawn(super::tasks::cdc_server(
+                buffered_receiver,
+                cdc_sender,
+                cdc_control,
+                usb_events,
+            )),
+        );
+
+        pending::<()>().await;
     }
 }
 
@@ -336,7 +334,7 @@ mod tasks {
     use crate::sync::{self, FRAME_MAX_SIZE, SyncContext, process_host_frame};
     use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
-    use alloc::{format, vec, vec::Vec};
+    use alloc::{format, string::ToString, vec, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
     use embassy_sync::{
@@ -350,6 +348,7 @@ mod tasks {
         class::cdc_acm::{BufferedReceiver, ControlChanged, Sender as CdcSender},
         driver::EndpointError,
     };
+    use embedded_io_async::{Read, Write};
     use trouble_host::IoCapabilities;
 
     use esp_storage::FlashStorageError;
@@ -543,7 +542,7 @@ mod tasks {
         let frame_jobs = host_frame_sender();
         let mut frame_responses = host_frame_response_receiver();
         let callbacks = TransportCallbacks::new();
-        let packet_size = receiver.max_packet_size() as usize;
+        let packet_size = USB_MAX_PACKET_SIZE as usize;
         callbacks.waiting().await;
         loop {
             if matches!(
@@ -575,8 +574,7 @@ mod tasks {
                     Either::First(Either::First(Ok((command, frame)))) => {
                         callbacks.connected().await;
                         if frame_jobs
-                            .send(HostFrameJob { command, frame })
-                            .await
+                            .try_send(HostFrameJob { command, frame })
                             .is_err()
                         {
                             let payload = encode_nack_payload(sync::ProtocolError::Transport);
@@ -686,7 +684,7 @@ mod tasks {
         let response = shared::schema::DeviceResponse::Nack(shared::schema::NackResponse {
             protocol_version: shared::schema::PROTOCOL_VERSION,
             code: shared::schema::DeviceErrorCode::InternalFailure,
-            message: format!("failed to load flash state: {error}"),
+            message: format!("failed to load flash state: {error:?}"),
         });
 
         match sync::encode_response(&response) {
@@ -700,7 +698,7 @@ mod tasks {
     }
 
     fn log_boot_failure(error: &StorageError<FlashStorageError>) {
-        let mut message = format!("[cdc] failed to restore state: {error}\n").into_bytes();
+        let mut message = format!("[cdc] failed to restore state: {error:?}\n").into_bytes();
         message.push(0);
 
         unsafe {
@@ -833,12 +831,12 @@ mod tasks {
             FRAME_MAX_SIZE,
             header_bytes,
         )
-        .map_err(FrameIoError::Protocol)?;
+        .map_err(|err| FrameIoError::Protocol(err.into()))?;
 
         let mut buffer = vec![0u8; header.length as usize];
         read_exact(reader, &mut buffer).await?;
 
-        decode_frame(&header, &buffer).map_err(FrameIoError::Protocol)?;
+        decode_frame(&header, &buffer).map_err(|err| FrameIoError::Protocol(err.into()))?;
 
         Ok((header.command, buffer))
     }
@@ -872,7 +870,7 @@ mod tasks {
             payload,
             FRAME_MAX_SIZE,
         )
-        .map_err(FrameIoError::Protocol)?;
+        .map_err(|err| FrameIoError::Protocol(err.into()))?;
 
         write_all(sender, packet_size, &header).await?;
         if !payload.is_empty() {
