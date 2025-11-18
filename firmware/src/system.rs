@@ -258,6 +258,9 @@ mod tests {
     use crate::ui::{UiCommand, ViewContent};
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
+    use std::sync::Mutex;
+
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     fn setup_context(pin: &str) -> UiRuntime {
         replace_sync_context(SyncContext::new());
@@ -288,6 +291,8 @@ mod tests {
 
     #[test]
     fn valid_pin_unlocks_home() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
         let pin = "123456";
         let mut runtime = setup_context(pin);
         let mut screen_rx = ui_screen_receiver().expect("screen receiver");
@@ -299,6 +304,8 @@ mod tests {
 
     #[test]
     fn wrong_pin_reports_backoff_and_wipe() {
+        let _guard = TEST_MUTEX.lock().expect("test mutex");
+
         let mut runtime = setup_context("654321");
         let mut frame_rx = ui_frame_receiver().expect("frame receiver");
         let wrong = "000000";
