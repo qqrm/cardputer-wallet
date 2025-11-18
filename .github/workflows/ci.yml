@@ -26,6 +26,8 @@ jobs:
     name: Firmware lint and test (host)
     runs-on: ubuntu-latest
     needs: fmt
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,19 +38,37 @@ jobs:
           path: |
             $HOME/.cargo/registry
             $HOME/.cargo/git
-          key: ${{ runner.os }}-firmware-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Cache firmware build artifacts
         uses: actions/cache@v4
         with:
           path: |
             target
-          key: ${{ runner.os }}-firmware-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install sccache
+        run: cargo install sccache
+
+      - name: Enable sccache wrapper
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Run cargo clippy (firmware host)
         run: >-
@@ -63,6 +83,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     continue-on-error: true
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -73,14 +95,18 @@ jobs:
           path: |
             $HOME/.cargo/registry
             $HOME/.cargo/git
-          key: ${{ runner.os }}-firmware-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Cache firmware build artifacts
         uses: actions/cache@v4
         with:
           path: |
             target
-          key: ${{ runner.os }}-firmware-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
 
       - name: Cache ESP toolchain
         uses: actions/cache@v4
@@ -91,11 +117,27 @@ jobs:
             $HOME/.rustup/toolchains/nightly-esp
             $HOME/export-esp.sh
           key: ${{ runner.os }}-firmware-esp-${{ hashFiles('firmware/rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-firmware-esp-
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install sccache
+        run: cargo install sccache
+
+      - name: Enable sccache wrapper
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install espup
         run: cargo install espup
@@ -113,18 +155,57 @@ jobs:
         run: >-
           bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp -Zbuild-std=core,alloc build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf"
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   shared:
     name: Shared lint and test
     runs-on: ubuntu-latest
     needs: fmt
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            $HOME/.cargo/registry
+            $HOME/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache shared build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install sccache
+        run: cargo install sccache
+
+      - name: Enable sccache wrapper
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Run cargo clippy (shared)
         run: >-
@@ -134,18 +215,57 @@ jobs:
         run: >-
           bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path shared/Cargo.toml --all-features"
 
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
   host_cli:
     name: Host CLI lint and test
     runs-on: ubuntu-latest
     needs: fmt
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            $HOME/.cargo/registry
+            $HOME/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache host-cli build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ runner.os }}-sccache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install sccache
+        run: cargo install sccache
+
+      - name: Enable sccache wrapper
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Run cargo clippy (host-cli)
         run: >-
@@ -154,3 +274,7 @@ jobs:
       - name: Run cargo test (host-cli)
         run: >-
           bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; cargo test --manifest-path host-cli/Cargo.toml --all-features"
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
