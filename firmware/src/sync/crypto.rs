@@ -52,7 +52,7 @@ impl SyncContext {
     }
 
     pub(crate) fn finalize_incoming_payload(&mut self) -> Result<String, NackResponse> {
-        let mut verifying_key = match VerifyingKey::from_bytes(&VAULT_SIGNATURE_PUBLIC_KEY) {
+        let verifying_key = match VerifyingKey::from_bytes(&VAULT_SIGNATURE_PUBLIC_KEY) {
             Ok(key) => key,
             Err(_) => {
                 return Err(NackResponse {
@@ -76,10 +76,13 @@ impl SyncContext {
                 }
             };
 
+        let incoming_vault = self.incoming_vault.clone();
+        let incoming_recipients = self.incoming_recipients.clone();
+
         let mut signed_payload =
-            Vec::with_capacity(self.incoming_vault.len() + self.incoming_recipients.len());
-        signed_payload.extend_from_slice(self.incoming_vault.as_slice());
-        signed_payload.extend_from_slice(self.incoming_recipients.as_slice());
+            Vec::with_capacity(incoming_vault.len() + incoming_recipients.len());
+        signed_payload.extend_from_slice(incoming_vault.as_slice());
+        signed_payload.extend_from_slice(incoming_recipients.as_slice());
 
         if verifying_key
             .verify(
@@ -96,10 +99,7 @@ impl SyncContext {
             });
         }
 
-        self.write_vault_payloads(
-            self.incoming_vault.as_slice(),
-            self.incoming_recipients.as_slice(),
-        );
+        self.write_vault_payloads(incoming_vault.as_slice(), incoming_recipients.as_slice());
         self.update_expected_signature(signature_bytes);
 
         self.vault_generation = self.vault_generation.saturating_add(1);

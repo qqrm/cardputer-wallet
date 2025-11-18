@@ -7,8 +7,7 @@ use embedded_storage_async::nor_flash::NorFlash;
 use postcard::{from_bytes as postcard_from_bytes, to_allocvec as postcard_to_allocvec};
 use sequential_storage::{cache::NoCache, map};
 use shared::schema::{
-    DeviceErrorCode, JournalOperation, NackResponse, PROTOCOL_VERSION, VaultArtifact,
-    decode_journal_operations,
+    DeviceErrorCode, NackResponse, PROTOCOL_VERSION, VaultArtifact, decode_journal_operations,
 };
 use zeroize::Zeroizing;
 

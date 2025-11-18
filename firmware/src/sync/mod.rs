@@ -6,6 +6,5 @@ mod protocol;
 mod storage;
 
 pub use context::{FRAME_MAX_SIZE, SyncContext};
+pub use protocol::encode_response;
 pub use protocol::{ProtocolError, process_host_frame};
-
-pub(crate) use protocol::encode_response;
