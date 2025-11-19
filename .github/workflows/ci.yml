@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+env:
+  CHECKOUT_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+
 jobs:
   fmt:
     name: Rustfmt
@@ -15,6 +18,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Synthesize merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin +${{ github.event.pull_request.head.sha }}:pr-head
+          git config user.name "Cardputer Wallet CI"
+          git config user.email "ci@cardputer-wallet.invalid"
+          git merge --no-ff --no-edit pr-head
 
       - name: Cache Rust toolchain
         uses: actions/cache@v4
@@ -44,6 +58,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Synthesize merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin +${{ github.event.pull_request.head.sha }}:pr-head
+          git config user.name "Cardputer Wallet CI"
+          git config user.email "ci@cardputer-wallet.invalid"
+          git merge --no-ff --no-edit pr-head
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -101,6 +126,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Synthesize merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin +${{ github.event.pull_request.head.sha }}:pr-head
+          git config user.name "Cardputer Wallet CI"
+          git config user.email "ci@cardputer-wallet.invalid"
+          git merge --no-ff --no-edit pr-head
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -181,6 +217,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Synthesize merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin +${{ github.event.pull_request.head.sha }}:pr-head
+          git config user.name "Cardputer Wallet CI"
+          git config user.email "ci@cardputer-wallet.invalid"
+          git merge --no-ff --no-edit pr-head
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -241,6 +288,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Synthesize merge commit
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin +${{ github.event.pull_request.head.sha }}:pr-head
+          git config user.name "Cardputer Wallet CI"
+          git config user.email "ci@cardputer-wallet.invalid"
+          git merge --no-ff --no-edit pr-head
 
       - name: Cache cargo registry
         uses: actions/cache@v4
