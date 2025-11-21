@@ -231,11 +231,11 @@ impl UiRuntime {
     }
 }
 
-#[cfg(test)]
-pub(super) const DEFAULT_TOTP_PERIOD: u8 = 30;
+#[cfg(any(test, feature = "ui-tests"))]
+pub const DEFAULT_TOTP_PERIOD: u8 = 30;
 
-#[cfg(test)]
-pub(super) mod fixtures;
+#[cfg(any(test, feature = "ui-tests"))]
+pub mod fixtures;
 
 #[cfg(test)]
 mod tests {

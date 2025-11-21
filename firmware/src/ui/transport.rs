@@ -150,7 +150,7 @@ fn default_transport() -> TransportIndicators {
     TransportIndicators::new(TransportState::Offline, TransportState::Offline)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "ui-tests"))]
 pub fn reset() {
     sender().send(default_transport());
 }

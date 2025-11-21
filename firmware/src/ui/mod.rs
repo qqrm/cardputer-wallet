@@ -20,5 +20,7 @@ pub use render::{
     EditView, EntryView, Frame, HintBar, HintItem, HomeView, LockView, RecentList, SearchWidget,
     SettingsView, SyncView, TotpWidget, ViewContent,
 };
+#[cfg(any(test, feature = "ui-tests"))]
+pub use state::fixtures;
 pub use state::{EntrySummary, UiEffect, UiRuntime, UiScreen};
 pub use transport::{TransportIndicators, TransportKind, TransportState, TransportStatus};
