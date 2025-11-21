@@ -8,7 +8,7 @@ rust-version = "1.88"
 [features]
 default = []
 firmware-bin = []
-ui-tests = []
+ui-tests = ["dep:trouble-host"]
 
 [dependencies]
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
@@ -37,6 +37,7 @@ uuid = "1.10"
 
 [target.'cfg(not(target_arch = "xtensa"))'.dependencies]
 embassy-time = { version = "0.5.0", default-features = false, features = ["std"] }
+trouble-host = { version = "0.5.0", default-features = false, features = ["peripheral", "gatt", "derive", "default-packet-pool"], optional = true }
 
 [[bin]]
 name = "cardputer-firmware"

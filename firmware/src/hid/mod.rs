@@ -4,7 +4,7 @@
 pub mod core;
 pub use core::actions;
 
-#[cfg(any(test, target_arch = "xtensa"))]
+#[cfg(any(test, target_arch = "xtensa", feature = "ui-tests"))]
 pub mod ble;
 
 #[cfg(target_arch = "xtensa")]
