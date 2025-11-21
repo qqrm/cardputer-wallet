@@ -253,10 +253,10 @@ fn hello_enqueues_ble_session_action() {
         other => panic!("unexpected response: {other:?}"),
     }
 
-    let actions = crate::hid::actions::drain();
+    let actions = crate::hid::core::actions::drain();
     assert!(actions.iter().any(|action| matches!(
         action,
-        crate::hid::actions::DeviceAction::StartSession { .. }
+        crate::hid::core::actions::DeviceAction::StartSession { .. }
     )));
 }
 
@@ -289,12 +289,11 @@ fn ack_enqueues_session_end_action() {
     };
     protocol::handle_ack(&ack, &mut ctx).expect("ack should succeed");
 
-    let actions = crate::hid::actions::drain();
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, crate::hid::actions::DeviceAction::EndSession { .. }))
-    );
+    let actions = crate::hid::core::actions::drain();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        crate::hid::core::actions::DeviceAction::EndSession { .. }
+    )));
 }
 
 #[test]

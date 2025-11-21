@@ -1,4 +1,4 @@
-use alloc::{format, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 #[cfg(any(test, feature = "ui-tests"))]
@@ -7,7 +7,9 @@ use zeroize::Zeroizing;
 
 use crate::crypto::{KeyError, PinLockStatus, PinUnlockError};
 
-use shared::schema::{DeviceErrorCode, JournalOperation, NackResponse, PROTOCOL_VERSION};
+#[cfg(any(test, feature = "ui-tests"))]
+use shared::schema::JournalOperation;
+use shared::schema::{DeviceErrorCode, NackResponse, PROTOCOL_VERSION};
 
 use super::{SIGNATURE_BUFFER_CAPACITY, SyncContext, VAULT_SIGNATURE_PUBLIC_KEY};
 

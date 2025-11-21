@@ -1,18 +1,22 @@
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::cmp;
 
 #[cfg(any(test, target_arch = "xtensa"))]
-use crate::hid::actions::DeviceAction;
+use crate::hid::core::actions::DeviceAction;
 use shared::cdc::transport::{FrameTransportError, command_for_request, command_for_response};
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE, compute_crc32};
 use shared::checksum::accumulate_checksum;
 use shared::journal::JournalHasher;
 use shared::schema::{
     AckRequest, AckResponse, DeviceErrorCode, DeviceResponse, GetTimeRequest, HelloRequest,
-    HelloResponse, HostRequest, JournalFrame, JournalOperation, NackResponse, PROTOCOL_VERSION,
-    PullHeadRequest, PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame,
-    SetTimeRequest, StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk,
-    decode_host_request, encode_device_response,
+    HelloResponse, HostRequest, JournalFrame, NackResponse, PROTOCOL_VERSION, PullHeadRequest,
+    PullHeadResponse, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
+    StatusRequest, StatusResponse, TimeResponse, VaultArtifact, VaultChunk, decode_host_request,
+    encode_device_response,
 };
 use shared::transfer::ArtifactLengths;
 
@@ -273,7 +277,7 @@ fn handle_hello(
     ctx.reset_transfer_state();
 
     #[cfg(any(test, target_arch = "xtensa"))]
-    crate::hid::actions::publish(DeviceAction::StartSession {
+    crate::hid::core::actions::publish(DeviceAction::StartSession {
         session_id: ctx.session_id,
     });
 
@@ -442,9 +446,6 @@ fn handle_push_ops(
     if push.is_last {
         ctx.vault_generation = ctx.vault_generation.saturating_add(1);
         ctx.frame_tracker.clear();
-        ctx.record_operation(JournalOperation::AckHost);
-    } else {
-        ctx.record_operation(JournalOperation::PendingHostFrame);
     }
 
     Ok(DeviceResponse::Ack(AckResponse {
@@ -476,9 +477,7 @@ pub(super) fn handle_ack(
     ctx.frame_tracker.clear();
 
     #[cfg(any(test, target_arch = "xtensa"))]
-    crate::hid::actions::publish(DeviceAction::EndSession {
-        session_id: ctx.session_id,
-    });
+    crate::hid::core::actions::publish(DeviceAction::EndSession);
 
     Ok(DeviceResponse::Ack(AckResponse {
         protocol_version: PROTOCOL_VERSION,
