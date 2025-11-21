@@ -52,7 +52,7 @@ fn push_serializes_local_operations() {
     ];
     let encoded_ops = postcard::to_allocvec(&host_operations).expect("encode operations");
     fs::write(
-        commands::push::operations_log_path(&args.repo),
+        commands::push::plan::operations_log_path(&args.repo),
         &encoded_ops,
     )
     .expect("write operations");
@@ -83,13 +83,14 @@ fn push_serializes_local_operations() {
             assert!(frame.is_last);
             let mut expected = Vec::new();
             for op in &host_operations {
-                expected
-                    .extend(commands::push::operations_for_device(op).expect("flatten host ops"));
+                expected.extend(
+                    commands::push::plan::operations_for_device(op).expect("flatten host ops"),
+                );
             }
             assert_eq!(frame.operations, expected);
             assert_eq!(
                 frame.checksum,
-                commands::push::compute_local_journal_checksum(&frame.operations)
+                commands::push::plan::compute_local_journal_checksum(&frame.operations)
             );
         }
         other => panic!("unexpected request written: {:?}", other),
@@ -98,14 +99,14 @@ fn push_serializes_local_operations() {
     assert_eq!(reader.position(), reader.get_ref().len() as u64);
 
     assert!(
-        !commands::push::operations_log_path(&args.repo).exists(),
+        !commands::push::plan::operations_log_path(&args.repo).exists(),
         "operations file should be cleared after push",
     );
 
     let vault_path = args.repo.join(VAULT_FILE);
     let encrypted_vault = fs::read(&vault_path).expect("encrypted vault");
-    let snapshot =
-        commands::push::decrypt_vault(&encrypted_vault, &TEST_VAULT_KEY).expect("decrypt vault");
+    let snapshot = commands::push::artifacts::decrypt_vault(&encrypted_vault, &TEST_VAULT_KEY)
+        .expect("decrypt vault");
 
     let added = snapshot
         .entries
@@ -157,7 +158,7 @@ fn push_command_uses_in_memory_transport_and_store() {
     let operations = vec![VaultJournalOperation::Delete { id: entry.id }];
     let encoded_ops = postcard::to_allocvec(&operations).expect("encode operations");
     fs::write(
-        commands::push::operations_log_path(&args.repo),
+        commands::push::plan::operations_log_path(&args.repo),
         &encoded_ops,
     )
     .expect("write operations");
@@ -224,21 +225,25 @@ fn load_local_operations_migrates_device_format() {
 
     let mut device_operations = Vec::new();
     for operation in &host_operations {
-        device_operations
-            .extend(commands::push::operations_for_device(operation).expect("flatten host ops"));
+        device_operations.extend(
+            commands::push::plan::operations_for_device(operation).expect("flatten host ops"),
+        );
     }
 
     let encoded_device = encode_journal_operations(&device_operations).expect("encode device ops");
-    fs::write(commands::push::operations_log_path(repo), &encoded_device)
-        .expect("write legacy operations");
+    fs::write(
+        commands::push::plan::operations_log_path(repo),
+        &encoded_device,
+    )
+    .expect("write legacy operations");
 
     let config = commands::host_config::HostConfig::load(&credentials).expect("load config");
-    let loaded =
-        commands::push::load_local_operations(repo, &config).expect("load migrated operations");
+    let loaded = commands::push::plan::load_local_operations(repo, &config)
+        .expect("load migrated operations");
     assert_eq!(loaded, host_operations);
 
-    let rewritten =
-        fs::read(commands::push::operations_log_path(repo)).expect("read rewritten operations");
+    let rewritten = fs::read(commands::push::plan::operations_log_path(repo))
+        .expect("read rewritten operations");
     let decoded: Vec<VaultJournalOperation> =
         postcard::from_bytes(&rewritten).expect("decode rewritten operations");
     assert_eq!(decoded, host_operations);
