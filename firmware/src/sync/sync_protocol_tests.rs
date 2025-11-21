@@ -1,21 +1,17 @@
-#![cfg(test)]
-
 use alloc::{string::String, vec::Vec};
 
 use super::{protocol, *};
 use crate::sync::test_helpers::fresh_context;
 use ed25519_dalek::{Signer, SigningKey};
-use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
-use shared::cdc::transport::{decode_frame, encode_frame};
-use shared::cdc::{CdcCommand, FrameHeader};
+use shared::cdc::transport::{decode_frame, decode_frame_header, encode_frame};
+use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE};
 use shared::checksum::accumulate_checksum;
 use shared::journal::{FrameState, JournalHasher};
 use shared::schema::{
     AckRequest, DeviceResponse, GetTimeRequest, HelloRequest, HostRequest, PROTOCOL_VERSION,
     PullHeadRequest, PullVaultRequest, PushOperationsFrame, PushVaultFrame, SetTimeRequest,
     StatusRequest, VaultArtifact, decode_device_response, encode_device_response,
-    encode_host_request, encode_journal_operations,
+    encode_host_request,
 };
 
 #[test]
@@ -240,8 +236,8 @@ fn hello_enqueues_ble_session_action() {
     let mut ctx = fresh_context();
     let request = HostRequest::Hello(HelloRequest {
         protocol_version: PROTOCOL_VERSION,
-        device_name: String::from("host"),
-        firmware_version: String::from("host-fw"),
+        client_name: String::from("host"),
+        client_version: String::from("host-fw"),
     });
     let encoded = encode_host_request(&request).unwrap();
     let (_, response_bytes) = process_host_frame(CdcCommand::Hello, &encoded, &mut ctx).unwrap();
@@ -565,37 +561,52 @@ fn checksum_validation_detects_corruption() {
     let mut ctx = fresh_context();
     let request = HostRequest::Hello(HelloRequest {
         protocol_version: PROTOCOL_VERSION,
-        device_name: String::from("host"),
-        firmware_version: String::from("fw"),
+        client_name: String::from("host"),
+        client_version: String::from("fw"),
     });
     let encoded = encode_host_request(&request).unwrap();
-    let mut header = FrameHeader {
-        version: PROTOCOL_VERSION,
-        length: encoded.len() as u16,
-        command: CdcCommand::Hello as u16,
-        checksum: 0,
-    };
-    let mut frame = encode_frame(&header, &encoded).unwrap();
-    frame[frame.len() - 1] ^= 0xFF;
-    let decoded = decode_frame(&frame).expect("decode");
-    header.checksum = decoded.header.checksum;
-    let corrupted = encode_frame(&header, &encoded).unwrap();
-    let decoded = decode_frame(&corrupted).expect("decode");
-    let error = process_host_frame(CdcCommand::Hello, decoded.payload, &mut ctx)
-        .expect_err("checksum error");
-    assert!(matches!(error, ProtocolError::ChecksumMismatch));
+    let header_bytes = encode_frame(
+        PROTOCOL_VERSION,
+        CdcCommand::Hello,
+        &encoded,
+        FRAME_MAX_SIZE,
+    )
+    .unwrap();
+    let header =
+        decode_frame_header(PROTOCOL_VERSION, FRAME_MAX_SIZE, header_bytes).expect("header");
+
+    let mut corrupted = encoded.clone();
+    *corrupted.last_mut().unwrap() ^= 0xFF;
+
+    let transport_error = decode_frame(&header, &corrupted).expect_err("checksum error");
+    let protocol_error: ProtocolError = transport_error.into();
+    assert!(matches!(protocol_error, ProtocolError::ChecksumMismatch));
+
+    decode_frame(&header, &encoded).expect("valid payload");
+    let error =
+        process_host_frame(CdcCommand::Hello, &corrupted, &mut ctx).expect_err("checksum error");
+    assert!(matches!(error, ProtocolError::Decode(_)));
 }
 
 #[test]
 fn transport_limit_matches_firmware_max_size() {
-    let header = FrameHeader {
-        version: PROTOCOL_VERSION,
-        length: FRAME_MAX_SIZE as u16,
-        command: CdcCommand::Hello as u16,
-        checksum: 0,
-    };
-    let frame = encode_frame(&header, &vec![0u8; FRAME_MAX_SIZE]).expect("encode");
-    assert!(frame.len() >= FRAME_MAX_SIZE + FrameHeader::SIZE);
+    let payload = vec![0u8; FRAME_MAX_SIZE];
+    let header_bytes = encode_frame(
+        PROTOCOL_VERSION,
+        CdcCommand::Hello,
+        &payload,
+        FRAME_MAX_SIZE,
+    )
+    .unwrap();
+    let header =
+        decode_frame_header(PROTOCOL_VERSION, FRAME_MAX_SIZE, header_bytes).expect("header");
+
+    assert_eq!(header.length as usize, FRAME_MAX_SIZE);
+    assert_eq!(header.command, CdcCommand::Hello);
+    assert_eq!(
+        FRAME_HEADER_SIZE + payload.len(),
+        FRAME_HEADER_SIZE + FRAME_MAX_SIZE
+    );
 }
 
 #[test]
@@ -603,8 +614,8 @@ fn hello_establishes_session() {
     let mut ctx = fresh_context();
     let request = HostRequest::Hello(HelloRequest {
         protocol_version: PROTOCOL_VERSION,
-        device_name: String::from("host"),
-        firmware_version: String::from("host-fw"),
+        client_name: String::from("host"),
+        client_version: String::from("host-fw"),
     });
     let encoded = encode_host_request(&request).unwrap();
     let (command, response_bytes) =

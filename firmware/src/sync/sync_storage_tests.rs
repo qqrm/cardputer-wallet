@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use alloc::{string::String, vec::Vec};
 
 use super::{storage, *};
@@ -14,7 +12,7 @@ use sequential_storage::{cache::NoCache, map};
 use shared::cdc::CdcCommand;
 use shared::schema::{
     DeviceResponse, HostRequest, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
-    PullVaultRequest, decode_device_response, encode_host_request, encode_journal_operations,
+    decode_device_response, encode_host_request, encode_journal_operations,
 };
 
 #[test]

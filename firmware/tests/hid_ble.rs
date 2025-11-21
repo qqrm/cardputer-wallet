@@ -1,7 +1,7 @@
 #![cfg(feature = "ui-tests")]
 
 use firmware::hid::ble::profile::TroubleProfile;
-use firmware::hid::ble::{BleHid, HidCommandQueue, HidError, HidResponse, profile};
+use firmware::hid::ble::{BleHid, HidBackend, HidCommandQueue, HidError, HidResponse, profile};
 use firmware::hid::core::actions::{DeviceAction, KeyboardReport, MacroBuffer, MacroStep};
 use heapless::Vec;
 use std::boxed::Box;
