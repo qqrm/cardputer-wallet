@@ -8,7 +8,19 @@ mod transport;
 compile_error!("Enable at least one host transport feature (currently only `transport-usb`).");
 
 #[cfg(test)]
-mod tests;
+mod test_support;
+#[cfg(test)]
+mod tests_confirm;
+#[cfg(test)]
+mod tests_hello;
+#[cfg(test)]
+mod tests_pull;
+#[cfg(test)]
+mod tests_push;
+#[cfg(test)]
+mod tests_status;
+#[cfg(test)]
+mod tests_transport;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
