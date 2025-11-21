@@ -65,8 +65,9 @@ pub(crate) fn deterministic_rng() -> ChaCha20Rng {
 
 pub(crate) fn write_encrypted_vault(repo: &Path, snapshot: &commands::host_config::VaultSnapshot) {
     let mut rng = deterministic_rng();
-    let encrypted = commands::push::encrypt_vault_with_rng(snapshot, &TEST_VAULT_KEY, &mut rng)
-        .expect("encrypt vault");
+    let encrypted =
+        commands::push::artifacts::encrypt_vault_with_rng(snapshot, &TEST_VAULT_KEY, &mut rng)
+            .expect("encrypt vault");
     let path = repo.join(VAULT_FILE);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create vault directory");
