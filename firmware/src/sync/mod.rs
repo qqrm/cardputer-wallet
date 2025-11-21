@@ -13,6 +13,7 @@ mod crypto;
 mod protocol;
 mod storage;
 
+#[cfg_attr(not(target_arch = "xtensa"), allow(unused_imports))]
 pub(crate) use protocol::encode_response;
 pub use protocol::{ProtocolError, process_host_frame};
 

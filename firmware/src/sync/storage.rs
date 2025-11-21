@@ -1,4 +1,4 @@
-use alloc::{format, vec, vec::Vec};
+use alloc::{format, string::ToString, vec, vec::Vec};
 use core::ops::Range;
 
 use embedded_storage_async::nor_flash::NorFlash;
