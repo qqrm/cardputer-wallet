@@ -5,7 +5,7 @@ use shared::cdc::transport::command_for_response;
 use shared::error::SharedError;
 use shared::schema::DeviceResponse;
 
-use super::DeviceTransport;
+use super::FrameTransport;
 
 /// In-memory transport that records transmitted frames and replays queued responses.
 #[derive(Default)]
@@ -38,7 +38,7 @@ impl MemoryDeviceTransport {
     }
 }
 
-impl DeviceTransport for MemoryDeviceTransport {
+impl FrameTransport for MemoryDeviceTransport {
     fn write_frame(&mut self, command: CdcCommand, payload: &[u8]) -> Result<(), SharedError> {
         self.sent_frames.push((command, payload.to_vec()));
         Ok(())

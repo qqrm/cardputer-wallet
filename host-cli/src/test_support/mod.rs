@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::commands::signature::compute_signature_message;
 use crate::commands::{self, DeviceTransport, RepoArtifactStore, TransportProvider};
 use crate::constants::VAULT_FILE;
-use crate::transport::write_framed_message_for_tests as write_framed_message;
+use crate::transport::{FrameTransport, write_framed_message_for_tests as write_framed_message};
 
 pub(crate) const SIGNATURE_SIZE: usize = 64;
 pub(crate) const TEST_SIGNING_SEED: [u8; 32] = [0x21; 32];
@@ -201,7 +201,7 @@ impl InMemoryDeviceTransport {
     }
 }
 
-impl DeviceTransport for InMemoryDeviceTransport {
+impl FrameTransport for InMemoryDeviceTransport {
     fn write_frame(&mut self, _command: CdcCommand, payload: &[u8]) -> Result<(), SharedError> {
         let request: HostRequest = postcard_from_bytes(payload).map_err(SharedError::from)?;
         self.requests.push(request);
