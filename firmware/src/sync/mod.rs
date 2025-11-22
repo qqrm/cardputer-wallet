@@ -123,8 +123,14 @@ impl SyncContext {
 }
 
 #[cfg(test)]
-mod sync_protocol_tests;
-#[cfg(test)]
 mod sync_storage_tests;
 #[cfg(test)]
 mod test_helpers;
+#[cfg(test)]
+mod tests_pull;
+#[cfg(test)]
+mod tests_push;
+#[cfg(test)]
+mod tests_time;
+#[cfg(test)]
+mod tests_transport;
