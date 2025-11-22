@@ -6,8 +6,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use shared::cdc::CdcCommand;
 use shared::journal::{FrameState, JournalHasher};
 use shared::schema::{
-    AckRequest, DeviceResponse, HostRequest, JournalOperation, PushOperationsFrame, PushVaultFrame,
-    VaultArtifact, decode_device_response, encode_host_request,
+    AckRequest, DeviceResponse, HostRequest, JournalOperation, PROTOCOL_VERSION, PullVaultRequest,
+    PushOperationsFrame, PushVaultFrame, VaultArtifact, decode_device_response,
+    encode_host_request,
 };
 
 #[test]

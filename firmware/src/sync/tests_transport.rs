@@ -5,7 +5,8 @@ use crate::sync::test_helpers::{frame_header_for_payload, fresh_context};
 use shared::cdc::transport::decode_frame;
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE};
 use shared::schema::{
-    HelloRequest, HostRequest, ProtocolError, PullVaultRequest, StatusRequest, encode_host_request,
+    HelloRequest, HostRequest, PROTOCOL_VERSION, ProtocolError, PullVaultRequest, StatusRequest,
+    encode_host_request,
 };
 
 #[test]

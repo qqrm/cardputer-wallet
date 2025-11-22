@@ -4,8 +4,8 @@ use super::{protocol, *};
 use crate::sync::test_helpers::fresh_context;
 use shared::cdc::CdcCommand;
 use shared::schema::{
-    DeviceResponse, GetTimeRequest, HelloRequest, HostRequest, SetTimeRequest, StatusRequest,
-    decode_device_response, encode_host_request,
+    DeviceResponse, GetTimeRequest, HelloRequest, HostRequest, PROTOCOL_VERSION, SetTimeRequest,
+    StatusRequest, decode_device_response, encode_host_request,
 };
 
 #[test]
