@@ -189,6 +189,23 @@ impl core::fmt::Display for PinUnlockError {
 
 impl core::error::Error for PinUnlockError {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct RecordNonce([u8; 12]);
+
+impl RecordNonce {
+    pub fn new(bytes: [u8; 12]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_array(&self) -> &[u8; 12] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> [u8; 12] {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ScryptParamsRecord {
     log_n: u8,
@@ -223,56 +240,40 @@ pub(crate) struct KeyRecord {
     pub(crate) scrypt: ScryptParamsRecord,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
-pub struct RecordNonce([u8; 12]);
-
-impl RecordNonce {
-    pub fn new(bytes: [u8; 12]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_array(&self) -> &[u8; 12] {
-        &self.0
-    }
-
-    pub fn into_inner(self) -> [u8; 12] {
-        self.0
-    }
-}
-
 #[derive(Debug, Zeroize, ZeroizeOnDrop)]
-pub struct CryptoMaterial {
+struct PinKekMaterial {
     kek: Option<Zeroizing<[u8; 32]>>,
-    vault_key: Option<Zeroizing<[u8; 32]>>,
-    device_private_key: Option<Zeroizing<[u8; 32]>>,
-    device_public_key: Option<[u8; 32]>,
     pin_salt: [u8; 16],
     kek_nonce: [u8; 12],
-    device_key_nonce: [u8; 12],
-    wrapped_vault_key: Zeroizing<Vec<u8>>,
-    wrapped_device_private_key: Zeroizing<Vec<u8>>,
     #[zeroize(skip)]
     scrypt_params: ScryptParams,
 }
 
-impl Default for CryptoMaterial {
+impl Default for PinKekMaterial {
     fn default() -> Self {
         Self {
             kek: None,
-            vault_key: None,
-            device_private_key: None,
-            device_public_key: None,
             pin_salt: [0u8; 16],
             kek_nonce: [0u8; 12],
-            device_key_nonce: [0u8; 12],
-            wrapped_vault_key: Zeroizing::new(Vec::new()),
-            wrapped_device_private_key: Zeroizing::new(Vec::new()),
             scrypt_params: ScryptParams::recommended(),
         }
     }
 }
 
-impl CryptoMaterial {
+impl PinKekMaterial {
+    fn randomize<R: RngCore + CryptoRng>(&mut self, rng: &mut R) {
+        rng.fill_bytes(&mut self.pin_salt);
+        rng.fill_bytes(&mut self.kek_nonce);
+    }
+
+    fn apply_record(&mut self, record: &KeyRecord) -> Result<(), KeyError> {
+        self.pin_salt = record.salt;
+        self.kek_nonce = record.vault_nonce;
+        self.kek = None;
+        self.scrypt_params = record.scrypt.to_params()?;
+        Ok(())
+    }
+
     fn derive_kek(&mut self, pin: &[u8]) -> Result<(), KeyError> {
         let mut derived = Zeroizing::new([0u8; 32]);
         let pin_guard = Zeroizing::new(pin.to_vec());
@@ -291,6 +292,69 @@ impl CryptoMaterial {
         let kek = self.kek.as_ref().ok_or(KeyError::KekUnavailable)?;
         ChaCha20Poly1305::new_from_slice(kek.as_ref()).map_err(|_| KeyError::CryptoFailure)
     }
+}
+
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+struct DeviceKeyMaterial {
+    vault_key: Option<Zeroizing<[u8; 32]>>,
+    device_private_key: Option<Zeroizing<[u8; 32]>>,
+    device_public_key: Option<[u8; 32]>,
+    device_key_nonce: [u8; 12],
+    wrapped_vault_key: Zeroizing<Vec<u8>>,
+    wrapped_device_private_key: Zeroizing<Vec<u8>>,
+}
+
+impl Default for DeviceKeyMaterial {
+    fn default() -> Self {
+        Self {
+            vault_key: None,
+            device_private_key: None,
+            device_public_key: None,
+            device_key_nonce: [0u8; 12],
+            wrapped_vault_key: Zeroizing::new(Vec::new()),
+            wrapped_device_private_key: Zeroizing::new(Vec::new()),
+        }
+    }
+}
+
+impl DeviceKeyMaterial {
+    fn randomize_nonces<R: RngCore + CryptoRng>(&mut self, rng: &mut R) {
+        rng.fill_bytes(&mut self.device_key_nonce);
+    }
+
+    fn set_wrapped_keys(&mut self, record: &KeyRecord) {
+        self.device_key_nonce = record.device_nonce;
+        self.wrapped_vault_key = Zeroizing::new(record.wrapped_vault_key.clone());
+        self.wrapped_device_private_key = Zeroizing::new(record.wrapped_device_key.clone());
+        self.device_public_key = Some(record.device_public_key);
+        self.vault_key = None;
+        self.device_private_key = None;
+    }
+
+    fn store_runtime_keys(
+        &mut self,
+        vault_key: Zeroizing<[u8; 32]>,
+        device_private_key: Zeroizing<[u8; 32]>,
+        device_public_key: [u8; 32],
+        wrapped_vault_key: Vec<u8>,
+        wrapped_device_key: Vec<u8>,
+    ) {
+        self.vault_key = Some(vault_key);
+        self.device_private_key = Some(device_private_key);
+        self.device_public_key = Some(device_public_key);
+        self.wrapped_vault_key = Zeroizing::new(wrapped_vault_key);
+        self.wrapped_device_private_key = Zeroizing::new(wrapped_device_key);
+    }
+
+    fn ensure_wrapped_keys(&self) -> Result<(), KeyError> {
+        if self.wrapped_vault_key.is_empty() {
+            return Err(KeyError::VaultKeyUnavailable);
+        }
+        if self.wrapped_device_private_key.is_empty() {
+            return Err(KeyError::DeviceKeyUnavailable);
+        }
+        Ok(())
+    }
 
     fn ensure_vault_key(&self) -> Result<&Zeroizing<[u8; 32]>, KeyError> {
         self.vault_key.as_ref().ok_or(KeyError::VaultKeyUnavailable)
@@ -302,36 +366,93 @@ impl CryptoMaterial {
             .ok_or(KeyError::DeviceKeyUnavailable)
     }
 
+    fn copy_plaintext_key(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, KeyError> {
+        if bytes.len() != 32 {
+            return Err(KeyError::VaultKeyLength);
+        }
+        let mut buffer = Zeroizing::new([0u8; 32]);
+        buffer.copy_from_slice(&bytes[..32]);
+        Ok(buffer)
+    }
+
+    fn copy_device_key(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, KeyError> {
+        if bytes.len() != 32 {
+            return Err(KeyError::DeviceKeyLength);
+        }
+        let mut buffer = Zeroizing::new([0u8; 32]);
+        buffer.copy_from_slice(&bytes[..32]);
+        Ok(buffer)
+    }
+
+    fn wipe(&mut self) {
+        if let Some(vault_key) = self.vault_key.take() {
+            drop(vault_key);
+        }
+        if let Some(device_key) = self.device_private_key.take() {
+            drop(device_key);
+        }
+    }
+}
+
+struct KeyRecordBuilder;
+
+impl KeyRecordBuilder {
+    fn validate_ciphertext_lengths(record: &KeyRecord) -> Result<(), KeyError> {
+        if record.wrapped_vault_key.is_empty() {
+            return Err(KeyError::VaultKeyUnavailable);
+        }
+        if record.wrapped_device_key.is_empty() {
+            return Err(KeyError::DeviceKeyUnavailable);
+        }
+        Ok(())
+    }
+
+    fn build(pin_kek: &PinKekMaterial, device_keys: &DeviceKeyMaterial) -> Option<KeyRecord> {
+        if device_keys.wrapped_vault_key.is_empty()
+            || device_keys.wrapped_device_private_key.is_empty()
+        {
+            return None;
+        }
+
+        let device_public_key = device_keys.device_public_key?;
+
+        Some(KeyRecord {
+            salt: pin_kek.pin_salt,
+            vault_nonce: pin_kek.kek_nonce,
+            device_nonce: device_keys.device_key_nonce,
+            wrapped_vault_key: (*device_keys.wrapped_vault_key).clone(),
+            wrapped_device_key: (*device_keys.wrapped_device_private_key).clone(),
+            device_public_key,
+            scrypt: pin_kek.scrypt_params.into(),
+        })
+    }
+}
+
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+pub struct CryptoMaterial {
+    pin_kek: PinKekMaterial,
+    device_keys: DeviceKeyMaterial,
+}
+
+impl Default for CryptoMaterial {
+    fn default() -> Self {
+        Self {
+            pin_kek: PinKekMaterial::default(),
+            device_keys: DeviceKeyMaterial::default(),
+        }
+    }
+}
+
+impl CryptoMaterial {
     pub(crate) fn configure_from_record(&mut self, record: &KeyRecord) -> Result<(), KeyError> {
-        self.pin_salt = record.salt;
-        self.kek_nonce = record.vault_nonce;
-        self.device_key_nonce = record.device_nonce;
-        self.wrapped_vault_key = Zeroizing::new(record.wrapped_vault_key.clone());
-        self.wrapped_device_private_key = Zeroizing::new(record.wrapped_device_key.clone());
-        self.device_public_key = Some(record.device_public_key);
-        self.scrypt_params = record.scrypt.to_params()?;
-        self.kek = None;
-        self.vault_key = None;
-        self.device_private_key = None;
+        self.pin_kek.apply_record(record)?;
+        KeyRecordBuilder::validate_ciphertext_lengths(record)?;
+        self.device_keys.set_wrapped_keys(record);
         Ok(())
     }
 
     pub(crate) fn record(&self) -> Option<KeyRecord> {
-        if self.wrapped_vault_key.is_empty() || self.wrapped_device_private_key.is_empty() {
-            return None;
-        }
-
-        let public_key = self.device_public_key?;
-
-        Some(KeyRecord {
-            salt: self.pin_salt,
-            vault_nonce: self.kek_nonce,
-            device_nonce: self.device_key_nonce,
-            wrapped_vault_key: (*self.wrapped_vault_key).clone(),
-            wrapped_device_key: (*self.wrapped_device_private_key).clone(),
-            device_public_key: public_key,
-            scrypt: self.scrypt_params.into(),
-        })
+        KeyRecordBuilder::build(&self.pin_kek, &self.device_keys)
     }
 
     pub fn wrap_new_keys<R: RngCore + CryptoRng>(
@@ -339,76 +460,56 @@ impl CryptoMaterial {
         pin: &[u8],
         rng: &mut R,
     ) -> Result<(), KeyError> {
-        rng.fill_bytes(&mut self.pin_salt);
-        rng.fill_bytes(&mut self.kek_nonce);
-        rng.fill_bytes(&mut self.device_key_nonce);
+        self.pin_kek.randomize(rng);
+        self.device_keys.randomize_nonces(rng);
+        self.pin_kek.scrypt_params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)?;
 
-        self.scrypt_params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)?;
+        let (vault_key, device_private_key, device_public_key) = Self::generate_key_material(rng);
 
-        let mut fresh_vault_key = Zeroizing::new([0u8; 32]);
-        rng.fill_bytes(fresh_vault_key.as_mut());
+        self.pin_kek.derive_kek(pin)?;
+        let cipher = self.pin_kek.cipher_from_kek()?;
+        let (wrapped_vault_key, wrapped_device_key) = Self::wrap_keys(
+            &cipher,
+            &vault_key,
+            &device_private_key,
+            self.pin_kek.kek_nonce,
+            self.device_keys.device_key_nonce,
+        )?;
 
-        let mut device_secret = Zeroizing::new([0u8; 32]);
-        rng.fill_bytes(device_secret.as_mut());
-        let static_secret = X25519StaticSecret::from(*device_secret);
-        let device_public = X25519PublicKey::from(&static_secret);
-        let device_private_key = Zeroizing::new(static_secret.to_bytes());
-        drop(static_secret);
-
-        self.derive_kek(pin)?;
-        let cipher = self.cipher_from_kek()?;
-        let vault_nonce = Nonce::from(self.kek_nonce);
-        let vault_ciphertext = cipher.encrypt(&vault_nonce, fresh_vault_key.as_ref())?;
-        let device_nonce = Nonce::from(self.device_key_nonce);
-        let device_ciphertext = cipher.encrypt(&device_nonce, device_private_key.as_ref())?;
-
-        self.wrapped_vault_key = Zeroizing::new(vault_ciphertext);
-        self.wrapped_device_private_key = Zeroizing::new(device_ciphertext);
-        self.vault_key = Some(fresh_vault_key);
-        self.device_private_key = Some(device_private_key);
-        self.device_public_key = Some(device_public.to_bytes());
+        self.device_keys.store_runtime_keys(
+            vault_key,
+            device_private_key,
+            device_public_key,
+            wrapped_vault_key,
+            wrapped_device_key,
+        );
         Ok(())
     }
 
     #[cfg(any(test, feature = "ui-tests"))]
     pub(crate) fn test_set_vault_key(&mut self, key: [u8; 32]) {
-        self.vault_key = Some(Zeroizing::new(key));
+        self.device_keys.vault_key = Some(Zeroizing::new(key));
     }
 
     pub fn unlock_vault_key(&mut self, pin: &[u8]) -> Result<(), KeyError> {
-        if self.wrapped_vault_key.is_empty() {
-            return Err(KeyError::VaultKeyUnavailable);
-        }
+        self.device_keys.ensure_wrapped_keys()?;
 
-        if self.wrapped_device_private_key.is_empty() {
-            return Err(KeyError::DeviceKeyUnavailable);
-        }
+        self.pin_kek.derive_kek(pin)?;
+        let cipher = self.pin_kek.cipher_from_kek()?;
+        let vault_plaintext = cipher.decrypt(
+            &Nonce::from(self.pin_kek.kek_nonce),
+            self.device_keys.wrapped_vault_key.as_slice(),
+        )?;
+        let vault_key = DeviceKeyMaterial::copy_plaintext_key(&vault_plaintext)?;
 
-        self.derive_kek(pin)?;
-        let cipher = self.cipher_from_kek()?;
-        let vault_nonce = Nonce::from(self.kek_nonce);
-        let vault_plaintext =
-            Zeroizing::new(cipher.decrypt(&vault_nonce, self.wrapped_vault_key.as_slice())?);
+        let device_plaintext = cipher.decrypt(
+            &Nonce::from(self.device_keys.device_key_nonce),
+            self.device_keys.wrapped_device_private_key.as_slice(),
+        )?;
+        let device_private_key = DeviceKeyMaterial::copy_device_key(&device_plaintext)?;
 
-        if vault_plaintext.len() != 32 {
-            return Err(KeyError::VaultKeyLength);
-        }
-
-        let mut vault_key = Zeroizing::new([0u8; 32]);
-        vault_key.copy_from_slice(&vault_plaintext[..32]);
-        let device_nonce = Nonce::from(self.device_key_nonce);
-        let device_plaintext = Zeroizing::new(
-            cipher.decrypt(&device_nonce, self.wrapped_device_private_key.as_slice())?,
-        );
-
-        if device_plaintext.len() != 32 {
-            return Err(KeyError::DeviceKeyLength);
-        }
-
-        let mut device_private = Zeroizing::new([0u8; 32]);
-        device_private.copy_from_slice(&device_plaintext[..32]);
-        self.vault_key = Some(vault_key);
-        self.device_private_key = Some(device_private);
+        self.device_keys.vault_key = Some(vault_key);
+        self.device_keys.device_private_key = Some(device_private_key);
         Ok(())
     }
 
@@ -417,7 +518,7 @@ impl CryptoMaterial {
         rng: &mut R,
         plaintext: &[u8],
     ) -> Result<(RecordNonce, Vec<u8>), KeyError> {
-        let vault_key = self.ensure_vault_key()?;
+        let vault_key = self.device_keys.ensure_vault_key()?;
         let cipher = ChaCha20Poly1305::new_from_slice(vault_key.as_ref())
             .map_err(|_| KeyError::CryptoFailure)?;
         let mut nonce_bytes = [0u8; 12];
@@ -432,7 +533,7 @@ impl CryptoMaterial {
         nonce: &RecordNonce,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, KeyError> {
-        let vault_key = self.ensure_vault_key()?;
+        let vault_key = self.device_keys.ensure_vault_key()?;
         let cipher = ChaCha20Poly1305::new_from_slice(vault_key.as_ref())
             .map_err(|_| KeyError::CryptoFailure)?;
         let nonce = Nonce::from(*nonce.as_array());
@@ -440,26 +541,128 @@ impl CryptoMaterial {
     }
 
     pub fn device_public_key(&self) -> Option<[u8; 32]> {
-        self.device_public_key
+        self.device_keys.device_public_key
     }
 
     pub fn device_private_key(&self) -> Result<&Zeroizing<[u8; 32]>, KeyError> {
-        self.ensure_device_key()
+        self.device_keys.ensure_device_key()
     }
 
     pub fn vault_key(&self) -> Result<&Zeroizing<[u8; 32]>, KeyError> {
-        self.ensure_vault_key()
+        self.device_keys.ensure_vault_key()
     }
 
     pub fn wipe(&mut self) {
-        if let Some(kek) = self.kek.take() {
+        if let Some(kek) = self.pin_kek.kek.take() {
             drop(kek);
         }
-        if let Some(vault_key) = self.vault_key.take() {
-            drop(vault_key);
-        }
-        if let Some(device_key) = self.device_private_key.take() {
-            drop(device_key);
-        }
+        self.device_keys.wipe();
+    }
+
+    fn generate_key_material<R: RngCore + CryptoRng>(
+        rng: &mut R,
+    ) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>, [u8; 32]) {
+        let mut fresh_vault_key = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(fresh_vault_key.as_mut());
+
+        let mut device_secret = Zeroizing::new([0u8; 32]);
+        rng.fill_bytes(device_secret.as_mut());
+        let static_secret = X25519StaticSecret::from(*device_secret);
+        let device_public = X25519PublicKey::from(&static_secret);
+        let device_private_key = Zeroizing::new(static_secret.to_bytes());
+        drop(static_secret);
+
+        (
+            fresh_vault_key,
+            device_private_key,
+            device_public.to_bytes(),
+        )
+    }
+
+    fn wrap_keys(
+        cipher: &ChaCha20Poly1305,
+        vault_key: &Zeroizing<[u8; 32]>,
+        device_private_key: &Zeroizing<[u8; 32]>,
+        vault_nonce_bytes: [u8; 12],
+        device_nonce_bytes: [u8; 12],
+    ) -> Result<(Vec<u8>, Vec<u8>), KeyError> {
+        let vault_ciphertext = cipher
+            .encrypt(&Nonce::from(vault_nonce_bytes), vault_key.as_ref())
+            .map_err(KeyError::from)?;
+        let device_ciphertext = cipher
+            .encrypt(
+                &Nonce::from(device_nonce_bytes),
+                device_private_key.as_ref(),
+            )
+            .map_err(KeyError::from)?;
+        Ok((vault_ciphertext, device_ciphertext))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn unlock_without_wrapped_keys_fails() {
+        let mut material = CryptoMaterial::default();
+
+        let err = material.unlock_vault_key(b"1234").unwrap_err();
+
+        assert_eq!(err, KeyError::VaultKeyUnavailable);
+    }
+
+    #[test]
+    fn unlock_without_device_key_fails() {
+        let mut material = CryptoMaterial::default();
+        material.device_keys.wrapped_vault_key = Zeroizing::new(vec![1, 2, 3]);
+
+        let err = material.unlock_vault_key(b"1234").unwrap_err();
+
+        assert_eq!(err, KeyError::DeviceKeyUnavailable);
+    }
+
+    #[test]
+    fn configure_rejects_invalid_scrypt_params() {
+        let record = KeyRecord {
+            salt: [0u8; 16],
+            vault_nonce: [0u8; 12],
+            device_nonce: [0u8; 12],
+            wrapped_vault_key: vec![1, 2, 3],
+            wrapped_device_key: vec![4, 5, 6],
+            device_public_key: [0u8; 32],
+            scrypt: ScryptParamsRecord {
+                log_n: 1,
+                r: 0,
+                p: 0,
+            },
+        };
+
+        let mut material = CryptoMaterial::default();
+        let err = material.configure_from_record(&record).unwrap_err();
+
+        assert_eq!(err, KeyError::InvalidParameters);
+    }
+
+    #[test]
+    fn encrypt_without_vault_key_fails() {
+        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
+        let material = CryptoMaterial::default();
+
+        let err = material.encrypt_record(&mut rng, b"hello").unwrap_err();
+
+        assert_eq!(err, KeyError::VaultKeyUnavailable);
+    }
+
+    #[test]
+    fn decrypt_without_vault_key_fails() {
+        let material = CryptoMaterial::default();
+        let nonce = RecordNonce::new([0u8; 12]);
+
+        let err = material.decrypt_record(&nonce, &[]).unwrap_err();
+
+        assert_eq!(err, KeyError::VaultKeyUnavailable);
     }
 }
