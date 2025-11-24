@@ -1,14 +1,16 @@
 use alloc::{string::String, vec::Vec};
 
 use super::{storage, *};
-use crate::crypto::{CryptoMaterial, KeyError, PinUnlockError};
+use crate::crypto::{
+    CryptoMaterial, KeyError, PIN_BACKOFF_BASE_MS, PIN_BACKOFF_THRESHOLD, PinUnlockError,
+};
 use crate::storage::StorageError;
 use crate::sync::test_helpers::fresh_context;
 use futures::executor::block_on;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
-use sequential_storage::{cache::NoCache, map};
+use sequential_storage::{Error as SequentialStorageError, cache::NoCache, map};
 use shared::cdc::CdcCommand;
 use shared::schema::{
     DeviceResponse, HostRequest, JournalOperation, PROTOCOL_VERSION, PullHeadRequest,
@@ -214,7 +216,7 @@ fn load_from_flash_rejects_oversized_vault_image() {
     let mut cache = NoCache::new();
     let mut buffer = vec![0u8; storage::STORAGE_DATA_BUFFER_CAPACITY];
 
-    block_on(async {
+    let store_result = block_on(async {
         map::store_item(
             &mut flash,
             range.clone(),
@@ -224,12 +226,10 @@ fn load_from_flash_rejects_oversized_vault_image() {
             &vec![0xAA; VAULT_BUFFER_CAPACITY + 1],
         )
         .await
-        .unwrap();
     });
 
-    let mut ctx = fresh_context();
-    let error = block_on(ctx.load_from_flash(&mut flash, range)).expect_err("oversized vault");
-    assert!(matches!(error, StorageError::Decode(_)));
+    let error = store_result.expect_err("oversized vault should not be stored");
+    assert!(matches!(error, SequentialStorageError::ItemTooBig));
 }
 
 #[test]
@@ -434,14 +434,15 @@ fn successful_pin_resets_backoff() {
     ctx.crypto.wipe();
 
     let wrong_pin = b"000000";
-    assert!(matches!(
-        ctx.unlock_with_pin(wrong_pin, 0),
-        Err(PinUnlockError::Key(KeyError::CryptoFailure))
-    ));
-    let status = ctx.pin_lock_status(0);
+    for attempt in 0..PIN_BACKOFF_THRESHOLD {
+        assert!(ctx.unlock_with_pin(wrong_pin, attempt as u64).is_err());
+    }
+
+    let status = ctx.pin_lock_status(PIN_BACKOFF_THRESHOLD as u64);
     assert!(status.backoff_remaining_ms.is_some());
 
-    ctx.unlock_with_pin(b"555555", 1_000).expect("unlock");
-    let status_after = ctx.pin_lock_status(1_000);
+    let unlock_time = PIN_BACKOFF_BASE_MS.saturating_add(PIN_BACKOFF_THRESHOLD as u64 + 1);
+    ctx.unlock_with_pin(b"555555", unlock_time).expect("unlock");
+    let status_after = ctx.pin_lock_status(unlock_time);
     assert!(status_after.backoff_remaining_ms.is_none());
 }

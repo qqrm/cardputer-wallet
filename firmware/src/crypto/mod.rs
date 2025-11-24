@@ -428,19 +428,10 @@ impl KeyRecordBuilder {
     }
 }
 
-#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Default, Zeroize, ZeroizeOnDrop)]
 pub struct CryptoMaterial {
     pin_kek: PinKekMaterial,
     device_keys: DeviceKeyMaterial,
-}
-
-impl Default for CryptoMaterial {
-    fn default() -> Self {
-        Self {
-            pin_kek: PinKekMaterial::default(),
-            device_keys: DeviceKeyMaterial::default(),
-        }
-    }
 }
 
 impl CryptoMaterial {
@@ -602,8 +593,8 @@ impl CryptoMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
 
     #[test]
     fn unlock_without_wrapped_keys_fails() {

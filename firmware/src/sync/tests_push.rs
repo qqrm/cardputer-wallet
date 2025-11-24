@@ -83,10 +83,11 @@ fn ack_enqueues_session_end_action() {
     protocol::handle_ack(&ack, &mut ctx).expect("ack should succeed");
 
     let actions = crate::hid::core::actions::drain();
-    assert!(actions.iter().any(|action| matches!(
-        action,
-        crate::hid::core::actions::DeviceAction::EndSession { .. }
-    )));
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, crate::hid::core::actions::DeviceAction::EndSession))
+    );
 }
 
 #[test]
@@ -144,8 +145,8 @@ fn push_operations_are_acknowledged() {
 
     match response {
         DeviceResponse::Ack(message) => {
-            assert!(message.message.contains("frame #3"));
-            assert!(message.message.contains("0x"));
+            let expected = "received operations frame (1 ops, last: true)";
+            assert_eq!(message.message, expected);
         }
         other => panic!("unexpected response: {other:?}"),
     }

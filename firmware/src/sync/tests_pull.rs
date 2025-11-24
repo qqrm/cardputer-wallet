@@ -1,13 +1,13 @@
 use alloc::{string::String, vec::Vec};
 
 use super::{protocol, *};
+use crate::sync::ProtocolError;
 use crate::sync::test_helpers::fresh_context;
 use shared::cdc::CdcCommand;
 use shared::journal::FrameState;
 use shared::schema::{
-    DeviceResponse, HostRequest, PROTOCOL_VERSION, ProtocolError, PullHeadRequest,
-    PullVaultRequest, VaultArtifact, decode_device_response, encode_device_response,
-    encode_host_request,
+    DeviceResponse, HostRequest, PROTOCOL_VERSION, PullHeadRequest, PullVaultRequest,
+    VaultArtifact, decode_device_response, encode_device_response, encode_host_request,
 };
 
 #[test]

@@ -1,11 +1,12 @@
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
-use super::{protocol, *};
+use super::*;
+use crate::sync::ProtocolError;
 use crate::sync::test_helpers::{frame_header_for_payload, fresh_context};
 use shared::cdc::transport::decode_frame;
 use shared::cdc::{CdcCommand, FRAME_HEADER_SIZE};
 use shared::schema::{
-    HelloRequest, HostRequest, PROTOCOL_VERSION, ProtocolError, PullVaultRequest, StatusRequest,
+    HelloRequest, HostRequest, PROTOCOL_VERSION, PullVaultRequest, StatusRequest,
     encode_host_request,
 };
 
