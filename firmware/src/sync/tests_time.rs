@@ -1,6 +1,6 @@
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
-use super::{protocol, *};
+use super::*;
 use crate::sync::test_helpers::fresh_context;
 use shared::cdc::CdcCommand;
 use shared::schema::{

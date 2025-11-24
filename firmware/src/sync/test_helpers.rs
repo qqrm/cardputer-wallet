@@ -1,5 +1,5 @@
-use shared::cdc::CdcCommand;
-use shared::cdc::transport::{FrameHeader, decode_frame_header, encode_frame};
+use shared::cdc::transport::{decode_frame_header, encode_frame};
+use shared::cdc::{CdcCommand, FrameHeader};
 use shared::checksum::accumulate_checksum;
 use shared::schema::PROTOCOL_VERSION;
 
