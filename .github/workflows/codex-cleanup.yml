@@ -2,7 +2,7 @@ name: Codex Branch Cleanup
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -18,10 +18,11 @@ env:
 
 jobs:
   cleanup:
-    name: cleanup
+    name: Codex branch cleanup
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: prune codex branches and pull requests
+      - name: Prune Codex branches and pull requests
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
