@@ -11,6 +11,7 @@ std = ["serde/std"]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 thiserror = { version = "2", default-features = false }
 crc32fast = { version = "1", default-features = false }
+pruefung = { version = "0.2", default-features = false }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 postcard-schema = { version = "0.2", default-features = false, features = ["derive", "alloc"] }
 ergot = { version = "0.11", default-features = false }
