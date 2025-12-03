@@ -52,6 +52,7 @@ jobs:
   firmware_host:
     name: Firmware lint and test (host)
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:
@@ -111,6 +112,7 @@ jobs:
   firmware_xtensa:
     name: Firmware Xtensa build (non-blocking)
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     continue-on-error: true
     timeout-minutes: 60
@@ -189,6 +191,7 @@ jobs:
   shared:
     name: Shared lint and test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:
@@ -248,6 +251,7 @@ jobs:
   host_cli:
     name: Host CLI lint and test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:
