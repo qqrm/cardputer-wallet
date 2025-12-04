@@ -83,7 +83,7 @@ mod tasks {
     #[cfg(any(test, feature = "ui-tests"))]
     static SLOW_FLASH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-    fn host_frame_sender() -> HostFrameSender {
+    pub fn host_frame_sender() -> HostFrameSender {
         HOST_FRAME_CHANNEL.sender()
     }
 
@@ -95,7 +95,7 @@ mod tasks {
         HOST_FRAME_RESPONSE_CHANNEL.sender()
     }
 
-    fn host_frame_response_receiver() -> HostFrameResponseReceiver {
+    pub fn host_frame_response_receiver() -> HostFrameResponseReceiver {
         HOST_FRAME_RESPONSE_CHANNEL.receiver()
     }
 
