@@ -5,19 +5,26 @@ on:
     branches:
       - main
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - closed
 
 env:
   RUST_TOOLCHAIN: stable
   SCCACHE_DIR: /home/runner/.cache/sccache
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -45,6 +52,7 @@ jobs:
   firmware_host:
     name: Firmware lint and test (host)
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:
@@ -104,6 +112,7 @@ jobs:
   firmware_xtensa:
     name: Firmware Xtensa build (non-blocking)
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     continue-on-error: true
     timeout-minutes: 60
@@ -162,10 +171,12 @@ jobs:
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install espup
-        run: cargo install espup
+        run: >-
+          bash -lc "set -euo pipefail; mkdir -p \"$HOME/.cargo/bin\"; curl -L https://github.com/esp-rs/espup/releases/download/v0.16.0/espup-x86_64-unknown-linux-gnu -o \"$HOME/.cargo/bin/espup\"; chmod +x \"$HOME/.cargo/bin/espup\""
 
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; \"$HOME/.cargo/bin/espup\" install --targets esp32s3"
 
       - name: Run cargo check (firmware Xtensa)
         run: >-
@@ -182,6 +193,7 @@ jobs:
   shared:
     name: Shared lint and test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:
@@ -241,6 +253,7 @@ jobs:
   host_cli:
     name: Host CLI lint and test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
     needs: fmt
     timeout-minutes: 40
     steps:

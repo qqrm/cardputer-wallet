@@ -1,7 +1,5 @@
 #![cfg(target_arch = "xtensa")]
 
-use crate::hid::core::actions;
-
 type BootContext =
     Result<crate::sync::SyncContext, crate::storage::StorageError<esp_storage::FlashStorageError>>;
 
@@ -10,14 +8,14 @@ const USB_MAX_PACKET_SIZE: u16 = 64;
 mod tasks {
     use super::BootContext;
     use super::USB_MAX_PACKET_SIZE;
-    use crate::hid::ble::{BleHid, HidError, HidResponse, profile};
+    use crate::hid::ble::{BleHid, HidError, profile};
     use crate::hid::core::actions;
     use crate::hid::usb::usb::{UsbEventReceiver, UsbTransportEvent};
     use crate::storage::{self, BootFlash, StorageError};
     use crate::sync::{self, FRAME_MAX_SIZE, process_host_frame};
     use crate::time::{self, CalibratedClock};
     use crate::ui::transport::{self, TransportState};
-    use alloc::{format, string::ToString, vec, vec::Vec};
+    use alloc::{format, vec, vec::Vec};
     use embassy_executor::task;
     use embassy_futures::select::{Either, select};
     use embassy_sync::{
@@ -33,7 +31,7 @@ mod tasks {
     };
     use embedded_io_async::Read;
     use shared::cdc::FRAME_HEADER_SIZE;
-    use shared::cdc::transport::{FrameTransportError, decode_frame, decode_frame_header};
+    use shared::cdc::transport::{decode_frame, decode_frame_header};
     use shared::schema::PROTOCOL_VERSION;
     use trouble_host::IoCapabilities;
 
@@ -85,7 +83,7 @@ mod tasks {
     #[cfg(any(test, feature = "ui-tests"))]
     static SLOW_FLASH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-    fn host_frame_sender() -> HostFrameSender {
+    pub fn host_frame_sender() -> HostFrameSender {
         HOST_FRAME_CHANNEL.sender()
     }
 
@@ -97,7 +95,7 @@ mod tasks {
         HOST_FRAME_RESPONSE_CHANNEL.sender()
     }
 
-    fn host_frame_response_receiver() -> HostFrameResponseReceiver {
+    pub fn host_frame_response_receiver() -> HostFrameResponseReceiver {
         HOST_FRAME_RESPONSE_CHANNEL.receiver()
     }
 
@@ -131,9 +129,10 @@ mod tasks {
     ) {
         loop {
             let boot_result = async {
-                let range = flash.sequential_storage_range().await.ok_or_else(|| {
-                    StorageError::Decode("sync flash partition not found".to_string())
-                })?;
+                let range = flash
+                    .sequential_storage_range()
+                    .await
+                    .ok_or_else(|| StorageError::Decode("sync flash partition not found".into()))?;
 
                 storage::initialize_context_from_flash(flash, range).await
             }
@@ -200,7 +199,7 @@ mod tasks {
     }
 
     #[task]
-    pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
+    pub async fn ble_profile(receiver: actions::ActionReceiver) {
         transport::set_ble_state(TransportState::Waiting);
 
         let mut ticker = Ticker::every(Duration::from_millis(5));
@@ -218,15 +217,7 @@ mod tasks {
 
         loop {
             match select(ticker.next(), receiver.receive()).await {
-                Either::First(_) => {
-                    if let Err(error) = hid.poll() {
-                        if let HidError::Coded(code) = error {
-                            log::error!("BLE HID error: {code:?}");
-                        }
-                        transport::set_ble_state(TransportState::Error);
-                        break;
-                    }
-                }
+                Either::First(_) => {}
                 Either::Second(action) => {
                     if process_action(&mut hid, action).is_err() {
                         transport::set_ble_state(TransportState::Error);
@@ -239,16 +230,18 @@ mod tasks {
 
     fn process_action(hid: &mut BleHid, action: actions::DeviceAction) -> Result<(), HidError> {
         match action {
-            actions::DeviceAction::StartSession { session_id } => hid.start_session(session_id),
-            actions::DeviceAction::EndSession => hid.end_session(),
+            actions::DeviceAction::StartSession { session_id } => {
+                hid.start_session(session_id).map(|_| ())
+            }
+            actions::DeviceAction::EndSession => hid.end_session().map(|_| ()),
             actions::DeviceAction::SendReport { session_id, report } => {
-                hid.send_report(session_id, &report)
+                hid.send_report(session_id, &report).map(|_| ())
             }
             actions::DeviceAction::HoldKeys { session_id, hold } => {
-                hid.send_hold(session_id, &hold)
+                hid.send_hold(session_id, &hold).map(|_| ())
             }
             actions::DeviceAction::StreamMacro { session_id, buffer } => {
-                hid.stream_macro(session_id, &buffer)
+                hid.stream_macro(session_id, &buffer).map(|_| ())
             }
         }
     }
@@ -263,18 +256,17 @@ mod tasks {
     ) {
         let max_packet_size = USB_MAX_PACKET_SIZE as usize;
         loop {
-            let inbound_or_response = select(
-                receive_frame(&mut receiver, max_packet_size),
-                frame_responses.receive(),
+            match select(
+                select(
+                    receive_frame(&mut receiver, max_packet_size),
+                    frame_responses.receive(),
+                ),
+                events.receive(),
             )
-            .await;
-
-            match select(inbound_or_response, events.receive()).await {
+            .await
+            {
                 Either::First(Either::First(Ok(job))) => {
-                    let sent = frame_jobs.send(job).await;
-                    if sent.is_err() {
-                        log::warn!("Failed to enqueue host frame");
-                    }
+                    frame_jobs.send(job).await;
                 }
                 Either::First(Either::First(Err(FrameIoError::UsbError(error)))) => {
                     log::error!("Failed to read from CDC endpoint: {error:?}");
@@ -323,7 +315,7 @@ mod tasks {
     }
 
     fn storage_protocol_error(error: &StorageError<FlashStorageError>) -> sync::ProtocolError {
-        sync::ProtocolError::Decode(error.to_string())
+        sync::ProtocolError::Decode(format!("{error:?}"))
     }
 
     fn boot_failure_payload(error: &StorageError<FlashStorageError>) -> Vec<u8> {
@@ -349,7 +341,7 @@ mod tasks {
     async fn receive_frame(
         receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
-    ) -> Result<HostFrameResult, FrameIoError> {
+    ) -> Result<HostFrameJob, FrameIoError> {
         let mut header = [0u8; FRAME_HEADER_SIZE];
         let mut offset = 0usize;
 
@@ -367,7 +359,7 @@ mod tasks {
         }
 
         let decoded_header = decode_frame_header(PROTOCOL_VERSION, FRAME_MAX_SIZE, header)
-            .map_err(FrameIoError::Protocol)?;
+            .map_err(|error| FrameIoError::Protocol(error.into()))?;
         let mut payload = vec![0u8; decoded_header.length as usize];
         offset = 0;
         loop {
@@ -382,9 +374,13 @@ mod tasks {
             }
         }
 
-        decode_frame(&decoded_header, &payload).map_err(FrameIoError::Protocol)?;
+        decode_frame(&decoded_header, &payload)
+            .map_err(|error| FrameIoError::Protocol(error.into()))?;
 
-        Ok(Ok((decoded_header.command, payload)))
+        Ok(HostFrameJob {
+            command: decoded_header.command,
+            frame: payload,
+        })
     }
 
     async fn send(
@@ -470,7 +466,7 @@ pub mod runtime {
     pub async fn main(spawner: Spawner) {
         init_allocator();
 
-        let mut peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
+        let peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
         let mut timg0 = TimerGroup::new(peripherals.TIMG0);
         timg0.wdt.disable();
 
@@ -534,7 +530,9 @@ pub mod runtime {
             )),
         );
         let frame_jobs = tasks::host_frame_receiver();
+        let frame_jobs_sender = tasks::host_frame_sender();
         let frame_responses = tasks::host_frame_response_sender();
+        let frame_responses_receiver = tasks::host_frame_response_receiver();
         spawn_or_log(
             "frame worker task",
             spawner.spawn(tasks::frame_worker(
@@ -549,8 +547,8 @@ pub mod runtime {
                 buffered_receiver,
                 cdc_sender,
                 usb_events,
-                frame_jobs,
-                frame_responses,
+                frame_jobs_sender,
+                frame_responses_receiver,
             )),
         );
 
