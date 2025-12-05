@@ -171,10 +171,12 @@ jobs:
         run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install espup
-        run: cargo install espup
+        run: >-
+          bash -lc "set -euo pipefail; mkdir -p \"$HOME/.cargo/bin\"; curl -L https://github.com/esp-rs/espup/releases/download/v0.16.0/espup-x86_64-unknown-linux-gnu -o \"$HOME/.cargo/bin/espup\"; chmod +x \"$HOME/.cargo/bin/espup\""
 
       - name: Install ESP toolchain
-        run: espup install --targets esp32s3
+        run: >-
+          bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; \"$HOME/.cargo/bin/espup\" install --targets esp32s3"
 
       - name: Run cargo check (firmware Xtensa)
         run: >-
