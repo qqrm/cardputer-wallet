@@ -129,9 +129,10 @@ mod tasks {
     ) {
         loop {
             let boot_result = async {
-                let range = flash.sequential_storage_range().await.ok_or_else(|| {
-                    StorageError::Decode("sync flash partition not found".to_string())
-                })?;
+                let range = flash
+                    .sequential_storage_range()
+                    .await
+                    .ok_or_else(|| StorageError::Decode("sync flash partition not found".into()))?;
 
                 storage::initialize_context_from_flash(flash, range).await
             }
@@ -198,7 +199,7 @@ mod tasks {
     }
 
     #[task]
-    pub async fn ble_profile(mut receiver: actions::ActionReceiver) {
+    pub async fn ble_profile(receiver: actions::ActionReceiver) {
         transport::set_ble_state(TransportState::Waiting);
 
         let mut ticker = Ticker::every(Duration::from_millis(5));
@@ -340,7 +341,7 @@ mod tasks {
     async fn receive_frame(
         receiver: &mut BufferedReceiver<'static, esp_hal::otg_fs::asynch::Driver<'static>>,
         packet_size: usize,
-    ) -> Result<HostFrameResult, FrameIoError> {
+    ) -> Result<HostFrameJob, FrameIoError> {
         let mut header = [0u8; FRAME_HEADER_SIZE];
         let mut offset = 0usize;
 
@@ -376,7 +377,10 @@ mod tasks {
         decode_frame(&decoded_header, &payload)
             .map_err(|error| FrameIoError::Protocol(error.into()))?;
 
-        Ok(Ok((decoded_header.command, payload)))
+        Ok(HostFrameJob {
+            command: decoded_header.command,
+            frame: payload,
+        })
     }
 
     async fn send(
@@ -462,7 +466,7 @@ pub mod runtime {
     pub async fn main(spawner: Spawner) {
         init_allocator();
 
-        let mut peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
+        let peripherals = esp_hal::init(Config::default().with_cpu_clock(CpuClock::max()));
         let mut timg0 = TimerGroup::new(peripherals.TIMG0);
         timg0.wdt.disable();
 
