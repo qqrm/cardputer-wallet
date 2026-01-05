@@ -102,10 +102,9 @@ jobs:
         run: sccache --show-stats
 
   firmware_xtensa:
-    name: Firmware Xtensa build (non-blocking)
+    name: Firmware Xtensa build (release)
     runs-on: ubuntu-latest
     needs: fmt
-    continue-on-error: true
     timeout-minutes: 60
     steps:
       - name: Checkout repository
@@ -174,6 +173,13 @@ jobs:
       - name: Run cargo build (firmware Xtensa release)
         run: >-
           bash -lc "set -euo pipefail; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; if [ -f \"$HOME/export-esp.sh\" ]; then source \"$HOME/export-esp.sh\"; fi; cargo +esp -Zbuild-std=core,alloc build --release -p firmware --features firmware-bin --target xtensa-esp32s3-none-elf"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cardputer-firmware-xtensa
+          path: target/xtensa-esp32s3-none-elf/release/cardputer-firmware
+          retention-days: 14
 
       - name: Show sccache stats
         if: always()
